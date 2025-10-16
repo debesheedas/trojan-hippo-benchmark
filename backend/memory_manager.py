@@ -210,15 +210,19 @@ class MemoryManager:
 _memory_manager = None
 
 
-def get_memory_manager() -> MemoryManager:
+def get_memory_manager(memory_file: str = "data/agent_memory.json", force_new: bool = False) -> MemoryManager:
     """
     Get or create the global memory manager instance.
     
+    Args:
+        memory_file: Path to the memory file (default: "data/agent_memory.json")
+        force_new: If True, create a new instance instead of reusing the global one
+    
     Returns:
-        The global MemoryManager instance
+        The MemoryManager instance
     """
     global _memory_manager
-    if _memory_manager is None:
-        _memory_manager = MemoryManager()
+    if force_new or _memory_manager is None:
+        _memory_manager = MemoryManager(memory_file=memory_file)
     return _memory_manager
 

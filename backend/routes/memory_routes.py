@@ -37,13 +37,25 @@ async def get_memory():
         Current short-term and long-term memory
     """
     try:
-        memory_manager = get_memory_manager()
-        context = memory_manager.get_context()
+        # Direct file access to avoid potential deadlocks with memory manager
+        import json
+        from pathlib import Path
+        
+        memory_file = Path("data/agent_memory.json")
+        
+        if memory_file.exists():
+            with open(memory_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                long_term = data.get("long_term", [])
+        else:
+            long_term = []
+        
         return MemoryResponse(
-            short_term=context["short_term"],
-            long_term=context["long_term"]
+            short_term=[],  # Short-term memory is now handled by LangChain sessions
+            long_term=long_term
         )
     except Exception as e:
+        print(f"Error in get_memory endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -59,16 +71,80 @@ async def update_memory(request: MemoryUpdateRequest):
         Success message and updated memory state
     """
     try:
-        memory_manager = get_memory_manager()
-        memory_manager.add_long_term(request.update)
-        context = memory_manager.get_context()
+        # Direct file access to avoid potential deadlocks with memory manager
+        import json
+        from pathlib import Path
         
-        return {
-            "status": "success",
-            "message": "Memory updated",
-            "memory": context
-        }
+        memory_file = Path("data/agent_memory.json")
+        memory_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Load existing memory
+        if memory_file.exists():
+            with open(memory_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                long_term = data.get("long_term", [])
+        else:
+            long_term = []
+        
+        # Handle forget requests
+        if request.update.lower().startswith("forget"):
+            to_forget = request.update[7:].strip()
+            original_count = len(long_term)
+            long_term = [item for item in long_term if to_forget.lower() not in item.lower()]
+            removed_count = original_count - len(long_term)
+            
+            # Save updated memory
+            with open(memory_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "long_term": long_term,
+                    "last_updated": "2025-01-08T00:00:00.000000"
+                }, f, indent=2, ensure_ascii=False)
+            
+            # Try to notify memory manager subscribers (non-blocking)
+            try:
+                memory_manager = get_memory_manager()
+                memory_manager._notify_subscribers()
+            except Exception as e:
+                print(f"Warning: Could not notify memory manager: {e}")
+            
+            return {
+                "status": "success",
+                "message": f"Removed {removed_count} fact(s) matching '{to_forget}'",
+                "memory": {"short_term": [], "long_term": long_term}
+            }
+        else:
+            # Add new memory (avoid duplicates)
+            if request.update not in long_term:
+                long_term.append(request.update)
+                
+                # Save updated memory
+                with open(memory_file, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        "long_term": long_term,
+                        "last_updated": "2025-01-08T00:00:00.000000"
+                    }, f, indent=2, ensure_ascii=False)
+                
+                # Try to notify memory manager subscribers (non-blocking)
+                try:
+                    memory_manager = get_memory_manager()
+                    memory_manager._notify_subscribers()
+                except Exception as e:
+                    print(f"Warning: Could not notify memory manager: {e}")
+                
+                return {
+                    "status": "success",
+                    "message": f"Saved '{request.update}' to long-term memory",
+                    "memory": {"short_term": [], "long_term": long_term}
+                }
+            else:
+                return {
+                    "status": "success",
+                    "message": f"Memory already exists: '{request.update}'",
+                    "memory": {"short_term": [], "long_term": long_term}
+                }
+        
     except Exception as e:
+        print(f"Error in update_memory endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -81,14 +157,33 @@ async def clear_memory():
         Success message
     """
     try:
-        memory_manager = get_memory_manager()
-        memory_manager.clear_all_memory()
+        # Direct file access to avoid potential deadlocks with memory manager
+        import json
+        from pathlib import Path
+        
+        memory_file = Path("data/agent_memory.json")
+        memory_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Clear the memory file directly
+        with open(memory_file, 'w', encoding='utf-8') as f:
+            json.dump({
+                "long_term": [],
+                "last_updated": "2025-01-08T00:00:00.000000"
+            }, f, indent=2, ensure_ascii=False)
+        
+        # Try to notify memory manager subscribers (non-blocking)
+        try:
+            memory_manager = get_memory_manager()
+            memory_manager._notify_subscribers()
+        except Exception as e:
+            print(f"Warning: Could not notify memory manager: {e}")
         
         return {
             "status": "success",
             "message": "All memory cleared"
         }
     except Exception as e:
+        print(f"Error in clear_memory endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -110,7 +205,13 @@ async def stream_memory():
         def callback(context):
             """Callback to push updates to queue."""
             try:
-                asyncio.create_task(queue.put(context))
+                # Use asyncio.create_task safely
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(queue.put(context))
+                else:
+                    # If no event loop is running, just log the update
+                    print(f"Memory update (no event loop): {context}")
             except Exception as e:
                 print(f"Error in memory callback: {e}")
         

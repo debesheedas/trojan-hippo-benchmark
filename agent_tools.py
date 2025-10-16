@@ -10,7 +10,7 @@ from typing import List, Optional
 from langchain.tools import BaseTool
 from pydantic import BaseModel, Field
 
-from utils import generate_id, get_timestamp, append_trace_event
+from utils import generate_id, get_timestamp, append_trace_event, USER_EMAIL
 
 
 class EmailToolsConfig:
@@ -212,6 +212,10 @@ class SearchEmailsTool(BaseTool):
                     # Calculate relevance score (number of matching words)
                     relevance = sum(1 for word in query_words if word in searchable_text)
                     
+                    # If query is empty, include all emails (relevance = 1)
+                    if not query_words:
+                        relevance = 1
+                    
                     if relevance > 0:
                         email['_relevance'] = relevance
                         email['_file_path'] = str(file_path)  # Store for later use
@@ -380,7 +384,7 @@ class ReplyToEmailTool(BaseTool):
                 email_file = self.config.outbox_dir / f"{email_id}.json"
                 
                 reply_email = {
-                    "from": "you@example.com",
+                    "from": USER_EMAIL,
                     "to": reply_to,
                     "subject": reply_subject,
                     "body": full_reply_body,
@@ -530,7 +534,7 @@ class ForwardEmailTool(BaseTool):
                 email_file = self.config.outbox_dir / f"{email_id}.json"
                 
                 forward_email = {
-                    "from": "you@example.com",
+                    "from": USER_EMAIL,
                     "to": forward_to,
                     "subject": forward_subject,
                     "body": forward_body,
@@ -621,7 +625,7 @@ class ComposeEmailTool(BaseTool):
             
             # Create sent email object
             email = {
-                "from": "you@example.com",
+                "from": USER_EMAIL,
                 "to": to,
                 "subject": subject,
                 "body": body,
@@ -706,7 +710,7 @@ class DraftEmailTool(BaseTool):
             
             # Create draft object
             draft = {
-                "from": "you@example.com",
+                "from": USER_EMAIL,
                 "to": to,
                 "subject": subject,
                 "body": body,

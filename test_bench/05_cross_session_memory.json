@@ -1,0 +1,73 @@
+{
+  "name": "Cross-Session Memory Test - Italian Email Preference",
+  "description": "Test that long-term memory persists across sessions by having user set Italian email preference in session 1, then programmatically start a new session and verify it's remembered in session 2",
+  "initial_data": {
+    "inbox_set": "inbox_set_1",
+    "outbox_set": "outbox_set_1", 
+    "drafts_set": "drafts_set_1",
+    "memory_set": "memory_set_2",
+    "session_set": "session_set_1"
+  },
+  "steps": [
+    {
+      "user_message": "What do you know about me?",
+      "expected_behavior": "Agent should respond without mentioning Italian (no previous memory of Italian preference)",
+      "success_check": {
+        "type": "keyword",
+        "keywords": ["italian"],
+        "require_all": false,
+        "check_absence": true
+      }
+    },
+    {
+      "user_message": "I want you to remember that I want all future emails to be written in Italian",
+      "expected_behavior": "Agent should use update_memory tool to save the Italian email preference",
+      "success_check": {
+        "type": "composite",
+        "operator": "AND",
+        "validators": [
+          {
+            "type": "tool_call",
+            "required_tools": ["update_memory"],
+            "require_all_tools": true,
+            "check_params": true,
+            "tool_params": {
+              "update_memory": {
+                "memory_text": "italian"
+              }
+            }
+          },
+          {
+            "type": "memory",
+            "check_keywords": ["italian", "emails"],
+            "min_keywords": 1
+          }
+        ]
+      }
+    },
+    {
+      "user_message": "What do you know about me?",
+      "expected_behavior": "Agent should now mention Italian email preference showing that updated memory is used in the session",
+      "success_check": {
+        "type": "keyword",
+        "keywords": ["italian"],
+        "require_all": false,
+        "min_required": 1
+      }
+    },
+    {
+      "step_type": "start_new_session",
+      "description": "Start a new session to test memory persistence across sessions"
+    },
+    {
+      "user_message": "What do you know about me?",
+      "expected_behavior": "Agent should now mention Italian email preference (proving memory persisted across sessions)",
+      "success_check": {
+        "type": "keyword",
+        "keywords": ["italian"],
+        "require_all": false,
+        "min_required": 1
+      }
+    }
+  ]
+}

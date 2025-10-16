@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Email Agent MVP</title>
+    <title>Email Agent</title>
     <style>
         * {
             margin: 0;
@@ -46,9 +46,90 @@
         
         .main-content {
             display: grid;
-            grid-template-columns: 1fr 2fr 380px;
+            grid-template-columns: 300px 1fr 380px; /* Session sidebar, wider chat, right column (memory + inbox) */
             gap: 20px;
             padding: 30px;
+        }
+        
+        .session-sidebar {
+            position: sticky;
+            top: 20px;
+            height: fit-content;
+        }
+        
+        .session-card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            border: 1px solid #e1e5e9;
+        }
+        
+        .session-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .session-header h2 {
+            margin: 0;
+            font-size: 1.2em;
+            color: #2c3e50;
+        }
+        
+        .new-session-btn {
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 32px;
+            height: 32px;
+            font-size: 18px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background-color 0.2s;
+        }
+        
+        .new-session-btn:hover {
+            background: #0056b3;
+        }
+        
+        .session-items {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .session-item {
+            padding: 12px;
+            margin-bottom: 8px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            border: 1px solid transparent;
+        }
+        
+        .session-item:hover {
+            background: #f8f9fa;
+        }
+        
+        .session-item.active {
+            background: #e3f2fd;
+            border-color: #2196f3;
+        }
+        
+        .session-title {
+            font-weight: 500;
+            color: #2c3e50;
+            margin-bottom: 4px;
+            font-size: 0.9em;
+        }
+        
+        .session-meta {
+            font-size: 0.75em;
+            color: #6c757d;
         }
         
         .memory-panel {
@@ -461,6 +542,14 @@
             border-left-color: #dc3545;
         }
         
+        .trace-event.system_context {
+            border-left-color: #6f42c1;
+        }
+        
+        .trace-event.system_context_error {
+            border-left-color: #fd7e14;
+        }
+        
         .status-bar {
             padding: 10px 30px;
             background: #f8f9fa;
@@ -490,12 +579,15 @@
         </div>
         
         <div class="main-content">
-            <!-- Left Column: Mailbox -->
-            <div class="mailbox-section">
-                <div class="card">
-                    <h2>📬 Inbox</h2>
-                    <div class="mailbox-list" id="mailboxList">
-                        <p style="text-align: center; color: #6c757d; padding: 20px;">Loading emails...</p>
+            <!-- Left Column: Session Sidebar -->
+            <div class="session-sidebar">
+                <div class="session-card">
+                    <div class="session-header">
+                        <h2>💬 Chat Sessions</h2>
+                        <button onclick="createNewSession()" class="new-session-btn" title="Start new chat">+</button>
+                    </div>
+                    <div id="sessionList" class="session-items">
+                        <!-- Sessions will be loaded here -->
                     </div>
                 </div>
             </div>
@@ -514,7 +606,6 @@
                 <div class="card">
                     <h2>📊 Trace Log</h2>
                     <div class="trace-log" id="traceLog"></div>
-                    <button class="small-button" onclick="refreshTrace()">Refresh Trace</button>
                 </div>
             </div>
             
@@ -530,13 +621,6 @@
                     </div>
                     
                     <div class="memory-section">
-                        <div class="memory-section-title">Short-Term (Recent Messages)</div>
-                        <div class="memory-list" id="shortTermMemory">
-                            <p class="memory-empty">No recent messages</p>
-                        </div>
-                    </div>
-                    
-                    <div class="memory-section">
                         <div class="memory-section-title">Long-Term (Persistent Facts)</div>
                         <div class="memory-list" id="longTermMemory">
                             <p class="memory-empty">No stored facts</p>
@@ -546,6 +630,14 @@
                     <div class="memory-actions">
                         <span class="memory-count" id="memoryCount">0 facts stored</span>
                         <button class="clear-memory-btn" onclick="clearMemory()">Clear Memory</button>
+                    </div>
+                </div>
+                
+                <!-- Inbox moved here -->
+                <div class="card" style="margin-top: 20px;">
+                    <h2>📬 Inbox</h2>
+                    <div class="mailbox-list" id="mailboxList">
+                        <p style="text-align: center; color: #6c757d; padding: 20px;">Loading emails...</p>
                     </div>
                 </div>
             </div>
@@ -561,9 +653,8 @@
     </div>
     
     <script>
-        // Generate session ID
-        const SESSION_ID = 'session_' + Math.random().toString(36).substr(2, 9);
-        document.getElementById('sessionId').textContent = SESSION_ID;
+        // Session management
+        let currentSessionId = null;
         
         // Add welcome message
         addMessage('agent', 'Welcome! I can help you manage your emails. Try asking me to search for emails, read specific messages, or draft new emails.');
@@ -580,6 +671,12 @@
             
             if (!text) return;
             
+            // Ensure we have a session
+            if (!currentSessionId) {
+                console.log('No session active, creating new session...');
+                await createNewSession();
+            }
+            
             // Display user message
             addMessage('user', text);
             input.value = '';
@@ -593,15 +690,21 @@
                 const response = await fetch('/api/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ session_id: SESSION_ID, text: text })
+                    body: JSON.stringify({ session_id: currentSessionId, text: text })
                 });
+                
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(`Server error (${response.status}): ${errorData.detail || errorData.message || 'Unknown error'}`);
+                }
                 
                 const data = await response.json();
                 addMessage('agent', data.response);
                 
-                // Refresh trace
-                refreshTrace();
+                // Load updated trace for current session
+                await loadSessionTraces();
             } catch (error) {
+                console.error('Chat error:', error);
                 addMessage('agent', 'Error: ' + error.message);
             } finally {
                 sendButton.disabled = false;
@@ -682,26 +785,63 @@
             emailItem.classList.toggle('expanded');
         }
         
-        async function refreshTrace() {
+        async function loadSessionTraces() {
+            if (!currentSessionId) {
+                document.getElementById('traceLog').innerHTML = '<div class="trace-event">No session active to display traces.</div>';
+                return;
+            }
+            
             try {
-                const response = await fetch(`/api/session/${SESSION_ID}/trace`);
+                const response = await fetch(`/api/traces/${currentSessionId}`);
                 const data = await response.json();
                 
                 const traceLog = document.getElementById('traceLog');
                 traceLog.innerHTML = '';
                 
-                data.events.forEach(event => {
+                if (data.length === 0) {
+                    traceLog.innerHTML = '<div class="trace-event">No trace events for this session yet.</div>';
+                    return;
+                }
+                
+                data.forEach(event => {
                     const eventDiv = document.createElement('div');
                     eventDiv.className = `trace-event ${event.event_type}`;
                     
                     const eventType = event.event_type.toUpperCase().replace('_', ' ');
                     const timestamp = new Date(event.ts).toLocaleTimeString();
                     
-                    eventDiv.innerHTML = `
-                        <div style="color: #888; font-size: 0.8em;">[${timestamp}] ${eventType}</div>
-                        <div>${JSON.stringify(event.payload, null, 2)}</div>
-                    `;
+                    let content = '';
                     
+                    if (event.event_type === 'system_context') {
+                        const payload = event.payload;
+                        content = `
+                            <div style="color: #888; font-size: 0.8em;">[${timestamp}] ${eventType}</div>
+                            <div style="margin: 10px 0;">
+                                <strong>System Prompt Length:</strong> ${payload.system_prompt_length} characters<br>
+                                <strong>Memory Instructions Length:</strong> ${payload.memory_instructions_length} characters<br>
+                                <strong>Memory Context Length:</strong> ${payload.memory_context_length} characters
+                            </div>
+                            <details style="margin: 10px 0;">
+                                <summary style="cursor: pointer; color: #6f42c1; font-weight: bold;">📋 Memory Context</summary>
+                                <pre style="background: #f8f9fa; padding: 10px; margin: 5px 0; border-radius: 4px; white-space: pre-wrap; font-size: 0.85em;">${payload.memory_context || '(empty)'}</pre>
+                            </details>
+                            <details style="margin: 10px 0;">
+                                <summary style="cursor: pointer; color: #6f42c1; font-weight: bold;">📝 Memory Instructions</summary>
+                                <pre style="background: #f8f9fa; padding: 10px; margin: 5px 0; border-radius: 4px; white-space: pre-wrap; font-size: 0.85em;">${payload.memory_instructions || '(empty)'}</pre>
+                            </details>
+                            <details style="margin: 10px 0;">
+                                <summary style="cursor: pointer; color: #6f42c1; font-weight: bold;">🔧 Full System Prompt</summary>
+                                <pre style="background: #f8f9fa; padding: 10px; margin: 5px 0; border-radius: 4px; white-space: pre-wrap; font-size: 0.8em; max-height: 300px; overflow-y: auto;">${payload.full_system_prompt}</pre>
+                            </details>
+                        `;
+                    } else {
+                        content = `
+                            <div style="color: #888; font-size: 0.8em;">[${timestamp}] ${eventType}</div>
+                            <div>${JSON.stringify(event.payload, null, 2)}</div>
+                        `;
+                    }
+                    
+                    eventDiv.innerHTML = content;
                     traceLog.appendChild(eventDiv);
                 });
                 
@@ -734,13 +874,6 @@
             addMessage('agent', 'Chat cleared. How can I help you?');
         }
         
-        // Auto-refresh trace every 5 seconds when chat is active
-        setInterval(() => {
-            const chatHistory = document.getElementById('chatHistory');
-            if (chatHistory.children.length > 1) {
-                refreshTrace();
-            }
-        }, 5000);
         
         // Memory Management Functions
         let memoryEventSource = null;
@@ -783,23 +916,17 @@
         }
         
         function updateMemoryDisplay(memory) {
-            // Update short-term memory
-            const shortTermDiv = document.getElementById('shortTermMemory');
-            if (memory.short_term && memory.short_term.length > 0) {
-                shortTermDiv.innerHTML = '<ul>' + 
-                    memory.short_term.map(msg => `<li>${escapeHtml(msg)}</li>`).join('') + 
-                    '</ul>';
-            } else {
-                shortTermDiv.innerHTML = '<p class="memory-empty">No recent messages</p>';
-            }
+            console.log('Updating memory display with:', memory);
             
             // Update long-term memory
             const longTermDiv = document.getElementById('longTermMemory');
             if (memory.long_term && memory.long_term.length > 0) {
+                console.log('Updating long-term memory with', memory.long_term.length, 'facts');
                 longTermDiv.innerHTML = '<ul>' + 
                     memory.long_term.map(fact => `<li>${escapeHtml(fact)}</li>`).join('') + 
                     '</ul>';
             } else {
+                console.log('No long-term memory to display');
                 longTermDiv.innerHTML = '<p class="memory-empty">No stored facts</p>';
             }
             
@@ -807,15 +934,22 @@
             const countDiv = document.getElementById('memoryCount');
             const count = memory.long_term ? memory.long_term.length : 0;
             countDiv.textContent = `${count} fact${count !== 1 ? 's' : ''} stored`;
+            console.log('Updated memory count to:', count);
         }
         
         async function refreshMemory() {
             try {
+                console.log('Refreshing memory...');
                 const response = await fetch('/memory');
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
                 const memory = await response.json();
+                console.log('Memory refreshed:', memory);
                 updateMemoryDisplay(memory);
             } catch (error) {
                 console.error('Error refreshing memory:', error);
+                alert(`Failed to refresh memory: ${error.message}`);
             }
         }
         
@@ -843,6 +977,184 @@
             div.textContent = text;
             return div.innerHTML;
         }
+        
+        // Session Management Functions
+        async function loadSessions() {
+            try {
+                const response = await fetch('/sessions');
+                const sessions = await response.json();
+                
+                const sessionList = document.getElementById('sessionList');
+                sessionList.innerHTML = '';
+                
+                if (sessions.length === 0) {
+                    sessionList.innerHTML = '<p style="text-align: center; color: #6c757d; padding: 20px; font-size: 0.9em;">No sessions yet</p>';
+                    // Create a default session if none exist
+                    if (!currentSessionId) {
+                        await createNewSession();
+                    }
+                    return;
+                }
+                
+                // If no current session is set, default to the first one
+                if (!currentSessionId && sessions.length > 0) {
+                    await switchToSession(sessions[0].session_id);
+                }
+                
+                sessions.forEach(session => {
+                    const sessionDiv = document.createElement('div');
+                    sessionDiv.className = 'session-item';
+                    if (session.session_id === currentSessionId) {
+                        sessionDiv.classList.add('active');
+                    }
+                    
+                    const date = new Date(session.last_updated);
+                    const timeAgo = getTimeAgo(date);
+                    
+                    sessionDiv.innerHTML = `
+                        <div class="session-title">${escapeHtml(session.title)}</div>
+                        <div class="session-meta">${timeAgo} • ${session.message_count} messages</div>
+                    `;
+                    
+                    sessionDiv.onclick = () => switchToSession(session.session_id);
+                    sessionList.appendChild(sessionDiv);
+                });
+            } catch (error) {
+                console.error('Error loading sessions:', error);
+            }
+        }
+        
+        async function createNewSession() {
+            try {
+                const response = await fetch('/sessions', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ first_message: '' })
+                });
+                
+                const session = await response.json();
+                currentSessionId = session.session_id;
+                
+                // Update status bar
+                document.getElementById('sessionId').textContent = currentSessionId;
+                
+                // Clear chat history
+                document.getElementById('chatHistory').innerHTML = '';
+                
+                // Add welcome message
+                addMessage('agent', 'Welcome to your new chat session! I can help you manage your emails.');
+                
+                // Reload sessions
+                await loadSessions();
+                
+                console.log('Created new session:', session.session_id);
+            } catch (error) {
+                console.error('Error creating session:', error);
+                alert('Failed to create new session: ' + error.message);
+            }
+        }
+        
+        async function switchToSession(sessionId) {
+            try {
+                // Get session details
+                const response = await fetch(`/sessions/${sessionId}`);
+                const session = await response.json();
+                
+                currentSessionId = sessionId;
+                
+                // Update status bar
+                document.getElementById('sessionId').textContent = currentSessionId;
+                
+                // Clear current chat
+                const chatHistory = document.getElementById('chatHistory');
+                chatHistory.innerHTML = '';
+                
+                // Load session conversation history
+                if (session.conversation_history && session.conversation_history.length > 0) {
+                    session.conversation_history.forEach(msg => {
+                        const type = msg.is_user ? 'user' : 'agent';
+                        addMessage(type, msg.message.replace(/^(User|Assistant): /, ''));
+                    });
+                } else {
+                    addMessage('agent', 'Welcome back! How can I help you with your emails?');
+                }
+                
+                // Load trace for this session
+                await loadSessionTraces();
+                
+                // Reload sessions to update active state
+                await loadSessions();
+                
+                console.log('Switched to session:', sessionId);
+            } catch (error) {
+                console.error('Error switching session:', error);
+                alert('Failed to switch session: ' + error.message);
+            }
+        }
+        
+        function getTimeAgo(date) {
+            const now = new Date();
+            const diffMs = now - date;
+            const diffMins = Math.floor(diffMs / 60000);
+            const diffHours = Math.floor(diffMs / 3600000);
+            const diffDays = Math.floor(diffMs / 86400000);
+            
+            if (diffMins < 1) return 'Just now';
+            if (diffMins < 60) return `${diffMins}m ago`;
+            if (diffHours < 24) return `${diffHours}h ago`;
+            if (diffDays < 7) return `${diffDays}d ago`;
+            return date.toLocaleDateString();
+        }
+        
+        // Update sendMessage to use currentSessionId
+        async function sendMessage() {
+            const input = document.getElementById('chatInput');
+            const text = input.value.trim();
+            if (!text) return;
+            
+            const sendButton = document.getElementById('sendButton');
+            sendButton.disabled = true;
+            sendButton.textContent = 'Sending...';
+            
+            addMessage('user', text);
+            input.value = '';
+            
+            try {
+                const response = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: currentSessionId, text: text })
+                });
+                
+                const data = await response.json();
+                addMessage('agent', data.response);
+                
+                // Load updated trace and refresh sessions
+                await loadSessionTraces();
+                await loadSessions();
+            } catch (error) {
+                addMessage('agent', 'Error: ' + error.message);
+            } finally {
+                sendButton.disabled = false;
+                sendButton.textContent = 'Send';
+            }
+        }
+        
+        // Initialize page
+        async function initializePage() {
+            try {
+                // Load sessions first
+                await loadSessions();
+                
+                // Then load traces for the current session
+                await loadSessionTraces();
+            } catch (error) {
+                console.error('Error initializing page:', error);
+            }
+        }
+        
+        // Initialize page on load
+        initializePage();
         
         // Cleanup on page unload
         window.addEventListener('beforeunload', () => {

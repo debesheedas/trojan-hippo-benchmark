@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from typing import Optional
 
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -29,9 +30,13 @@ from utils import (
     ensure_data_directories,
     append_trace_event,
     read_trace_events,
+    get_timestamp,
+    generate_id,
 )
 from backend.memory_manager import get_memory_manager
 from backend.routes.memory_routes import router as memory_router
+from langchain.memory import ChatMessageHistory, ConversationBufferWindowMemory, ConversationSummaryMemory
+from langchain_core.runnables.history import RunnableWithMessageHistory
 
 # Load environment variables
 load_dotenv()
@@ -60,9 +65,83 @@ tools_config = EmailToolsConfig(
     trace_file=config["data"]["trace_file"]
 )
 
+# Session store for LangChain's RunnableWithMessageHistory
+session_store = {}
+
+def get_session_memory(session_id: str) -> ChatMessageHistory:
+    """Get or create session memory for a given session ID."""
+    if session_id not in session_store:
+        session_store[session_id] = ChatMessageHistory()
+    return session_store[session_id]
+
+def load_sessions_from_disk():
+    """Load sessions from disk on startup."""
+    import json
+    from pathlib import Path
+    
+    sessions_dir = Path("data/sessions")
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    
+    for session_file in sessions_dir.glob("*.json"):
+        try:
+            with open(session_file, 'r', encoding='utf-8') as f:
+                session_data = json.load(f)
+                session_id = session_data["session_id"]
+                
+                # Recreate ChatMessageHistory from stored messages
+                chat_history = ChatMessageHistory()
+                for msg_data in session_data.get("messages", []):
+                    if msg_data["type"] == "human":
+                        from langchain_core.messages import HumanMessage
+                        chat_history.add_message(HumanMessage(content=msg_data["content"]))
+                    elif msg_data["type"] == "ai":
+                        from langchain_core.messages import AIMessage
+                        chat_history.add_message(AIMessage(content=msg_data["content"]))
+                
+                session_store[session_id] = chat_history
+                print(f"Loaded session {session_id} with {len(chat_history.messages)} messages")
+        except Exception as e:
+            print(f"Error loading session from {session_file}: {e}")
+
+def save_session_to_disk(session_id: str):
+    """Save session to disk."""
+    import json
+    from pathlib import Path
+    
+    if session_id not in session_store:
+        return
+    
+    sessions_dir = Path("data/sessions")
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    
+    session_file = sessions_dir / f"{session_id}.json"
+    chat_history = session_store[session_id]
+    
+    # Convert messages to serializable format
+    messages = []
+    for msg in chat_history.messages:
+        messages.append({
+            "type": "human" if msg.__class__.__name__ == "HumanMessage" else "ai",
+            "content": msg.content
+        })
+    
+    session_data = {
+        "session_id": session_id,
+        "messages": messages,
+        "last_updated": get_timestamp()
+    }
+    
+    try:
+        with open(session_file, 'w', encoding='utf-8') as f:
+            json.dump(session_data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Error saving session {session_id}: {e}")
+
 # Create tools
 email_tools = create_tools(tools_config)
-memory_tools = create_memory_tools()
+# Get memory file path from config, default to standard location
+memory_file = config.get("data", {}).get("memory_file", "data/agent_memory.json")
+memory_tools = create_memory_tools(memory_file=memory_file)
 all_tools = email_tools + memory_tools
 
 
@@ -130,8 +209,8 @@ class ErrorHandlingCallback(BaseCallbackHandler):
             )
 
 
-def create_agent_executor() -> AgentExecutor:
-    """Create and configure the LangChain agent."""
+def create_agent_executor() -> RunnableWithMessageHistory:
+    """Create and configure the LangChain agent with session management."""
     
     # Initialize LLM based on config
     model_config = config.get("model", {})
@@ -164,8 +243,15 @@ def create_agent_executor() -> AgentExecutor:
             memory_instructions = f.read()
     
     # Get long-term memory context
-    memory_manager = get_memory_manager()
-    memory_context = memory_manager.get_long_term_as_text()
+    try:
+        memory_manager = get_memory_manager()
+        memory_context = memory_manager.get_long_term_as_text()
+        print(f"Loaded memory context: {len(memory_context)} characters")
+        if memory_context:
+            print(f"Memory context preview: {memory_context[:200]}...")
+    except Exception as e:
+        print(f"Warning: Could not load memory context: {e}")
+        memory_context = ""
     
     # Create agent prompt for tool calling (native function calling)
     system_message = """You are an email assistant. Help users manage their emails efficiently.
@@ -216,6 +302,7 @@ GUIDELINES:
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_message),
+        MessagesPlaceholder(variable_name="chat_history"),
         ("human", "{input}"),
         MessagesPlaceholder(variable_name="agent_scratchpad")
     ])
@@ -233,12 +320,20 @@ GUIDELINES:
         callbacks=[ErrorHandlingCallback()]  # Debug logging
     )
     
-    return agent_executor
+    # Wrap with session management
+    chain_with_history = RunnableWithMessageHistory(
+        agent_executor,
+        get_session_memory,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+    )
+    
+    return chain_with_history
 
 
 # Pydantic models for API
 class ChatRequest(BaseModel):
-    session_id: str
+    session_id: Optional[str] = None
     text: str
 
 
@@ -280,88 +375,147 @@ async def serve_index():
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """
-    Main chat endpoint. Processes user input through the agent.
+    Main chat endpoint. Processes user input through the agent with session management.
     """
     try:
-        # Get memory manager
-        memory_manager = get_memory_manager()
-        
-        # Add user message to short-term memory
-        memory_manager.add_short_term(f"User: {request.text}")
-        
+        # Resolve or create session id
+        session_id = request.session_id or f"session_{generate_id()[:8]}"
+
+        # Ensure session memory exists
+        _ = get_session_memory(session_id)
+
         # Log user input
         append_trace_event(
             config["data"]["trace_file"],
             "user_input",
-            request.session_id,
+            session_id,
             {"text": request.text}
         )
         
         # Set session ID in tools config
-        tools_config.session_id = request.session_id
+        tools_config.session_id = session_id
         
-        # Create agent executor
+        # Create agent executor with session management
         agent_executor = create_agent_executor()
         
-        # Run agent
+        # Run agent with session management
         try:
-            result = agent_executor.invoke({"input": request.text})
+            result = agent_executor.invoke(
+                {"input": request.text},
+                {"configurable": {"session_id": session_id}}
+            )
             response_text = result.get("output", "I encountered an error processing your request.")
             
             # Check if max iterations was reached
             if "Agent stopped due to iteration limit" in response_text or \
                "Agent stopped due to max iterations" in response_text:
                 response_text += "\n\n(Note: I've reached the maximum number of tool calls allowed. Please provide more specific instructions or break this into smaller tasks.)"
-            
-            # Add agent response to short-term memory
-            memory_manager.add_short_term(f"Assistant: {response_text}")
-            
-            # Check for memory updates in the response
-            process_memory_updates(response_text, memory_manager)
                 
         except Exception as e:
             error_msg = str(e)
             response_text = f"I encountered an error: {error_msg}"
             print(f"Agent Error: {error_msg}")
-            memory_manager.add_short_term(f"Assistant: {response_text}")
         
         # Log agent response
         append_trace_event(
             config["data"]["trace_file"],
             "agent_response",
-            request.session_id,
+            session_id,
             {"text": response_text}
         )
         
+        # Save session to disk after each interaction
+        save_session_to_disk(session_id)
+        
         return ChatResponse(
             response=response_text,
-            session_id=request.session_id
+            session_id=session_id
         )
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-def process_memory_updates(response_text: str, memory_manager):
-    """
-    Process potential memory updates from agent response.
-    
-    Looks for patterns like:
-    - "User prefers..."
-    - "Forget that..."
-    - Lines starting with memory update patterns
-    """
-    lines = response_text.split('\n')
-    
-    for line in lines:
-        line = line.strip()
+# Memory updates are now handled by the update_memory tool
+
+# Session Management API Endpoints
+@app.get("/sessions")
+async def get_sessions():
+    """Get all sessions."""
+    try:
+        sessions = []
+        for session_id, chat_history in session_store.items():
+            sessions.append({
+                "session_id": session_id,
+                "title": f"Session {session_id}",
+                "created_at": "2025-01-08T00:00:00Z",
+                "last_updated": "2025-01-08T00:00:00Z",
+                "message_count": len(chat_history.messages)
+            })
+        return sessions
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/sessions")
+async def create_session(request: dict = None):
+    """Create a new session."""
+    try:
+        session_id = f"session_{len(session_store) + 1:03d}"
+        session_store[session_id] = ChatMessageHistory()
         
-        # Check if line starts with memory update pattern
-        if line.lower().startswith(('user ', 'forget ')):
-            # Extract the memory update (remove any markdown or formatting)
-            memory_update = line.strip('*_`')
-            memory_manager.add_long_term(memory_update)
-            print(f"Memory update detected: {memory_update}")
+        # Save session to disk
+        save_session_to_disk(session_id)
+        
+        return {
+            "session_id": session_id,
+            "title": "New Chat",
+            "created_at": "2025-01-08T00:00:00Z",
+            "last_updated": "2025-01-08T00:00:00Z",
+            "message_count": 0
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    """Get session details."""
+    try:
+        if session_id not in session_store:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        chat_history = session_store[session_id]
+        conversation_history = []
+        
+        for message in chat_history.messages:
+            conversation_history.append({
+                "message": message.content,
+                "is_user": message.__class__.__name__ == "HumanMessage",
+                "timestamp": "2025-01-08T00:00:00Z"
+            })
+        
+        return {
+            "session_id": session_id,
+            "title": f"Session {session_id}",
+            "created_at": "2025-01-08T00:00:00Z",
+            "last_updated": "2025-01-08T00:00:00Z",
+            "message_count": len(chat_history.messages),
+            "short_term_memory": [msg.content for msg in chat_history.messages[-15:]],
+            "conversation_history": conversation_history
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/traces/{session_id}")
+async def get_session_traces(session_id: str):
+    """Get trace events for a specific session."""
+    try:
+        trace_events = read_trace_events(config["data"]["trace_file"], session_id)
+        return trace_events
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/api/tool/read")
@@ -445,6 +599,9 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
+    
+    # Load sessions from disk on startup
+    load_sessions_from_disk()
     
     server_config = config.get("server", {})
     uvicorn.run(

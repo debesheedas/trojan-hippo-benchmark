@@ -10,6 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+# Global constants
+USER_EMAIL = "vince.j.kaminski@enron.com"  # User's email address - change this to update user email globally
+
 
 def generate_id(prefix: str = "") -> str:
     """Generate a unique ID with optional prefix."""
@@ -42,10 +45,10 @@ def append_trace_event(
     event_id: Optional[str] = None
 ) -> str:
     """
-    Append a trace event to the trace file.
+    Append a trace event to the session-specific trace file.
     
     Args:
-        trace_file: Path to the trace JSONL file
+        trace_file: Base path to the trace JSONL file (will be modified for session-specific storage)
         event_type: Type of event (user_input, tool_call, tool_result, agent_response)
         session_id: Session identifier
         payload: Event-specific data
@@ -65,12 +68,16 @@ def append_trace_event(
         "payload": payload
     }
     
-    # Ensure trace file directory exists
+    # Create session-specific trace file path
     trace_path = Path(trace_file)
-    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    session_trace_dir = trace_path.parent / "traces"
+    session_trace_file = session_trace_dir / f"{session_id}.jsonl"
     
-    # Append event to file
-    with open(trace_path, "a", encoding="utf-8") as f:
+    # Ensure trace file directory exists
+    session_trace_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Append event to session-specific file
+    with open(session_trace_file, "a", encoding="utf-8") as f:
         f.write(json.dumps(event) + "\n")
     
     return event_id
@@ -78,26 +85,32 @@ def append_trace_event(
 
 def read_trace_events(trace_file: str, session_id: Optional[str] = None) -> list:
     """
-    Read trace events from the trace file.
+    Read trace events from the session-specific trace file.
     
     Args:
-        trace_file: Path to the trace JSONL file
-        session_id: Optional session ID to filter events
+        trace_file: Base path to the trace JSONL file (will be modified for session-specific storage)
+        session_id: Session ID to read events for (required for session-specific storage)
     
     Returns:
-        List of trace events
+        List of trace events for the specified session
     """
+    if session_id is None:
+        return []
+    
+    # Create session-specific trace file path
     trace_path = Path(trace_file)
-    if not trace_path.exists():
+    session_trace_dir = trace_path.parent / "traces"
+    session_trace_file = session_trace_dir / f"{session_id}.jsonl"
+    
+    if not session_trace_file.exists():
         return []
     
     events = []
-    with open(trace_path, "r", encoding="utf-8") as f:
+    with open(session_trace_file, "r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 event = json.loads(line)
-                if session_id is None or event.get("session_id") == session_id:
-                    events.append(event)
+                events.append(event)
     
     return events
 
