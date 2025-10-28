@@ -257,7 +257,7 @@ Edit `config.yaml` to customize:
 ```yaml
 model:
   provider: "openai"  # or "mock"
-  model_name: "gpt-4"
+  model_name: "gpt-5"
   temperature: 0.7
 
 server:

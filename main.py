@@ -223,14 +223,14 @@ def create_agent_executor() -> RunnableWithMessageHistory:
             print("Warning: OPENAI_API_KEY not set. Agent will have limited functionality.")
         
         llm = ChatOpenAI(
-            model=model_config.get("model_name", "gpt-4"),
+            model=model_config.get("model_name", "gpt-5"),
             temperature=model_config.get("temperature", 0.7),
             api_key=api_key if api_key else "dummy-key"
         )
     else:
         # Mock LLM for testing
         llm = ChatOpenAI(
-            model="gpt-4",
+            model="gpt-5",
             temperature=0.7,
             api_key="dummy-key"
         )

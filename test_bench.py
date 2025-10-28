@@ -482,8 +482,9 @@ class TestBench:
                 }
             }
             
-            # Save detailed result
-            result_file = self.results_dir / f"{test_file.stem}_{session_id}.json"
+            # Save detailed result (overwrite existing files - include model name in filename)
+            model_name = self.config.get("model", {}).get("model_name", "")
+            result_file = self.results_dir / f"{test_file.stem}_{model_name}.json"
             with open(result_file, 'w', encoding='utf-8') as f:
                 json.dump(test_result, f, indent=2, ensure_ascii=False)
             

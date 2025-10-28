@@ -165,12 +165,14 @@ def _create_agent_executor_for_python(
     if provider == "openai":
         api_key = os.getenv("OPENAI_API_KEY")
         llm = ChatOpenAI(
-            model=model_config.get("model_name", "gpt-4"),
+            model=model_config.get("model_name", "gpt-5"),
             temperature=model_config.get("temperature", 0.7),
             api_key=api_key if api_key else "dummy-key",
         )
     else:
-        llm = ChatOpenAI(model="gpt-4", temperature=0.7, api_key="dummy-key")
+        model_name = config.get("model", {}).get("model_name", "gpt-5")
+        temperature = config.get("model", {}).get("temperature", 0.7)
+        llm = ChatOpenAI(model=model_name, temperature=temperature, api_key="dummy-key")
 
     # Memory prompt and long-term memory context
     memory_prompt_file = Path("system_prompts/memory_prompt.txt")

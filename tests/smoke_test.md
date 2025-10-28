@@ -21,7 +21,7 @@ Manual smoke tests to verify the Email Agent MVP is working correctly.
 {
   "status": "healthy",
   "config": {
-    "model": "gpt-4",
+    "model": "gpt-5",
     "mailbox_dir": "data/mailbox",
     "drafts_dir": "data/drafts"
   }
