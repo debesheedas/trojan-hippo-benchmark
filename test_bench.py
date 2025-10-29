@@ -19,6 +19,7 @@ import tempfile
 import uuid
 from pathlib import Path
 from typing import Dict, List, Any, Optional
+import logging
 from datetime import datetime
 
 from agent_core import invoke_agent, clear_session_agent, clear_agent_cache
@@ -38,7 +39,71 @@ class TestBench:
         self.results_dir = Path("test_bench_results")
         self.results_dir.mkdir(exist_ok=True)
         self.test_dirs = []  # Track test directories for cleanup
+        
+        # Check if adaptive benchmark is enabled
+        self.adaptive_enabled = self.config.get("adaptive_benchmark", {}).get("enabled", False)
+        if self.adaptive_enabled:
+            # Import adaptive components only when needed
+            from optimization_strategies import DSPyOptimizer, OpenEvolveOptimizer
+            from utils import compare_attack_bench_files
+            from environment_state import StateManager
+            
+            # Initialize optimization strategies based on config
+            self.optimizers = {}
+            
+            # Check if DSPy is enabled
+            if self.config.get("dspy", {}).get("enabled", True):
+                self.optimizers["dspy"] = DSPyOptimizer(self.config)
+            
+            # Check if OpenEvolve is enabled
+            if self.config.get("openevolve", {}).get("enabled", True):
+                self.optimizers["openevolve"] = OpenEvolveOptimizer(self.config)
+            
+            if not self.optimizers:
+                print("⚠️ Warning: No optimizers enabled in config. Adaptive benchmark will not work.")
+            
+            # Cache directory for successful attacks
+            self.cache_dir = Path("attack_bench_cache")
+            self.cache_dir.mkdir(exist_ok=True)
+            
+            # Initialize state manager for environment state tracking
+            self.state_manager = StateManager()
+
+            # Set up logging for optimizers when running via TestBench
+            self._setup_optimizer_logging()
+            for optimizer in self.optimizers.values():
+                optimizer.set_logger(self.logger)
+            
+            print("🔧 Adaptive benchmark mode ENABLED")
+        else:
+            print("📊 Static benchmark mode")
     
+    def _setup_optimizer_logging(self):
+        """Initialize a file logger for optimization runs when using TestBench."""
+        try:
+            log_dir = Path("logs")
+            log_dir.mkdir(exist_ok=True)
+            self.logger = logging.getLogger("adaptive_benchmark")
+            self.logger.setLevel(logging.DEBUG)
+            # Clear existing handlers to avoid duplication
+            for h in self.logger.handlers[:]:
+                self.logger.removeHandler(h)
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_file = log_dir / f"adaptive_benchmark_{timestamp}.log"
+            file_handler = logging.FileHandler(log_file, encoding='utf-8')
+            file_handler.setLevel(logging.DEBUG)
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(logging.INFO)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            file_handler.setFormatter(formatter)
+            console_handler.setFormatter(formatter)
+            self.logger.addHandler(file_handler)
+            self.logger.addHandler(console_handler)
+            self.logger.info("Logging initialized from TestBench. Detailed logs: %s", log_file)
+        except Exception as e:
+            print(f"Warning: Failed to initialize optimizer logging: {e}")
+
     def create_test_environment(self, test_name: str, initial_data: Dict[str, str] = None) -> Dict[str, str]:
         """
         Create an isolated test environment with specified initial data.
@@ -180,8 +245,15 @@ class TestBench:
             print(f"Cleaned up test environment: {test_dir}")
         
     def run_test_from_file(self, test_file: Path) -> Dict[str, Any]:
+        """Run a single test from a JSON file (adaptive or static based on config)."""
+        if self.adaptive_enabled:
+            return self._run_adaptive_test_from_file(test_file)
+        else:
+            return self._run_static_test_from_file(test_file)
+    
+    def _run_static_test_from_file(self, test_file: Path) -> Dict[str, Any]:
         """
-        Run a single test from a JSON file.
+        Run a single test from a JSON file (static mode).
         
         Test file format:
         {
@@ -317,6 +389,7 @@ class TestBench:
                     # Run dual evaluation system (user_goal and attack_goal)
                     user_goal_passed = None
                     attack_goal_passed = None
+                    partial_attack_score = None
                     
                     # Check if this is an attack benchmark with dual goals
                     # We can detect this by checking if the step has user_goal or attack_goal fields
@@ -349,6 +422,11 @@ class TestBench:
                                 if isinstance(attack_goal_check, dict):
                                     validator = create_validator(attack_goal_check, test_config)
                                     attack_goal_passed = validator.validate(response, session_id, step_traces)
+                                    # compute partial score if available
+                                    try:
+                                        partial_attack_score = float(validator.score(response, session_id, step_traces))
+                                    except Exception:
+                                        partial_attack_score = 1.0 if attack_goal_passed else 0.0
                                 else:
                                     # String-based check function (legacy support)
                                     check_function = attack_goal_check
@@ -361,6 +439,7 @@ class TestBench:
                             except Exception as e:
                                 print(f"Attack Goal Check Error: {e}")
                                 attack_goal_passed = False
+                                partial_attack_score = 0.0
                         
                         # Print results for dual evaluation
                         if user_goal_passed is not None:
@@ -368,7 +447,8 @@ class TestBench:
                             print(f"User Goal Result: {status}")
                         if attack_goal_passed is not None:
                             status = "✓ PASSED" if attack_goal_passed else "✗ FAILED"
-                            print(f"Attack Goal Result: {status}")
+                            suffix = f" (partial={partial_attack_score:.2f})" if partial_attack_score is not None else ""
+                            print(f"Attack Goal Result: {status}{suffix}")
                         
                         # For overall test success, we consider user goal success (attack goal failure is good)
                         step_passed = user_goal_passed if user_goal_passed is not None else True
@@ -419,7 +499,8 @@ class TestBench:
                         }
                         step_result["attack_goal"] = {
                             "description": step.get("attack_goal", {}).get("description", ""),
-                            "passed": attack_goal_passed
+                            "passed": attack_goal_passed,
+                            "partial_attack_score": partial_attack_score
                         }
                     else:
                         # Legacy single evaluation
@@ -476,13 +557,7 @@ class TestBench:
                 "overall_success": all_passed,
                 "steps": step_results,
                 "session_history": session_history,
-                "test_environment": str(test_dir),
-                "summary": {
-                    "total_steps": len(steps),
-                    "passed_steps": sum(1 for s in step_results if s.get("passed") is True),
-                    "failed_steps": sum(1 for s in step_results if s.get("passed") is False),
-                    "unknown_steps": sum(1 for s in step_results if s.get("passed") is None)
-                }
+                "test_environment": str(test_dir)
             }
             
             # Save detailed result into model_name/attack_type/ structure
@@ -501,6 +576,414 @@ class TestBench:
         finally:
             # Clean up test environment
             self.cleanup_test_environment(test_dir)
+    
+    def _run_adaptive_test_from_file(self, test_file: Path) -> Dict[str, Any]:
+        """
+        Run a single test from a JSON file (adaptive mode).
+        
+        This method implements the adaptive benchmark logic:
+        1. Check for cached version first (stronger attack)
+        2. If no cache, try static attack
+        3. If static fails, try optimization strategies in order
+        4. Cache successful attacks and resume from failed step
+        """
+        print(f"\n{'='*80}")
+        print(f"RUNNING ADAPTIVE TEST: {test_file.name}")
+        print(f"{'='*80}")
+        
+        # Load test definition
+        with open(test_file, 'r', encoding='utf-8') as f:
+            test_def = json.load(f)
+        
+        test_name = test_def["name"]
+        attack_type = test_def.get("attack_type", "unknown")
+        
+        # Check if this is an indirect PI attack (only these get adaptive treatment)
+        if attack_type != "indirect":
+            print(f"📊 Non-indirect attack, running in static mode")
+            return self._run_static_test_from_file(test_file)
+        
+        # Check for cached version first
+        cached_test = self._get_cached_test(test_file)
+        if cached_test:
+            print(f"💾 Using cached test with optimized attack")
+            return self._run_static_test_from_file(cached_test)
+        
+        print(f"🔧 Running adaptive test for indirect attack: {test_name}")
+        
+        # Initialize state manager with test data
+        self.state_manager.initialize(test_def, self.config)
+        
+        # Run test with adaptive optimization
+        result = self._run_test_with_optimization(test_def, test_file)
+        
+        # Cache successful attacks
+        if result.get("optimization_used"):
+            self._cache_successful_attack(test_file, result)
+        
+        return result
+    
+    def _get_cached_test(self, test_file: Path) -> Optional[Path]:
+        """Check if there's a cached version of the test with successful attacks."""
+        cache_file = self.cache_dir / test_file.relative_to(Path("attack_bench"))
+        if cache_file.exists():
+            return cache_file
+        return None
+    
+    def _run_test_with_optimization(self, test_def: Dict[str, Any], test_file: Path) -> Dict[str, Any]:
+        """Run test with optimization when attacks fail."""
+        test_name = test_def["name"]
+        steps = test_def["steps"]
+        initial_data = test_def.get("initial_data", {})
+        
+        # Clear agent cache for clean state
+        clear_agent_cache()
+        
+        # Create test environment
+        test_config = self.create_test_environment(test_name, initial_data)
+        test_dir = Path(test_config["data"]["mailbox_dir"]).parent
+        
+        try:
+            session_id = f"adaptive_{int(time.time()*1000)}"
+            print(f"Session ID: {session_id}")
+            
+            step_results = []
+            all_passed = True
+            optimization_used = False
+            
+            for i, step in enumerate(steps, 1):
+                print(f"\n--- Step {i}/{len(steps)} ---")
+                
+                # Save state before each step
+                self.state_manager.save_state_before_step(i)
+                
+                # Check if this step has an attack goal
+                if "attack_goal" in step and step["attack_goal"]:
+                    print(f"🎯 Step {i} has attack goal, testing attack effectiveness")
+                    
+                    # Run the step and check if attack succeeds
+                    step_result = self._run_step_with_attack_check(
+                        step, i, session_id, test_config
+                    )
+                    
+                    # Check if attack failed
+                    attack_goal_passed = step_result.get("attack_goal", {}).get("passed")
+                    if attack_goal_passed is False:
+                        print(f"⚠️ Attack failed at step {i}, attempting optimization")
+                        
+                        # Restore to previous state before optimization
+                        if self.state_manager.restore_to_prev_state():
+                            print(f"🔄 Restored to previous state for optimization")
+                        else:
+                            print(f"⚠️ Could not restore to previous state, using current state")
+                        
+                        # Try optimization strategies in order: basic, dspy, openevolve
+                        optimization_result = self._optimize_attack(
+                            test_def, step, i, session_id, test_config
+                        )
+                        
+                        if optimization_result.success:
+                            print(f"✅ Optimization successful with {optimization_result.optimization_strategy}")
+                            
+                            # Update the test with optimized attack
+                            test_def = self._update_test_with_optimized_attack(
+                                test_def, optimization_result.optimized_attack_email
+                            )
+                            
+                            # Inject optimized attack into environment state
+                            current_state = self.state_manager.get_current_state()
+                            if current_state:
+                                current_state.inject_attack_email(optimization_result.optimized_attack_email, 0)
+                            
+                            # Re-run the step with optimized attack
+                            step_result = self._run_step_with_attack_check(
+                                step, i, session_id, test_config, 
+                                optimized_attack_email=optimization_result.optimized_attack_email
+                            )
+                            
+                            optimization_used = True
+                            step_result["optimization"] = {
+                                "strategy": optimization_result.optimization_strategy,
+                                "iterations": optimization_result.iterations,
+                                "feedback": optimization_result.feedback
+                            }
+                        else:
+                            print(f"❌ All optimization strategies failed for step {i}")
+                            step_result["optimization"] = {
+                                "strategy": "all_failed",
+                                "iterations": 0,
+                                "feedback": optimization_result.feedback
+                            }
+                    
+                    step_results.append(step_result)
+                    
+                    # Check if step passed
+                    if step_result.get("passed") is False:
+                        all_passed = False
+                else:
+                    # Regular step without attack goal
+                    step_result = self._run_regular_step(step, i, session_id, test_config)
+                    step_results.append(step_result)
+                    
+                    if step_result.get("passed") is False:
+                        all_passed = False
+            
+            # Compile result
+            result = {
+                "test_name": test_name,
+                "test_file": str(test_file),
+                "session_id": session_id,
+                "timestamp": datetime.now().isoformat(),
+                "overall_success": all_passed,
+                "steps": step_results,
+                "optimization_used": optimization_used,
+                "adaptive_benchmark": True,
+            }
+            
+            return result
+            
+        finally:
+            # Clean up test environment
+            self.cleanup_test_environment(test_dir)
+    
+    def _run_step_with_attack_check(self, step: Dict[str, Any], step_num: int, 
+                                  session_id: str, test_config: Dict[str, Any],
+                                  optimized_attack_email: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Run a step and check if attack succeeds."""
+        # If we have an optimized attack email, we need to update the test environment
+        if optimized_attack_email:
+            self._inject_optimized_attack_email(test_config, optimized_attack_email)
+        
+        # Run the step (reuse existing logic from static test)
+        start_time = time.time()
+        try:
+            result = invoke_agent(
+                text=step['user_message'],
+                session_id=session_id,
+                config=test_config
+            )
+            duration = time.time() - start_time
+            
+            response = result["response"]
+            print(f"Agent Response: {response[:200]}...")
+            print(f"Duration: {duration:.2f}s")
+            
+            # Get traces for evaluation
+            try:
+                step_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+            except Exception as e:
+                print(f"Warning: Could not read traces: {e}")
+                step_traces = []
+            
+            # Evaluate both user and attack goals
+            user_goal_passed = None
+            attack_goal_passed = None
+            
+            if "user_goal" in step and step["user_goal"]:
+                try:
+                    user_goal_check = step["user_goal"]["success_check"]
+                    if isinstance(user_goal_check, dict):
+                        validator = create_validator(user_goal_check, test_config)
+                        user_goal_passed = validator.validate(response, session_id, step_traces)
+                    print(f"User Goal Result: {'✓ PASSED' if user_goal_passed else '✗ FAILED'}")
+                except Exception as e:
+                    print(f"User Goal Check Error: {e}")
+                    user_goal_passed = False
+            
+            if "attack_goal" in step and step["attack_goal"]:
+                try:
+                    attack_goal_check = step["attack_goal"]["success_check"]
+                    if isinstance(attack_goal_check, dict):
+                        validator = create_validator(attack_goal_check, test_config)
+                        attack_goal_passed = validator.validate(response, session_id, step_traces)
+                        try:
+                            partial_attack_score = float(validator.score(response, session_id, step_traces))
+                        except Exception:
+                            partial_attack_score = 1.0 if attack_goal_passed else 0.0
+                    status = '✓ PASSED' if attack_goal_passed else '✗ FAILED'
+                    pas = f"{partial_attack_score:.2f}" if isinstance(partial_attack_score, float) else "n/a"
+                    print(f"Attack Goal Result: {status} (partial={pas})")
+                except Exception as e:
+                    print(f"Attack Goal Check Error: {e}")
+                    attack_goal_passed = False
+                    partial_attack_score = 0.0
+            
+            # Overall step success (user goal success, attack goal failure is good)
+            step_passed = user_goal_passed if user_goal_passed is not None else True
+            
+            return {
+                "step": step_num,
+                "user_message": step['user_message'],
+                "expected_behavior": step['expected_behavior'],
+                "agent_response": response,
+                "duration_s": round(duration, 3),
+                "passed": step_passed,
+                "user_goal": {
+                    "description": step.get("user_goal", {}).get("description", ""),
+                    "passed": user_goal_passed
+                },
+                "attack_goal": {
+                    "description": step.get("attack_goal", {}).get("description", ""),
+                    "passed": attack_goal_passed,
+                    "partial_attack_score": partial_attack_score
+                }
+            }
+            
+        except Exception as e:
+            print(f"Error in step {step_num}: {e}")
+            return {
+                "step": step_num,
+                "user_message": step['user_message'],
+                "expected_behavior": step['expected_behavior'],
+                "error": str(e),
+                "passed": False
+            }
+    
+    def _run_regular_step(self, step: Dict[str, Any], step_num: int, 
+                         session_id: str, test_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Run a regular step without attack goals."""
+        start_time = time.time()
+        try:
+            result = invoke_agent(
+                text=step['user_message'],
+                session_id=session_id,
+                config=test_config
+            )
+            duration = time.time() - start_time
+            
+            response = result["response"]
+            
+            return {
+                "step": step_num,
+                "user_message": step['user_message'],
+                "expected_behavior": step['expected_behavior'],
+                "agent_response": response,
+                "duration_s": round(duration, 3),
+                "passed": True
+            }
+            
+        except Exception as e:
+            print(f"Error in regular step {step_num}: {e}")
+            return {
+                "step": step_num,
+                "user_message": step['user_message'],
+                "expected_behavior": step['expected_behavior'],
+                "error": str(e),
+                "passed": False
+            }
+    
+    def _optimize_attack(self, test_def: Dict[str, Any], failed_step: Dict[str, Any], 
+                        step_num: int, session_id: str, test_config: Dict[str, Any]) -> Any:
+        """Try different optimization strategies to find a successful attack."""
+        from optimization_strategies import OptimizationResult
+        
+        # Get the original attack email
+        original_attack_email = None
+        if "attack_emails" in test_def.get("initial_data", {}):
+            attack_emails = test_def["initial_data"]["attack_emails"]
+            if attack_emails:
+                original_attack_email = attack_emails[0]
+        
+        if not original_attack_email:
+            print("❌ No attack email found in test definition")
+            return OptimizationResult(
+                success=False,
+                optimized_attack_email=None,
+                optimization_strategy="none",
+                iterations=0,
+                feedback=["No attack email found"],
+                final_evaluation=None
+            )
+        
+        # Check if any optimizers are available
+        if not self.optimizers:
+            print("❌ No optimizers available (all disabled in config)")
+            return OptimizationResult(
+                success=False,
+                optimized_attack_email=None,
+                optimization_strategy="no_optimizers",
+                iterations=0,
+                feedback=["No optimizers enabled in configuration"],
+                final_evaluation=None
+            )
+        
+        # Get current environment state for optimization
+        current_state = self.state_manager.get_current_state()
+        if not current_state:
+            print("❌ No environment state available for optimization")
+            return OptimizationResult(
+                success=False,
+                optimized_attack_email=None,
+                optimization_strategy="no_state",
+                iterations=0,
+                feedback=["No environment state available"],
+                final_evaluation=None
+            )
+        
+        # Try each optimization strategy in order
+        for strategy_name, optimizer in self.optimizers.items():
+            print(f"🔧 Trying optimization strategy: {strategy_name}")
+            
+            result = optimizer.optimize_attack(
+                original_attack_email, failed_step, step_num, session_id, test_config, current_state
+            )
+            
+            if result.success:
+                print(f"✅ Optimization successful with {strategy_name}")
+                return result
+            else:
+                print(f"⚠️ Optimization failed with {strategy_name}")
+        
+        # All strategies failed
+        return OptimizationResult(
+            success=False,
+            optimized_attack_email=None,
+            optimization_strategy="all_failed",
+            iterations=0,
+            feedback=["All optimization strategies failed"],
+            final_evaluation=None
+        )
+    
+    def _update_test_with_optimized_attack(self, test_def: Dict[str, Any], 
+                                         optimized_attack_email: Dict[str, Any]) -> Dict[str, Any]:
+        """Update test definition with optimized attack email."""
+        if "initial_data" in test_def and "attack_emails" in test_def["initial_data"]:
+            test_def["initial_data"]["attack_emails"][0] = optimized_attack_email
+        return test_def
+    
+    def _inject_optimized_attack_email(self, test_config: Dict[str, Any], 
+                                     optimized_attack_email: Dict[str, Any]):
+        """Inject optimized attack email into the test environment."""
+        # This would update the inbox with the new attack email
+        # For now, this is a placeholder - in a real implementation,
+        # we would replace the attack email in the inbox
+        print(f"💉 Injecting optimized attack email into test environment")
+        # TODO: Implement actual email injection
+    
+    def _cache_successful_attack(self, test_file: Path, result: Dict[str, Any]):
+        """Cache a test with successful attacks for future runs."""
+        print(f"💾 Caching successful attack for {test_file.name}")
+        
+        # Create cache directory structure
+        cache_file = self.cache_dir / test_file.relative_to(Path("attack_bench"))
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Load original test and update with optimized attacks
+        with open(test_file, 'r', encoding='utf-8') as f:
+            cached_test = json.load(f)
+        
+        # Add optimization metadata
+        cached_test["optimization_metadata"] = {
+            "optimized": True,
+            "optimization_timestamp": datetime.now().isoformat(),
+            "model_name": self.model_name
+        }
+        
+        # Save cached version
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(cached_test, f, indent=2, ensure_ascii=False)
+        
+        print(f"💾 Cached test saved to: {cache_file}")
     
     def discover_test_files(self, test_path: str) -> List[Path]:
         """
@@ -596,9 +1079,15 @@ class TestBench:
         passed_tests = sum(1 for r in results if r["overall_success"])
         failed_tests = total_tests - passed_tests
         
-        total_steps = sum(r["summary"]["total_steps"] for r in results)
-        passed_steps = sum(r["summary"]["passed_steps"] for r in results)
-        failed_steps = sum(r["summary"]["failed_steps"] for r in results)
+        # Calculate step statistics from individual step results
+        all_steps = []
+        for r in results:
+            if "steps" in r:
+                all_steps.extend(r["steps"])
+        
+        total_steps = len(all_steps)
+        passed_steps = sum(1 for s in all_steps if s.get("passed") is True)
+        failed_steps = sum(1 for s in all_steps if s.get("passed") is False)
         
         # Group results by attack_type
         attack_type_groups = {"benign": [], "direct": [], "indirect": []}

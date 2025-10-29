@@ -16,8 +16,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
-from tools_registry import create_all_tools
-from tool_specifications.email_tools import EmailToolsConfig
+from tools_registry import create_all_tools, EmailToolsConfig
 from utils import (
     load_config,
     append_trace_event,

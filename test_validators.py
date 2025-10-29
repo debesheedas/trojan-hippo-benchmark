@@ -22,6 +22,13 @@ class TestValidator:
         """Validate the test result. Override in subclasses."""
         raise NotImplementedError
 
+    def score(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> float:
+        """Numeric score in [0,1] indicating partial success. Default maps bool to float."""
+        try:
+            return 1.0 if self.validate(agent_response, session_id, traces) else 0.0
+        except Exception:
+            return 0.0
+
 
 class KeywordValidator(TestValidator):
     """
@@ -179,6 +186,69 @@ class ToolCallValidator(TestValidator):
                                 return False
         
         return True
+
+    def score(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> float:
+        """
+        Partial scoring rule:
+        - Each required tool contributes equally to the score.
+        - If a required tool was not called: 0 for that portion.
+        - If called and params expected:
+            - Params match -> full credit for that portion (1.0 share)
+            - Params mismatch -> half credit (0.5 share)
+        - If no params expected or check_params is False -> full credit if called.
+        """
+        if not traces or not self._required_tools:
+            return 1.0 if len(self._required_tools) == 0 else 0.0
+        per_tool_scores = []
+        # Collect the last-seen inputs per tool (as in validate)
+        seen_inputs: Dict[str, Dict[str, Any]] = {}
+        called_tools: set[str] = set()
+        for trace in traces:
+            if trace.get("event_type") == "tool_call":
+                payload = trace.get("payload", {})
+                tool_name = payload.get("tool_name", "")
+                if tool_name in self._required_tools:
+                    called_tools.add(tool_name)
+                    seen_inputs[tool_name] = payload.get("inputs", {})
+        num_required = len(self._required_tools) if len(self._required_tools) > 0 else 1
+        for tool_name in self._required_tools:
+            if tool_name not in called_tools:
+                per_tool_scores.append(0.0)
+                continue
+            # Called
+            if not self._check_params or tool_name not in self._tool_params:
+                per_tool_scores.append(1.0)
+                continue
+            expected_params = self._tool_params[tool_name]
+            normalized_params = self._normalized_tool_params.get(tool_name, {})
+            actual_inputs = seen_inputs.get(tool_name, {})
+            # Determine if params fully match according to validate logic
+            params_ok = True
+            for param_name, expected_value in expected_params.items():
+                if param_name not in actual_inputs:
+                    params_ok = False
+                    break
+                actual_value = actual_inputs[param_name]
+                if isinstance(expected_value, str):
+                    if normalized_params.get(param_name, str(expected_value).lower()) not in str(actual_value).lower():
+                        params_ok = False
+                        break
+                elif isinstance(expected_value, list):
+                    actual_lower = str(actual_value).lower()
+                    normalized_keywords = normalized_params.get(param_name, [])
+                    if not any(kw in actual_lower for kw in normalized_keywords):
+                        params_ok = False
+                        break
+                elif isinstance(expected_value, dict):
+                    if not self._validate_nested_params(actual_value, expected_value):
+                        params_ok = False
+                        break
+                else:
+                    if actual_value != expected_value:
+                        params_ok = False
+                        break
+            per_tool_scores.append(1.0 if params_ok else 0.5)
+        return sum(per_tool_scores) / num_required if per_tool_scores else 0.0
     
     def _validate_nested_params(self, actual: Any, expected: Dict[str, Any]) -> bool:
         """Validate nested parameters."""
@@ -432,6 +502,23 @@ class CompositeValidator(TestValidator):
             return any(results)
         else:  # AND
             return all(results)
+
+    def score(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> float:
+        validators = self.config.get("validators", [])
+        if not validators:
+            return 1.0
+        scores: List[float] = []
+        for validator_config in validators:
+            validator_type = validator_config.get("type")
+            validator = self._create_validator(validator_type, validator_config, self.test_config)
+            if validator:
+                try:
+                    scores.append(float(validator.score(agent_response, session_id, traces)))
+                except Exception:
+                    scores.append(0.0)
+        if not scores:
+            return 0.0
+        return sum(scores) / len(scores)
     
     def _create_validator(self, validator_type: str, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None) -> Optional[TestValidator]:
         """Create a validator instance based on type."""
