@@ -18,13 +18,12 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
 
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
-from langchain.callbacks.base import BaseCallbackHandler
+from langchain_core.messages import HumanMessage, AIMessage
 
-from agent_tools import EmailToolsConfig, create_tools
-from memory_tools import create_memory_tools
+from tools_registry import create_all_tools
+from tool_specifications.email_tools import EmailToolsConfig
 from utils import (
     load_config,
     ensure_data_directories,
@@ -35,8 +34,7 @@ from utils import (
 )
 from backend.memory_manager import get_memory_manager
 from backend.routes.memory_routes import router as memory_router
-from langchain.memory import ChatMessageHistory, ConversationBufferWindowMemory, ConversationSummaryMemory
-from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.messages import HumanMessage, AIMessage
 
 # Load environment variables
 load_dotenv()
@@ -65,13 +63,13 @@ tools_config = EmailToolsConfig(
     trace_file=config["data"]["trace_file"]
 )
 
-# Session store for LangChain's RunnableWithMessageHistory
+# Session store for message history
 session_store = {}
 
-def get_session_memory(session_id: str) -> ChatMessageHistory:
+def get_session_memory(session_id: str) -> list:
     """Get or create session memory for a given session ID."""
     if session_id not in session_store:
-        session_store[session_id] = ChatMessageHistory()
+        session_store[session_id] = []
     return session_store[session_id]
 
 def load_sessions_from_disk():
@@ -88,18 +86,16 @@ def load_sessions_from_disk():
                 session_data = json.load(f)
                 session_id = session_data["session_id"]
                 
-                # Recreate ChatMessageHistory from stored messages
-                chat_history = ChatMessageHistory()
+                # Recreate message history from stored messages
+                messages = []
                 for msg_data in session_data.get("messages", []):
                     if msg_data["type"] == "human":
-                        from langchain_core.messages import HumanMessage
-                        chat_history.add_message(HumanMessage(content=msg_data["content"]))
+                        messages.append({"role": "user", "content": msg_data["content"]})
                     elif msg_data["type"] == "ai":
-                        from langchain_core.messages import AIMessage
-                        chat_history.add_message(AIMessage(content=msg_data["content"]))
+                        messages.append({"role": "assistant", "content": msg_data["content"]})
                 
-                session_store[session_id] = chat_history
-                print(f"Loaded session {session_id} with {len(chat_history.messages)} messages")
+                session_store[session_id] = messages
+                print(f"Loaded session {session_id} with {len(messages)} messages")
         except Exception as e:
             print(f"Error loading session from {session_file}: {e}")
 
@@ -115,19 +111,27 @@ def save_session_to_disk(session_id: str):
     sessions_dir.mkdir(parents=True, exist_ok=True)
     
     session_file = sessions_dir / f"{session_id}.json"
-    chat_history = session_store[session_id]
+    messages = session_store[session_id]
     
     # Convert messages to serializable format
-    messages = []
-    for msg in chat_history.messages:
-        messages.append({
-            "type": "human" if msg.__class__.__name__ == "HumanMessage" else "ai",
-            "content": msg.content
+    serializable_messages = []
+    for msg in messages:
+        if isinstance(msg, dict):
+            msg_type = "human" if msg.get("role") == "user" else "ai"
+            content = msg.get("content", "")
+        else:
+            # Handle old format if any
+            msg_type = "human" if hasattr(msg, '__class__') and 'Human' in msg.__class__.__name__ else "ai"
+            content = getattr(msg, 'content', str(msg))
+        
+        serializable_messages.append({
+            "type": msg_type,
+            "content": content
         })
     
     session_data = {
         "session_id": session_id,
-        "messages": messages,
+        "messages": serializable_messages,
         "last_updated": get_timestamp()
     }
     
@@ -137,79 +141,25 @@ def save_session_to_disk(session_id: str):
     except Exception as e:
         print(f"Error saving session {session_id}: {e}")
 
-# Create tools
-email_tools = create_tools(tools_config)
-# Get memory file path from config, default to standard location
+# Create tools using the unified registry
 memory_file = config.get("data", {}).get("memory_file", "data/agent_memory.json")
-memory_tools = create_memory_tools(memory_file=memory_file)
-all_tools = email_tools + memory_tools
+trace_file = config.get("data", {}).get("trace_file", "data/trace.jsonl")
+all_tools = create_all_tools(
+    email_config=tools_config,
+    memory_file=memory_file,
+    session_id=None,  # Will be set per session
+    trace_file=trace_file
+)
+
+# Create separate email tools for direct API endpoints
+from tools_registry import create_email_tools
+email_tools = create_email_tools(tools_config)
 
 
-class ErrorHandlingCallback(BaseCallbackHandler):
-    """Callback to handle and log tool errors gracefully."""
-    
-    def on_tool_start(self, serialized, input_str: str, **kwargs) -> None:
-        """Log when a tool starts executing."""
-        tool_name = serialized.get("name", "unknown")
-        print(f"\n{'='*60}")
-        print(f"TOOL START: {tool_name}")
-        print(f"RAW INPUT: {input_str}")
-        print(f"{'='*60}\n")
-        
-        # Log to trace file as well
-        if hasattr(tools_config, 'session_id') and tools_config.session_id:
-            append_trace_event(
-                config["data"]["trace_file"],
-                "debug_tool_start",
-                tools_config.session_id,
-                {
-                    "tool_name": tool_name,
-                    "raw_input": input_str,
-                    "serialized": str(serialized)
-                }
-            )
-    
-    def on_tool_error(self, error: Exception, **kwargs) -> None:
-        """Handle tool execution errors."""
-        error_msg = str(error)
-        print(f"\n{'!'*60}")
-        print(f"TOOL ERROR: {error_msg}")
-        print(f"{'!'*60}\n")
-        
-        # Log to trace file
-        if hasattr(tools_config, 'session_id') and tools_config.session_id:
-            append_trace_event(
-                config["data"]["trace_file"],
-                "debug_tool_error",
-                tools_config.session_id,
-                {"error": error_msg}
-            )
-    
-    def on_agent_action(self, action, **kwargs) -> None:
-        """Log agent actions for debugging."""
-        print(f"\n{'~'*60}")
-        print(f"AGENT ACTION:")
-        print(f"  Tool: {action.tool}")
-        print(f"  Tool Input (type={type(action.tool_input).__name__}): {action.tool_input}")
-        print(f"  Log: {action.log}")
-        print(f"{'~'*60}\n")
-        
-        # Log to trace file
-        if hasattr(tools_config, 'session_id') and tools_config.session_id:
-            append_trace_event(
-                config["data"]["trace_file"],
-                "debug_agent_action",
-                tools_config.session_id,
-                {
-                    "tool": action.tool,
-                    "tool_input": str(action.tool_input),
-                    "tool_input_type": type(action.tool_input).__name__,
-                    "log": action.log
-                }
-            )
+# Note: Callback handling is now built into the new LangChain API
 
 
-def create_agent_executor() -> RunnableWithMessageHistory:
+def create_agent_executor():
     """Create and configure the LangChain agent with session management."""
     
     # Initialize LLM based on config
@@ -223,14 +173,14 @@ def create_agent_executor() -> RunnableWithMessageHistory:
             print("Warning: OPENAI_API_KEY not set. Agent will have limited functionality.")
         
         llm = ChatOpenAI(
-            model=model_config.get("model_name", "gpt-5"),
+            model=model_config.get("model_name", "gpt-4o"),
             temperature=model_config.get("temperature", 0.7),
             api_key=api_key if api_key else "dummy-key"
         )
     else:
         # Mock LLM for testing
         llm = ChatOpenAI(
-            model="gpt-5",
+            model="gpt-4o",
             temperature=0.7,
             api_key="dummy-key"
         )
@@ -253,7 +203,7 @@ def create_agent_executor() -> RunnableWithMessageHistory:
         print(f"Warning: Could not load memory context: {e}")
         memory_context = ""
     
-    # Create agent prompt for tool calling (native function calling)
+    # Create system prompt
     system_message = """You are an email assistant. Help users manage their emails efficiently.
 
 AVAILABLE TOOLS:
@@ -299,36 +249,16 @@ GUIDELINES:
         memory_instructions=memory_instructions,
         memory_context=memory_context
     )
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_message),
-        MessagesPlaceholder(variable_name="chat_history"),
-        ("human", "{input}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad")
-    ])
     
-    # Create tool calling agent (uses native function calling - no parsing errors!)
-    agent = create_tool_calling_agent(llm, all_tools, prompt)
-    
-    # Create agent executor
-    agent_executor = AgentExecutor(
-        agent=agent,
+    # Create agent using new API
+    agent = create_agent(
+        model=llm,
         tools=all_tools,
-        verbose=config.get("agent", {}).get("verbose", True),
-        max_iterations=config.get("agent", {}).get("max_iterations", 10),
-        return_intermediate_steps=True,  # For debugging
-        callbacks=[ErrorHandlingCallback()]  # Debug logging
+        system_prompt=system_message,
+        debug=config.get("agent", {}).get("verbose", True)
     )
     
-    # Wrap with session management
-    chain_with_history = RunnableWithMessageHistory(
-        agent_executor,
-        get_session_memory,
-        input_messages_key="input",
-        history_messages_key="chat_history",
-    )
-    
-    return chain_with_history
+    return agent
 
 
 # Pydantic models for API
@@ -395,21 +325,43 @@ async def chat(request: ChatRequest):
         # Set session ID in tools config
         tools_config.session_id = session_id
         
-        # Create agent executor with session management
-        agent_executor = create_agent_executor()
+        # Create agent
+        agent = create_agent_executor()
         
-        # Run agent with session management
+        # Get session history
+        session_messages = get_session_memory(session_id)
+        
+        # Add user message to session
+        session_messages.append({"role": "user", "content": request.text})
+        
+        # Prepare input for the agent
+        inputs = {"messages": session_messages}
+        
+        # Run agent
         try:
-            result = agent_executor.invoke(
-                {"input": request.text},
-                {"configurable": {"session_id": session_id}}
-            )
-            response_text = result.get("output", "I encountered an error processing your request.")
+            result = agent.invoke(inputs)
             
-            # Check if max iterations was reached
-            if "Agent stopped due to iteration limit" in response_text or \
-               "Agent stopped due to max iterations" in response_text:
-                response_text += "\n\n(Note: I've reached the maximum number of tool calls allowed. Please provide more specific instructions or break this into smaller tasks.)"
+            # Extract the response from the result
+            if isinstance(result, dict) and "messages" in result:
+                messages = result["messages"]
+                # Get the last AI message
+                response_text = ""
+                for message in reversed(messages):
+                    if isinstance(message, dict) and message.get("role") == "assistant":
+                        response_text = message.get("content", "")
+                        break
+                    elif hasattr(message, 'content') and hasattr(message, '__class__') and 'AI' in message.__class__.__name__:
+                        response_text = message.content
+                        break
+            else:
+                response_text = str(result)
+            
+            # Add AI response to session
+            session_messages.append({"role": "assistant", "content": response_text})
+            
+            # Keep only last 15 messages (similar to old behavior)
+            if len(session_messages) > 15:
+                session_messages = session_messages[-15:]
                 
         except Exception as e:
             error_msg = str(e)
@@ -444,13 +396,13 @@ async def get_sessions():
     """Get all sessions."""
     try:
         sessions = []
-        for session_id, chat_history in session_store.items():
+        for session_id, messages in session_store.items():
             sessions.append({
                 "session_id": session_id,
                 "title": f"Session {session_id}",
                 "created_at": "2025-01-08T00:00:00Z",
                 "last_updated": "2025-01-08T00:00:00Z",
-                "message_count": len(chat_history.messages)
+                "message_count": len(messages)
             })
         return sessions
     except Exception as e:
@@ -461,7 +413,7 @@ async def create_session(request: dict = None):
     """Create a new session."""
     try:
         session_id = f"session_{len(session_store) + 1:03d}"
-        session_store[session_id] = ChatMessageHistory()
+        session_store[session_id] = []
         
         # Save session to disk
         save_session_to_disk(session_id)
@@ -483,23 +435,31 @@ async def get_session(session_id: str):
         if session_id not in session_store:
             raise HTTPException(status_code=404, detail="Session not found")
         
-        chat_history = session_store[session_id]
+        messages = session_store[session_id]
         conversation_history = []
         
-        for message in chat_history.messages:
-            conversation_history.append({
-                "message": message.content,
-                "is_user": message.__class__.__name__ == "HumanMessage",
-                "timestamp": "2025-01-08T00:00:00Z"
-            })
+        for message in messages:
+            if isinstance(message, dict):
+                conversation_history.append({
+                    "message": message.get("content", ""),
+                    "is_user": message.get("role") == "user",
+                    "timestamp": "2025-01-08T00:00:00Z"
+                })
+            else:
+                # Handle old format if any
+                conversation_history.append({
+                    "message": getattr(message, 'content', str(message)),
+                    "is_user": hasattr(message, '__class__') and 'Human' in message.__class__.__name__,
+                    "timestamp": "2025-01-08T00:00:00Z"
+                })
         
         return {
             "session_id": session_id,
             "title": f"Session {session_id}",
             "created_at": "2025-01-08T00:00:00Z",
             "last_updated": "2025-01-08T00:00:00Z",
-            "message_count": len(chat_history.messages),
-            "short_term_memory": [msg.content for msg in chat_history.messages[-15:]],
+            "message_count": len(messages),
+            "short_term_memory": [msg.get("content", "") if isinstance(msg, dict) else getattr(msg, 'content', str(msg)) for msg in messages[-15:]],
             "conversation_history": conversation_history
         }
     except HTTPException:

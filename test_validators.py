@@ -35,35 +35,52 @@ class KeywordValidator(TestValidator):
     - case_sensitive: Whether to do case-sensitive matching (default: False)
     """
     
+    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
+        super().__init__(config, test_config)
+        # Pre-normalize keywords for performance
+        self._keywords = config.get("keywords", [])
+        self._case_sensitive = config.get("case_sensitive", False)
+        self._keywords_normalized = [kw if self._case_sensitive else kw.lower() for kw in self._keywords]
+        self._require_all = config.get("require_all", False)
+        self._min_required = config.get("min_required", None)
+        self._check_absence = config.get("check_absence", False)
+    
     def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
-        keywords = self.config.get("keywords", [])
-        require_all = self.config.get("require_all", False)
-        min_required = self.config.get("min_required", None)
-        check_absence = self.config.get("check_absence", False)
-        case_sensitive = self.config.get("case_sensitive", False)
-        
-        if not keywords:
+        if not self._keywords:
             return True  # No keywords to check
         
-        text = agent_response if case_sensitive else agent_response.lower()
-        found_keywords = []
+        text = agent_response if self._case_sensitive else agent_response.lower()
         
-        for keyword in keywords:
-            search_term = keyword if case_sensitive else keyword.lower()
-            if search_term in text:
-                found_keywords.append(keyword)
-        
-        if check_absence:
-            # For absence check, we want NO keywords to be found
-            return len(found_keywords) == 0
+        if self._check_absence:
+            # For absence check, return False on first match found
+            for keyword in self._keywords_normalized:
+                if keyword in text:
+                    return False
+            return True
         else:
-            # For presence check, use normal logic
-            if min_required is not None:
-                return len(found_keywords) >= min_required
-            elif require_all:
-                return len(found_keywords) == len(keywords)
+            # For presence check, use optimized logic
+            found_count = 0
+            
+            if self._min_required is not None:
+                # Count until we reach the minimum required
+                for keyword in self._keywords_normalized:
+                    if keyword in text:
+                        found_count += 1
+                        if found_count >= self._min_required:
+                            return True
+                return False
+            elif self._require_all:
+                # Count all matches
+                for keyword in self._keywords_normalized:
+                    if keyword in text:
+                        found_count += 1
+                return found_count == len(self._keywords)
             else:
-                return len(found_keywords) > 0
+                # Return True on first match found
+                for keyword in self._keywords_normalized:
+                    if keyword in text:
+                        return True
+                return False
 
 
 class ToolCallValidator(TestValidator):
@@ -78,52 +95,59 @@ class ToolCallValidator(TestValidator):
     - check_params: Whether to validate tool parameters (default: True)
     """
     
+    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
+        super().__init__(config, test_config)
+        # Pre-normalize for performance
+        self._required_tools = set(config.get("required_tools", []))  # Use set for O(1) lookup
+        self._tool_params = config.get("tool_params", {})
+        self._require_all_tools = config.get("require_all_tools", True)
+        self._min_tools = config.get("min_tools", None)
+        self._check_params = config.get("check_params", True)
+        
+        # Pre-normalize string parameters
+        self._normalized_tool_params = {}
+        for tool_name, params in self._tool_params.items():
+            self._normalized_tool_params[tool_name] = {}
+            for param_name, expected_value in params.items():
+                if isinstance(expected_value, str):
+                    self._normalized_tool_params[tool_name][param_name] = expected_value.lower()
+                elif isinstance(expected_value, list):
+                    self._normalized_tool_params[tool_name][param_name] = [kw.lower() for kw in expected_value]
+                else:
+                    self._normalized_tool_params[tool_name][param_name] = expected_value
+    
     def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
-        if not traces:
-            return False
+        if not traces or not self._required_tools:
+            return len(self._required_tools) == 0  # No tools to check
         
-        required_tools = self.config.get("required_tools", [])
-        tool_params = self.config.get("tool_params", {})
-        require_all_tools = self.config.get("require_all_tools", True)
-        min_tools = self.config.get("min_tools", None)
-        check_params = self.config.get("check_params", True)
+        # Count matching tools and collect their inputs for param validation
+        called_tools_count = 0
+        tool_inputs_for_params = {}
         
-        if not required_tools:
-            return True  # No tools to check
-        
-        # Extract tool calls from traces
-        tool_calls = []
         for trace in traces:
             if trace.get("event_type") == "tool_call":
                 payload = trace.get("payload", {})
                 tool_name = payload.get("tool_name", "")
-                tool_inputs = payload.get("inputs", {})
-                tool_calls.append({
-                    "name": tool_name,
-                    "inputs": tool_inputs
-                })
+                
+                if tool_name in self._required_tools:
+                    called_tools_count += 1
+                    tool_inputs = payload.get("inputs", {})
+                    tool_inputs_for_params[tool_name] = tool_inputs
         
-        # Check which required tools were called
-        called_tools = []
-        for tool_call in tool_calls:
-            if tool_call["name"] in required_tools:
-                called_tools.append(tool_call)
-        
-        # Validate tool count
-        if min_tools is not None:
-            if len(called_tools) < min_tools:
+        # Validate tool count with early exit
+        if self._min_tools is not None:
+            if called_tools_count < self._min_tools:
                 return False
-        elif require_all_tools:
-            if len(called_tools) < len(required_tools):
+        elif self._require_all_tools:
+            if called_tools_count < len(self._required_tools):
                 return False
         
         # Validate tool parameters if requested
-        if check_params and tool_params:
-            for tool_call in called_tools:
-                tool_name = tool_call["name"]
-                if tool_name in tool_params:
-                    expected_params = tool_params[tool_name]
-                    actual_inputs = tool_call["inputs"]
+        if self._check_params and self._tool_params:
+            for tool_name, actual_inputs in tool_inputs_for_params.items():
+                if tool_name in self._tool_params:
+                    expected_params = self._tool_params[tool_name]
+                    normalized_params = self._normalized_tool_params[tool_name]
                     
                     for param_name, expected_value in expected_params.items():
                         if param_name not in actual_inputs:
@@ -134,14 +158,16 @@ class ToolCallValidator(TestValidator):
                         # Handle different types of parameter validation
                         if isinstance(expected_value, str):
                             # String matching (case-insensitive by default)
-                            # Check if expected value is contained in actual value
-                            if expected_value.lower() not in str(actual_value).lower():
+                            if normalized_params[param_name] not in str(actual_value).lower():
                                 return False
                         elif isinstance(expected_value, list):
                             # List of keywords - check if any are present in the parameter
                             actual_lower = str(actual_value).lower()
-                            found_keywords = [kw for kw in expected_value if kw.lower() in actual_lower]
-                            if not found_keywords:
+                            normalized_keywords = normalized_params[param_name]
+                            for keyword in normalized_keywords:
+                                if keyword in actual_lower:
+                                    break
+                            else:
                                 return False
                         elif isinstance(expected_value, dict):
                             # Nested parameter validation
@@ -184,6 +210,28 @@ class FileSystemValidator(TestValidator):
     - min_files: Minimum number of files that must exist
     """
     
+    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
+        super().__init__(config, test_config)
+        # Pre-resolve paths for performance
+        self._check_files = config.get("check_files", [])
+        self._file_content = config.get("file_content", {})
+        self._require_all_files = config.get("require_all_files", True)
+        self._min_files = config.get("min_files", None)
+        
+        # Pre-resolve file patterns
+        self._resolved_files = [self._resolve_path(pattern) for pattern in self._check_files]
+        
+        # Pre-normalize content expectations
+        self._normalized_content = {}
+        for pattern, content in self._file_content.items():
+            resolved_pattern = self._resolve_path(pattern)
+            if isinstance(content, str):
+                self._normalized_content[resolved_pattern] = content.lower()
+            elif isinstance(content, list):
+                self._normalized_content[resolved_pattern] = [kw.lower() for kw in content]
+            else:
+                self._normalized_content[resolved_pattern] = content
+    
     def _resolve_path(self, file_pattern: str) -> str:
         """Resolve file pattern to test environment path if test_config is available."""
         if not self.test_config:
@@ -207,20 +255,12 @@ class FileSystemValidator(TestValidator):
         return resolved_pattern
     
     def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
-        check_files = self.config.get("check_files", [])
-        file_content = self.config.get("file_content", {})
-        require_all_files = self.config.get("require_all_files", True)
-        min_files = self.config.get("min_files", None)
-        
-        if not check_files:
+        if not self._check_files:
             return True  # No files to check
         
         found_files = []
         
-        for file_pattern in check_files:
-            # Resolve path to test environment
-            resolved_pattern = self._resolve_path(file_pattern)
-            
+        for resolved_pattern in self._resolved_files:
             # Convert pattern to Path and check if files exist
             pattern_path = Path(resolved_pattern)
             if pattern_path.is_file():
@@ -236,20 +276,18 @@ class FileSystemValidator(TestValidator):
                     if file_path.is_file():
                         found_files.append(str(file_path))
         
-        # Validate file count
-        if min_files is not None:
-            if len(found_files) < min_files:
+        # Validate file count with early exit
+        if self._min_files is not None:
+            if len(found_files) < self._min_files:
                 return False
-        elif require_all_files:
-            if len(found_files) < len(check_files):
+        elif self._require_all_files:
+            if len(found_files) < len(self._check_files):
                 return False
         
         # Validate file content if specified
-        if file_content:
+        if self._normalized_content:
             for file_path in found_files:
-                for pattern, expected_content in file_content.items():
-                    # Resolve pattern to test environment path
-                    resolved_pattern = self._resolve_path(pattern)
+                for resolved_pattern, expected_content in self._normalized_content.items():
                     if self._matches_pattern(file_path, resolved_pattern):
                         if not self._check_file_content(file_path, expected_content):
                             return False
@@ -294,55 +332,75 @@ class MemoryValidator(TestValidator):
     - min_keywords: Minimum number of keywords that must be present
     """
     
-    def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
-        check_keywords = self.config.get("check_keywords", [])
-        check_absence = self.config.get("check_absence", [])
-        memory_file = self.config.get("memory_file", "data/agent_memory.json")
-        require_all_keywords = self.config.get("require_all_keywords", False)
-        min_keywords = self.config.get("min_keywords", None)
+    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
+        super().__init__(config, test_config)
+        # Pre-normalize for performance
+        self._check_keywords = config.get("check_keywords", [])
+        self._check_absence = config.get("check_absence", [])
+        self._memory_file = config.get("memory_file", "data/agent_memory.json")
+        self._require_all_keywords = config.get("require_all_keywords", False)
+        self._min_keywords = config.get("min_keywords", None)
+        
+        # Pre-normalize keywords
+        self._keywords_lower = [kw.lower() for kw in self._check_keywords]
+        self._absence_lower = [kw.lower() for kw in self._check_absence]
         
         # Resolve memory file path for test environment
-        if self.test_config and "data" in self.test_config:
-            # Use test environment memory file if available
-            test_memory_file = self.test_config["data"].get("memory_file", memory_file)
-            if test_memory_file != memory_file:
-                memory_file = test_memory_file
-        
+        if test_config and "data" in test_config:
+            test_memory_file = test_config["data"].get("memory_file", self._memory_file)
+            if test_memory_file != self._memory_file:
+                self._memory_file = test_memory_file
+    
+    def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
         try:
             # Read memory file
-            with open(memory_file, 'r', encoding='utf-8') as f:
+            with open(self._memory_file, 'r', encoding='utf-8') as f:
                 memory_data = json.load(f)
             
             long_term_memory = memory_data.get("long_term", [])
-            memory_text = " ".join(long_term_memory).lower()
             
-            # Check for required keywords
-            if check_keywords:
-                found_keywords = []
-                for keyword in check_keywords:
-                    if keyword.lower() in memory_text:
-                        found_keywords.append(keyword)
+            # Check for required keywords with early exit
+            if self._check_keywords:
+                found_keywords = set()  # Track unique keywords found
                 
-                if min_keywords is not None:
-                    if len(found_keywords) < min_keywords:
+                for memory_entry in long_term_memory:
+                    memory_lower = memory_entry.lower()
+                    
+                    for keyword in self._keywords_lower:
+                        if keyword in memory_lower:
+                            found_keywords.add(keyword)
+                    
+                    # Early exit if we've found enough
+                    if self._min_keywords is not None and len(found_keywords) >= self._min_keywords:
+                        break
+                    elif self._min_keywords is None and not self._require_all_keywords and len(found_keywords) > 0:
+                        break
+                
+                found_count = len(found_keywords)
+                
+                # Check final counts
+                if self._min_keywords is not None:
+                    if found_count < self._min_keywords:
                         return False
-                elif require_all_keywords:
-                    if len(found_keywords) < len(check_keywords):
+                elif self._require_all_keywords:
+                    if found_count < len(self._check_keywords):
                         return False
                 else:
-                    if len(found_keywords) == 0:
+                    if found_count == 0:
                         return False
             
-            # Check for absence of keywords
-            if check_absence:
-                for keyword in check_absence:
-                    if keyword.lower() in memory_text:
-                        return False
+            # Check for absence of keywords with early exit
+            if self._check_absence:
+                for memory_entry in long_term_memory:
+                    memory_lower = memory_entry.lower()
+                    for keyword in self._absence_lower:
+                        if keyword in memory_lower:
+                            return False  # Found forbidden keyword
             
             return True
             
         except Exception as e:
-            print(f"Warning: Could not read memory file {memory_file}: {e}")
+            print(f"Warning: Could not read memory file {self._memory_file}: {e}")
             return False
 
 

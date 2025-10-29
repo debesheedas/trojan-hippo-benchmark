@@ -236,7 +236,6 @@ class TestResultHTMLGenerator:
         timestamp = self.format_timestamp(test_result.get('timestamp', ''))
         overall_success = test_result.get('overall_success', False)
         steps = test_result.get('steps', [])
-        traces = test_result.get('traces', [])
         summary = test_result.get('summary', {})
         
         # Get additional context from original test case
@@ -256,38 +255,30 @@ class TestResultHTMLGenerator:
         for step in steps:
             steps_html += self.format_step(step)
         
-        # Format traces - include both main traces and session history
+        # Format traces from session history
         traces_html = ""
         current_session_id = test_result.get('session_id', 'current')
         
-        # First, add traces from session history (previous sessions only)
+        # Add traces from session history (all sessions including current)
         session_history = test_result.get('session_history', [])
         for session_data in session_history:
             session_id = session_data.get('session_id', 'unknown')
             step_range = session_data.get('step_range', '')
             session_traces = session_data.get('traces', [])
             
-            # Only show sessions that are different from the current session
-            if session_traces and session_id != current_session_id:
+            if session_traces:
+                # Determine if this is the current session
+                is_current_session = session_id == current_session_id
+                session_title = f"📋 Current Session {session_id}" if is_current_session else f"📋 Session {session_id} (Steps {step_range})"
+                
                 traces_html += f"""
                 <div class="session-section">
-                    <h3>📋 Session {session_id} (Steps {step_range})</h3>
+                    <h3>{session_title}</h3>
                 </div>
                 """
                 
                 for trace in session_traces:
                     traces_html += self.format_trace_event(trace, session_id)
-        
-        # Then add current session traces
-        if traces:
-            traces_html += f"""
-            <div class="session-section">
-                <h3>📋 Current Session {current_session_id}</h3>
-            </div>
-            """
-            
-            for trace in traces:
-                traces_html += self.format_trace_event(trace, current_session_id)
         
         # Calculate success statistics
         total_steps = len(steps)
@@ -696,7 +687,7 @@ class TestResultHTMLGenerator:
             </div>
             ''' if is_attack_test else ''}
             <div class="stat-card">
-                <div class="stat-number">{len(traces)}</div>
+                <div class="stat-number">{sum(len(session_data.get('traces', [])) for session_data in session_history)}</div>
                 <div class="stat-label">Trace Events</div>
             </div>
             <div class="stat-card">
@@ -733,9 +724,283 @@ class TestResultHTMLGenerator:
         
         return html_content
     
+    def generate_index_page(self):
+        """Generate an index page that lists all available test reports."""
+        json_files = list(self.results_dir.rglob("*.json"))
+        
+        # Filter out summary files
+        json_files = [f for f in json_files if not f.name.startswith("summary_")]
+        
+        # Group items by model and attack type
+        items_by_model = {}
+        for json_file in json_files:
+            try:
+                data = self.load_test_result(json_file)
+                test_name = data.get('test_name') or data.get('name') or json_file.stem
+                description = data.get('description', '')
+                session_id = data.get('session_id', '')
+                
+                # Extract model name and attack type from folder structure
+                path_parts = json_file.relative_to(self.results_dir).parts
+                if len(path_parts) >= 2:
+                    # Structure: model_name/attack_type/test.json
+                    model_name = path_parts[0]
+                    attack_type = path_parts[1]
+                else:
+                    # Fallback for old structure or single-level files
+                    model_name = 'unknown'
+                    attack_type = 'benign'
+                    if len(path_parts) >= 1:
+                        attack_type = path_parts[0]
+                
+                # Initialize model group if not exists
+                if model_name not in items_by_model:
+                    items_by_model[model_name] = {'benign': [], 'direct': [], 'indirect': []}
+                
+                # Only include valid attack types
+                if attack_type in ['benign', 'direct', 'indirect']:
+                    link = f'{model_name}/{attack_type}/{json_file.stem}.html'
+                
+                # Check if HTML report exists
+                if not (self.output_dir / link).exists():
+                    continue
+                    
+                items_by_model[model_name][attack_type].append({
+                    'test_name': test_name,
+                    'description': description,
+                    'session_id': session_id,
+                    'link': link,
+                })
+            except Exception:
+                continue
+        
+        # Generate organized sections HTML by model
+        sections_html = []
+        type_configs = {
+            'benign': {'title': '🛡️ Benign Tests', 'description': 'Normal functionality tests', 'color': '#28a745'},
+            'direct': {'title': '⚡ Direct Attacks', 'description': 'Direct injection and manipulation attacks', 'color': '#dc3545'},
+            'indirect': {'title': '🎯 Indirect Attacks', 'description': 'Subtle manipulation and policy change attacks', 'color': '#fd7e14'}
+        }
+        
+        for model_name in sorted(items_by_model.keys()):
+            model_items = items_by_model[model_name]
+            total_tests = sum(len(items) for items in model_items.values())
+            
+            if total_tests == 0:
+                continue
+                
+            # Add model header
+            sections_html.append(f'''            <div class="model-section">
+                <div class="model-header">
+                    <h1>🤖 Model: {model_name}</h1>
+                    <p>Total tests: {total_tests}</p>
+                </div>
+            </div>''')
+            
+            # Add attack type sections for this model
+            for attack_type in ['benign', 'direct', 'indirect']:
+                items = model_items[attack_type]
+                if not items:
+                    continue
+                    
+                config = type_configs[attack_type]
+                cards_html = []
+                for item in items:
+                    cards_html.append(f'''                <a href="{item['link']}" class="report-card">
+                        <h3>{item['test_name']}</h3>
+                        <div class="description">
+                            {item['description']}
+                        </div>
+                        <div class="report-meta">
+                            <span class="report-date">Session: {item['session_id']}</span>
+                            <span class="view-report">View Report →</span>
+                        </div>
+                    </a>''')
+                
+                sections_html.append(f'''            <div class="test-section">
+                <div class="section-header" style="border-left: 4px solid {config['color']};">
+                    <h2>{config['title']}</h2>
+                    <p>{config['description']} ({len(items)} test{'s' if len(items) != 1 else ''})</p>
+                </div>
+                <div class="reports-grid">
+{chr(10).join(cards_html)}
+                </div>
+            </div>''')
+        
+        # Generate index HTML
+        index_html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Memory Agent Security Benchmark - Test Reports</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }}
+        .header {{
+            text-align: center;
+            color: white;
+            margin-bottom: 50px;
+        }}
+        .header h1 {{
+            font-size: 3em;
+            margin-bottom: 20px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }}
+        .header p {{
+            font-size: 1.3em;
+            opacity: 0.9;
+        }}
+        .test-section {{
+            margin-bottom: 60px;
+        }}
+        .section-header {{
+            background: rgba(255, 255, 255, 0.1);
+            padding: 20px 30px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            backdrop-filter: blur(10px);
+        }}
+        .section-header h2 {{
+            color: white;
+            font-size: 2em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }}
+        .section-header p {{
+            color: rgba(255, 255, 255, 0.9);
+            font-size: 1.1em;
+            margin: 0;
+        }}
+        .model-section {{
+            margin-bottom: 2rem;
+        }}
+        .model-header {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 1.5rem;
+            border-radius: 8px;
+            margin-bottom: 1.5rem;
+            text-align: center;
+        }}
+        .model-header h1 {{
+            margin: 0 0 0.5rem 0;
+            font-size: 1.8rem;
+            font-weight: 600;
+        }}
+        .model-header p {{
+            margin: 0;
+            font-size: 1rem;
+            opacity: 0.9;
+        }}
+        .reports-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 30px;
+        }}
+        .report-card {{
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            text-decoration: none;
+            color: inherit;
+        }}
+        .report-card:hover {{
+            transform: translateY(-5px);
+            box-shadow: 0 15px 40px rgba(0, 0, 0, 0.3);
+        }}
+        .report-card h3 {{
+            color: #495057;
+            margin-bottom: 15px;
+            font-size: 1.4em;
+        }}
+        .report-card .description {{
+            color: #6c757d;
+            margin-bottom: 20px;
+            line-height: 1.5;
+        }}
+        .report-meta {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid #e9ecef;
+        }}
+        .report-date {{
+            color: #6c757d;
+            font-size: 0.9em;
+        }}
+        .view-report {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            text-decoration: none;
+            font-size: 0.9em;
+            font-weight: bold;
+            transition: opacity 0.3s ease;
+        }}
+        .view-report:hover {{
+            opacity: 0.9;
+        }}
+        .footer {{
+            text-align: center;
+            margin-top: 50px;
+            color: white;
+            opacity: 0.8;
+        }}
+        @media (max-width: 768px) {{
+            .header h1 {{ font-size: 2em; }}
+            .reports-grid {{ grid-template-columns: 1fr; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🛡️ Memory Agent Security Benchmark</h1>
+            <p>Test Execution Reports</p>
+        </div>
+{chr(10).join(sections_html)}
+        <div class="footer">
+            <p>Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        </div>
+    </div>
+</body>
+</html>'''
+        
+        # Save index file at root level since we now group by model in the index
+        index_file = self.output_dir / 'index.html'
+        
+        index_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(index_file, 'w', encoding='utf-8') as f:
+            f.write(index_html)
+        
+        print(f"📋 Generated index page: {index_file}")
+        total_items = sum(len(items) for model_items in items_by_model.values() for items in model_items.values())
+        return total_items
+
     def generate_all_reports(self):
         """Generate HTML reports for all test result files."""
-        json_files = list(self.results_dir.glob("*.json"))
+        json_files = list(self.results_dir.rglob("*.json"))
         
         # Filter out summary files
         json_files = [f for f in json_files if not f.name.startswith("summary_")]
@@ -755,12 +1020,33 @@ class TestResultHTMLGenerator:
                 if test_file_path:
                     original_test = self.load_original_test_case(test_file_path)
                 
+                # Extract model name and attack type from folder structure
+                path_parts = json_file.relative_to(self.results_dir).parts
+                if len(path_parts) >= 2:
+                    # Structure: model_name/attack_type/test.json
+                    model_name = path_parts[0]
+                    attack_type = path_parts[1]
+                else:
+                    # Fallback for old structure or single-level files
+                    model_name = 'unknown'
+                    attack_type = 'benign'
+                    if len(path_parts) >= 1:
+                        attack_type = path_parts[0]
+                
+                # Only process valid attack types
+                if attack_type not in ['benign', 'direct', 'indirect']:
+                    print(f"  ⚠️  Skipping {json_file.name} - invalid attack type: {attack_type}")
+                    continue
+                
+                # Ensure output subfolders exist
+                (self.output_dir / model_name / attack_type).mkdir(parents=True, exist_ok=True)
+
                 # Generate HTML report
                 html_content = self.generate_html_report(test_result, original_test)
                 
                 # Save HTML file
                 html_filename = json_file.stem + ".html"
-                html_file = self.output_dir / html_filename
+                html_file = self.output_dir / model_name / attack_type / html_filename
                 
                 with open(html_file, 'w', encoding='utf-8') as f:
                     f.write(html_content)
@@ -770,8 +1056,13 @@ class TestResultHTMLGenerator:
             except Exception as e:
                 print(f"  ❌ Error processing {json_file.name}: {e}")
         
+        # Generate index page
+        print(f"\n📋 Generating index page...")
+        report_count = self.generate_index_page()
+        
         print(f"\n🎉 HTML reports generated in: {self.output_dir}")
-        print(f"📁 Open any .html file in your browser to view the reports")
+        print(f"📁 Generated {report_count} report(s) with index page")
+        print(f"🌐 Open {self.output_dir}/index.html in your browser to view all reports")
 
 
 def main():

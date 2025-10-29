@@ -11,14 +11,13 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 from dotenv import load_dotenv
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
-from langchain.memory import ChatMessageHistory
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
-from agent_tools import EmailToolsConfig, create_tools
-from memory_tools import create_memory_tools
+from tools_registry import create_all_tools
+from tool_specifications.email_tools import EmailToolsConfig
 from utils import (
     load_config,
     append_trace_event,
@@ -32,16 +31,16 @@ from backend.memory_manager import get_memory_manager
 load_dotenv()
 
 
-# In-memory session store for RunnableWithMessageHistory
-_session_store: Dict[str, ChatMessageHistory] = {}
+# In-memory session store for message history
+_session_store: Dict[str, list] = {}
 
-# Agent executor cache - one per session
-_agent_cache: Dict[str, RunnableWithMessageHistory] = {}
+# Agent cache - one per session
+_agent_cache: Dict[str, Any] = {}
 
 
-def _get_session_memory(session_id: str) -> ChatMessageHistory:
+def _get_session_memory(session_id: str) -> list:
     if session_id not in _session_store:
-        _session_store[session_id] = ChatMessageHistory()
+        _session_store[session_id] = []
     return _session_store[session_id]
 
 
@@ -63,17 +62,17 @@ def clear_session_agent(session_id: str):
         del _agent_cache[session_id]
 
 
-def _get_or_create_agent_executor(session_id: str, config: Optional[dict] = None) -> RunnableWithMessageHistory:
+def _get_or_create_agent_executor(session_id: str, config: Optional[dict] = None) -> Any:
     """
-    Get or create an agent executor for the given session.
-    This implements proper caching - one executor per session.
+    Get or create an agent for the given session.
+    This implements proper caching - one agent per session.
     """
     if session_id not in _agent_cache:
         _agent_cache[session_id] = _create_agent_executor_for_python(config, session_id=session_id)
     return _agent_cache[session_id]
 
 
-def _build_agent_prompt(memory_instructions: str, memory_context: str) -> ChatPromptTemplate:
+def _build_agent_prompt(memory_instructions: str, memory_context: str) -> str:
     system_message = """You are an email assistant. Help users manage their emails efficiently.
 
 AVAILABLE TOOLS:
@@ -114,25 +113,18 @@ GUIDELINES:
 
 {memory_context}"""
 
-    system_message = system_message.format(
+    return system_message.format(
         memory_instructions=memory_instructions or "",
         memory_context=memory_context or "",
     )
-
-    return ChatPromptTemplate.from_messages([
-        ("system", system_message),
-        MessagesPlaceholder(variable_name="chat_history"),
-        ("human", "{input}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ])
 
 
 def _create_agent_executor_for_python(
     config: Optional[dict] = None,
     session_id: Optional[str] = None,
-) -> RunnableWithMessageHistory:
+) -> Any:
     """
-    Create a RunnableWithMessageHistory agent for direct Python invocation.
+    Create an agent for direct Python invocation using the new LangChain API.
     """
     if config is None:
         config = load_config()
@@ -151,12 +143,17 @@ def _create_agent_executor_for_python(
     if session_id:
         tools_config.session_id = session_id
 
-    email_tools = create_tools(tools_config)
     # Get memory file path from config, default to standard location
     memory_file = config.get("data", {}).get("memory_file", "data/agent_memory.json")
     trace_file = config.get("data", {}).get("trace_file", "data/trace.jsonl")
-    memory_tools = create_memory_tools(memory_file=memory_file, session_id=session_id, trace_file=trace_file)
-    all_tools = email_tools + memory_tools
+    
+    # Create all tools using the unified registry
+    all_tools = create_all_tools(
+        email_config=tools_config,
+        memory_file=memory_file,
+        session_id=session_id,
+        trace_file=trace_file
+    )
 
     # Model
     model_config = config.get("model", {})
@@ -164,15 +161,15 @@ def _create_agent_executor_for_python(
 
     if provider == "openai":
         api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY is not set")
         llm = ChatOpenAI(
-            model=model_config.get("model_name", "gpt-5"),
+            model=model_config.get("model_name", "gpt-4o"),
             temperature=model_config.get("temperature", 0.7),
-            api_key=api_key if api_key else "dummy-key",
+            api_key=api_key,
         )
     else:
-        model_name = config.get("model", {}).get("model_name", "gpt-5")
-        temperature = config.get("model", {}).get("temperature", 0.7)
-        llm = ChatOpenAI(model=model_name, temperature=temperature, api_key="dummy-key")
+        raise ValueError(f"Unsupported provider: {provider}")
 
     # Memory prompt and long-term memory context
     memory_prompt_file = Path("system_prompts/memory_prompt.txt")
@@ -187,25 +184,18 @@ def _create_agent_executor_for_python(
     except Exception:
         memory_context = ""
 
-    prompt = _build_agent_prompt(memory_instructions, memory_context)
+    # Build system prompt
+    system_prompt = _build_agent_prompt(memory_instructions, memory_context)
 
-    agent = create_tool_calling_agent(llm, all_tools, prompt)
-    agent_executor = AgentExecutor(
-        agent=agent,
+    # Create agent using new API
+    agent = create_agent(
+        model=llm,
         tools=all_tools,
-        verbose=config.get("agent", {}).get("verbose", True),
-        max_iterations=config.get("agent", {}).get("max_iterations", 10),
-        return_intermediate_steps=True,
+        system_prompt=system_prompt,
+        debug=config.get("agent", {}).get("verbose", True)
     )
 
-    chain_with_history = RunnableWithMessageHistory(
-        agent_executor,
-        _get_session_memory,
-        input_messages_key="input",
-        history_messages_key="chat_history",
-    )
-
-    return chain_with_history
+    return agent
 
 
 def invoke_agent(
@@ -215,19 +205,50 @@ def invoke_agent(
 ) -> Dict[str, Any]:
     """
     Run a single agent turn directly in Python and return response + metadata.
-    Uses cached agent executor for better performance.
+    Uses cached agent for better performance.
     """
     session_id = session_id or f"session_cli"
     
-    # Get or create cached agent executor for this session
-    chain = _get_or_create_agent_executor(session_id, config)
+    # Get or create cached agent for this session
+    agent = _get_or_create_agent_executor(session_id, config)
 
     # Log user input to traces (optional, matches behavior in main.py)
     cfg = config or load_config()
     append_trace_event(cfg["data"]["trace_file"], "user_input", session_id, {"text": text})
 
-    result = chain.invoke({"input": text}, {"configurable": {"session_id": session_id}})
-    response_text = result.get("output", "")
+    # Get session history
+    session_messages = _get_session_memory(session_id)
+    
+    # Add user message to session
+    session_messages.append({"role": "user", "content": text})
+    
+    # Prepare input for the agent
+    inputs = {"messages": session_messages}
+    
+    # Invoke the agent
+    result = agent.invoke(inputs)
+    
+    # Extract the response from the result
+    if isinstance(result, dict) and "messages" in result:
+        messages = result["messages"]
+        # Get the last AI message
+        response_text = ""
+        for message in reversed(messages):
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                response_text = message.get("content", "")
+                break
+            elif hasattr(message, 'content') and hasattr(message, '__class__') and 'AI' in message.__class__.__name__:
+                response_text = message.content
+                break
+    else:
+        response_text = str(result)
+
+    # Add AI response to session
+    session_messages.append({"role": "assistant", "content": response_text})
+    
+    # Keep only last 15 messages (similar to old behavior)
+    if len(session_messages) > 15:
+        session_messages = session_messages[-15:]
 
     append_trace_event(cfg["data"]["trace_file"], "agent_response", session_id, {"text": response_text})
 
