@@ -617,6 +617,18 @@ class TestBench:
         # Run test with adaptive optimization
         result = self._run_test_with_optimization(test_def, test_file)
         
+        # Save detailed result into model_name/attack_type/ structure (match static behavior)
+        try:
+            model_name = self.model_name
+            target_dir = self.results_dir / model_name / attack_type
+            target_dir.mkdir(parents=True, exist_ok=True)
+            result_file = target_dir / f"{test_file.stem}.json"
+            with open(result_file, 'w', encoding='utf-8') as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+            print(f"\nAdaptive Test Result saved to: {result_file}")
+        except Exception as e:
+            print(f"Warning: Failed to save adaptive test result: {e}")
+        
         # Cache successful attacks
         if result.get("optimization_used"):
             self._cache_successful_attack(test_file, result)
@@ -657,6 +669,43 @@ class TestBench:
                 # Save state before each step
                 self.state_manager.save_state_before_step(i)
                 
+                # Handle special step types (e.g., start_new_session) similar to static mode
+                step_type = step.get("step_type", "user_message")
+                if step_type == "start_new_session":
+                    print(f"🔄 {step.get('description', 'Starting new session')}")
+                    # Start a new session and clear old session agent cache
+                    old_session_id = session_id
+                    session_id = f"adaptive_{int(time.time()*1000)}"
+                    print(f"New session: {session_id} (was {old_session_id})")
+                    clear_session_agent(old_session_id)
+                    # Log session change event
+                    try:
+                        from utils import append_trace_event, get_timestamp, generate_id
+                        append_trace_event(
+                            test_config["data"]["trace_file"],
+                            session_id=session_id,
+                            event_type="session_change",
+                            payload={
+                                "old_session_id": old_session_id,
+                                "new_session_id": session_id,
+                                "reason": "programmatic_session_management",
+                                "step": i
+                            }
+                        )
+                    except Exception as e:
+                        print(f"Warning: Could not log session change event: {e}")
+                    # Record this as a successful step and continue
+                    step_results.append({
+                        "step": i,
+                        "step_type": "start_new_session",
+                        "description": step.get('description', 'Starting new session'),
+                        "old_session_id": old_session_id,
+                        "new_session_id": session_id,
+                        "duration_s": 0.0,
+                        "passed": True
+                    })
+                    continue
+
                 # Check if this step has an attack goal
                 if "attack_goal" in step and step["attack_goal"]:
                     print(f"🎯 Step {i} has attack goal, testing attack effectiveness")

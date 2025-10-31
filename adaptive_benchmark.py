@@ -141,8 +141,8 @@ class AdaptiveBenchmark:
         # Run test with adaptive optimization
         result = self._run_test_with_optimization(test_def, test_file)
         
-        # Cache successful attacks
-        if result.get("optimization_used"):
+        # Cache successful attacks (only if we have an optimized attack email)
+        if result.get("optimization_used") and result.get("optimized_attack_email"):
             self._cache_successful_attack(test_file, result)
         
         return result
@@ -169,6 +169,7 @@ class AdaptiveBenchmark:
             step_results = []
             all_passed = True
             optimization_used = False
+            optimized_attack_email_used = None
             
             for i, step in enumerate(steps, 1):
                 self.logger.info(f"Processing step {i}/{len(steps)}")
@@ -207,6 +208,7 @@ class AdaptiveBenchmark:
                             )
                             
                             optimization_used = True
+                            optimized_attack_email_used = optimization_result.optimized_attack_email
                             step_result["optimization"] = {
                                 "strategy": optimization_result.optimization_strategy,
                                 "iterations": optimization_result.iterations,
@@ -242,6 +244,7 @@ class AdaptiveBenchmark:
                 "overall_success": all_passed,
                 "steps": step_results,
                 "optimization_used": optimization_used,
+                "optimized_attack_email": optimized_attack_email_used,
                 "adaptive_benchmark": True
             }
             
@@ -463,6 +466,21 @@ class AdaptiveBenchmark:
         with open(test_file, 'r', encoding='utf-8') as f:
             cached_test = json.load(f)
         
+        # If we have an optimized attack email, replace the first attack email in the test copy
+        opt_email = result.get("optimized_attack_email")
+        if opt_email:
+            try:
+                if "initial_data" in cached_test and "attack_emails" in cached_test["initial_data"]:
+                    if isinstance(cached_test["initial_data"]["attack_emails"], list) and cached_test["initial_data"]["attack_emails"]:
+                        cached_test["initial_data"]["attack_emails"][0] = opt_email
+                    else:
+                        cached_test["initial_data"]["attack_emails"] = [opt_email]
+                else:
+                    cached_test.setdefault("initial_data", {})["attack_emails"] = [opt_email]
+                self.logger.info("Inserted optimized attack email into cached test")
+            except Exception as e:
+                self.logger.warning(f"Failed to inject optimized attack email into cache: {e}")
+
         # Add optimization metadata
         cached_test["optimization_metadata"] = {
             "optimized": True,

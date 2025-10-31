@@ -125,8 +125,19 @@ def _create_agent_executor_for_python(
     """
     Create an agent for direct Python invocation using the new LangChain API.
     """
-    if config is None:
-        config = load_config()
+    # Always start from full config, then overlay provided config to avoid losing sections
+    base_cfg = load_config()
+    if config:
+        try:
+            # shallow merge is sufficient for our current keys (data, model, agent)
+            for k, v in config.items():
+                if isinstance(v, dict) and isinstance(base_cfg.get(k), dict):
+                    base_cfg[k].update(v)
+                else:
+                    base_cfg[k] = v
+        except Exception:
+            base_cfg.update(config)
+    config = base_cfg
     
     # Ensure data directories exist
     ensure_data_directories(config)
@@ -165,6 +176,9 @@ def _create_agent_executor_for_python(
         llm = ChatOpenAI(
             model=model_config.get("model_name", "gpt-4o"),
             temperature=model_config.get("temperature", 0.7),
+            top_p=model_config.get("top_p", 1.0),
+            presence_penalty=model_config.get("presence_penalty", 0),
+            frequency_penalty=model_config.get("frequency_penalty", 0),
             api_key=api_key,
         )
     else:
