@@ -21,6 +21,10 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 import logging
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from agent_core import invoke_agent, clear_session_agent, clear_agent_cache
 from utils import read_trace_events, load_config, ensure_data_directories

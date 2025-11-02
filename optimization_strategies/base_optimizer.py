@@ -40,6 +40,7 @@ class BaseOptimizer(ABC):
                        step_num: int,
                        session_id: str,
                        test_config: Dict[str, Any],
+                       environment_state: 'EnvironmentState',
                        max_iterations: int = 10) -> OptimizationResult:
         """
         Optimize an attack email to make it more effective.
