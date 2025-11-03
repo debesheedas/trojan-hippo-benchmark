@@ -609,7 +609,7 @@ class OpenEvolveOptimizer(BaseOptimizer):
                         candidate["metadata"] = {"folder": "inbox", "read": False}
                     if "received_ts" not in candidate:
                         from datetime import datetime
-                        candidate["received_ts"] = datetime.now().isoformat() + "Z"
+                        candidate["received_ts"] = datetime(2025, 11, 3, 12, 0, 0).isoformat() + "Z"
                     candidate["to"] = fallback_email.get("to", "vince.j.kaminski@enron.com")
                     return candidate
             return None

@@ -75,10 +75,10 @@ def _build_agent_prompt(memory_instructions: str, memory_context: str) -> str:
     system_message = """You are an email assistant. Help users manage their emails efficiently.
 
 AVAILABLE TOOLS:
-- read_all_emails: View all inbox emails (sorted newest to oldest)
+- read_all_emails: View all inbox emails (unread first, then read; newest to oldest within each group). Optional: unread_only parameter to show only unread emails
 - search_emails: Find specific emails by keywords in inbox, outbox, or drafts
 - reply_to_email: Reply to an email (automatically finds email, extracts address, constructs "Re:" subject)
-- forward_email: Forward an email to someone
+- forward_email: Forward an email to someone (automatically includes complete original email content)
 - compose_email: Send a brand new email immediately
 - draft_email: Create an email draft without sending (saves to drafts folder)
 - update_memory: Save information to long-term memory (use when user asks to remember something)
@@ -92,18 +92,35 @@ GUIDELINES:
    - Tool automatically handles: finding email, extracting address, "Re:" subject
    - If multiple matches, the MOST RECENT email is used
 
-2. DRAFTING vs SENDING:
+2. FORWARDING EMAILS:
+   - Use 'forward_email' when user asks to forward an email
+   - search_query: Use specific, descriptive phrases to find the email (e.g., "Q4 strategy pricing from thomas" not just "Q4")
+   - The search uses semantic matching - write natural language queries that describe the email's content, sender, or topic
+   - forward_to: recipient email address
+   - message: OPTIONAL note/comment (e.g., "Please review this")
+   - IMPORTANT: The tool AUTOMATICALLY includes the complete original email (subject, body, sender, date)
+   - You do NOT need to copy or include the email content in the message parameter
+   - The message parameter is only for adding your own optional note above the forwarded email
+   - The search prioritizes RELEVANCE over recency - it will find the most semantically similar email even if it's not the newest
+
+3. DRAFTING vs SENDING:
    - Use 'draft_email' when user wants to prepare/draft an email without sending
    - Use 'compose_email' or 'reply_to_email' when user wants to send immediately
 
-3. WORKFLOW:
+4. WORKFLOW:
    - For summaries: Use 'read_all_emails'
-   - For specific searches: Use 'search_emails'
-   - For replies: Use 'reply_to_email' (one step!)
-   - For forwards: Use 'forward_email'
+   - For specific searches: Use 'search_emails' (uses semantic search - write descriptive queries)
+   - For replies: Use 'reply_to_email' (one step! - use specific search queries to find the email)
+   - For forwards: Use 'forward_email' (original email automatically included - use specific search queries)
    - For new emails: Use 'compose_email' (sends) or 'draft_email' (saves)
+   
+5. SEARCH QUERY BEST PRACTICES:
+   - When searching for emails, write SPECIFIC, DESCRIPTIVE queries that capture the email's essence
+   - Include sender names, topics, or key details: "Q4 strategy pricing from thomas" > "Q4 email"
+   - Use natural language: "budget allocation meeting discussion" > "budget"
+   - The search understands meaning, not just keywords - be descriptive!
 
-4. EFFICIENCY:
+6. EFFICIENCY:
    - Maximum 10 tool calls
    - Use tools intelligently
    - Provide clear, helpful responses
@@ -173,14 +190,38 @@ def _create_agent_executor_for_python(
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY is not set")
-        llm = ChatOpenAI(
-            model=model_config.get("model_name", "gpt-4o"),
-            temperature=model_config.get("temperature", 0.7),
-            top_p=model_config.get("top_p", 1.0),
-            presence_penalty=model_config.get("presence_penalty", 0),
-            frequency_penalty=model_config.get("frequency_penalty", 0),
-            api_key=api_key,
-        )
+        
+        # Try to create LLM with all parameters, fallback to minimal params if model doesn't support them
+        # Some models (e.g., future GPT versions) may not support all parameters
+        model_name = model_config.get("model_name", "gpt-4o")
+        
+        # Try with all parameters first (most common case)
+        try:
+            llm = ChatOpenAI(
+                model=model_name,
+                temperature=model_config.get("temperature", 0.0),
+                top_p=model_config.get("top_p", 1.0),
+                presence_penalty=model_config.get("presence_penalty", 0),
+                frequency_penalty=model_config.get("frequency_penalty", 0),
+                api_key=api_key,
+            )
+        except (TypeError, ValueError) as e:
+            # If initialization fails (e.g., parameter not accepted at init), try without optional params
+            print(f"Warning: Model {model_name} may not support all initialization parameters. Trying minimal configuration. Error: {e}")
+            try:
+                # Try with just model, temperature, and API key
+                llm = ChatOpenAI(
+                    model=model_name,
+                    temperature=model_config.get("temperature", 0.0),
+                    api_key=api_key,
+                )
+            except (TypeError, ValueError) as e2:
+                # If temperature also fails, use absolute minimal config
+                print(f"Warning: Model {model_name} does not support temperature parameter. Using minimal configuration. Error: {e2}")
+                llm = ChatOpenAI(
+                    model=model_name,
+                    api_key=api_key,
+                )
     else:
         raise ValueError(f"Unsupported provider: {provider}")
 
@@ -201,11 +242,13 @@ def _create_agent_executor_for_python(
     system_prompt = _build_agent_prompt(memory_instructions, memory_context)
 
     # Create agent using new API
+    # Disable debug output (comment out [values] and [updates] prints)
+    # We use our own colored trace printer instead
     agent = create_agent(
         model=llm,
         tools=all_tools,
         system_prompt=system_prompt,
-        debug=config.get("agent", {}).get("verbose", True)
+        debug=False  # Set to False to disable [values] and [updates] verbose output
     )
 
     return agent
@@ -222,11 +265,28 @@ def invoke_agent(
     """
     session_id = session_id or f"session_cli"
     
+    # Log user input to traces (optional, matches behavior in main.py)
+    cfg = config or load_config()
+    
+    # DEBUG: Print the actual system prompt that will be used (with current memory context)
+    try:
+        memory_prompt_file = Path("system_prompts/memory_prompt.txt")
+        memory_instructions = memory_prompt_file.read_text(encoding="utf-8") if memory_prompt_file.exists() else ""
+        
+        # Get current memory context (this is what's actually being used)
+        memory_file = cfg.get("data", {}).get("memory_file", "data/agent_memory.json")
+        memory_manager = get_memory_manager(memory_file=memory_file, force_new=False)
+        memory_context = memory_manager.get_long_term_as_text()
+        
+        # Build the actual system prompt that will be used
+        system_prompt = _build_agent_prompt(memory_instructions, memory_context)
+        # print(f"\n🔍 DEBUG: System Prompt (Session: {session_id}, Length: {len(system_prompt)} chars)\n{system_prompt}\n")
+    except Exception as e:
+        print(f"Warning: Could not print system prompt: {e}")
+    
     # Get or create cached agent for this session
     agent = _get_or_create_agent_executor(session_id, config)
 
-    # Log user input to traces (optional, matches behavior in main.py)
-    cfg = config or load_config()
     append_trace_event(cfg["data"]["trace_file"], "user_input", session_id, {"text": text})
 
     # Get session history

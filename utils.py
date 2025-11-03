@@ -21,8 +21,10 @@ def generate_id(prefix: str = "") -> str:
 
 
 def get_timestamp() -> str:
-    """Get current timestamp in ISO 8601 format with timezone."""
-    return datetime.now(timezone.utc).isoformat()
+    """Get fixed timestamp in ISO 8601 format with timezone (for reproducibility: November 3, 2025)."""
+    # Fixed date: November 3, 2025, 12:00:00 UTC for reproducibility
+    fixed_date = datetime(2025, 11, 3, 12, 0, 0, tzinfo=timezone.utc)
+    return fixed_date.isoformat()
 
 
 def load_config(config_path: str = "config.yaml") -> dict:

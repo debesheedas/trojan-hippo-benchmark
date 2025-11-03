@@ -45,7 +45,7 @@ class TestResultHTMLGenerator:
         except:
             return timestamp
     
-    def format_trace_event(self, event: Dict[str, Any], session_id: str = None) -> str:
+    def format_trace_event(self, event: Dict[str, Any], session_id: Optional[str] = None) -> str:
         """Format a single trace event for HTML display."""
         event_type = event.get('event_type', 'unknown')
         timestamp = self.format_timestamp(event.get('ts', ''))
@@ -151,11 +151,22 @@ class TestResultHTMLGenerator:
     def format_step(self, step: Dict[str, Any]) -> str:
         """Format a test step for HTML display."""
         step_num = step.get('step', '?')
+        step_type = step.get('step_type', 'user_message')
+        duration = step.get('duration_s', 0)
+        passed = step.get('passed', None)
+        
+        # Handle special step types
+        if step_type == 'insert_attack_email':
+            return self._format_insert_attack_email_step(step, step_num, duration, passed)
+        elif step_type == 'insert_benign_email':
+            return self._format_insert_benign_email_step(step, step_num, duration, passed)
+        elif step_type == 'start_new_session':
+            return self._format_start_new_session_step(step, step_num, duration, passed)
+        
+        # Regular user message step
         user_message = step.get('user_message', '')
         expected_behavior = step.get('expected_behavior', '')
         agent_response = step.get('agent_response', '')
-        duration = step.get('duration_s', 0)
-        passed = step.get('passed', None)
         
         # Determine step status
         if passed is True:
@@ -226,6 +237,174 @@ class TestResultHTMLGenerator:
         </div>
         """
     
+    def _format_insert_attack_email_step(self, step: Dict[str, Any], step_num: Any, duration: float, passed: Optional[bool]) -> str:
+        """Format an insert_attack_email step for HTML display."""
+        description = step.get('description', 'Inserting attack email into inbox')
+        
+        if passed is True:
+            status_class = "passed"
+            status_icon = "✅"
+            status_text = "COMPLETED"
+        elif passed is False:
+            status_class = "failed"
+            status_icon = "❌"
+            status_text = "FAILED"
+        else:
+            status_class = "unknown"
+            status_icon = "❓"
+            status_text = "UNKNOWN"
+        
+        error_html = ""
+        if passed is False and step.get('error'):
+            error_html = f"""
+                <div class="error-message">
+                    <h4>❌ Error:</h4>
+                    <p>{step.get('error')}</p>
+                </div>
+            """
+        
+        attack_email = step.get('attack_email', {})
+        email_details_html = ""
+        if attack_email:
+            email_details_html = f"""
+                <div class="email-details">
+                    <h4>📧 Attack Email Details:</h4>
+                    <p><strong>From:</strong> {attack_email.get('from', 'Unknown')}</p>
+                    <p><strong>To:</strong> {attack_email.get('to', 'Unknown')}</p>
+                    <p><strong>Subject:</strong> {attack_email.get('subject', 'No subject')}</p>
+                    <p><strong>Received:</strong> {self.format_timestamp(attack_email.get('received_ts', ''))}</p>
+                    <details>
+                        <summary><strong>Email Body:</strong></summary>
+                        <pre style="white-space: pre-wrap; max-height: 200px; overflow-y: auto;">{attack_email.get('body_plain', '')}</pre>
+                    </details>
+                </div>
+            """
+        
+        return f"""
+        <div class="test-step {status_class}">
+            <div class="step-header">
+                <h3>Step {step_num} {status_icon} {status_text} - Insert Attack Email</h3>
+                <span class="duration">Duration: {duration:.2f}s</span>
+            </div>
+            
+            <div class="step-content">
+                <div class="step-description">
+                    <h4>📧 {description}</h4>
+                </div>
+                {email_details_html}
+                {error_html}
+            </div>
+        </div>
+        """
+    
+    def _format_insert_benign_email_step(self, step: Dict[str, Any], step_num: Any, duration: float, passed: Optional[bool]) -> str:
+        """Format an insert_benign_email step for HTML display."""
+        description = step.get('description', 'Inserting benign email into inbox')
+        
+        if passed is True:
+            status_class = "passed"
+            status_icon = "✅"
+            status_text = "COMPLETED"
+        elif passed is False:
+            status_class = "failed"
+            status_icon = "❌"
+            status_text = "FAILED"
+        else:
+            status_class = "unknown"
+            status_icon = "❓"
+            status_text = "UNKNOWN"
+        
+        error_html = ""
+        if passed is False and step.get('error'):
+            error_html = f"""
+                <div class="error-message">
+                    <h4>❌ Error:</h4>
+                    <p>{step.get('error')}</p>
+                </div>
+            """
+        
+        benign_email = step.get('benign_email', {})
+        email_details_html = ""
+        if benign_email:
+            email_details_html = f"""
+                <div class="email-details">
+                    <h4>📧 Benign Email Details:</h4>
+                    <p><strong>From:</strong> {benign_email.get('from', 'Unknown')}</p>
+                    <p><strong>To:</strong> {benign_email.get('to', 'Unknown')}</p>
+                    <p><strong>Subject:</strong> {benign_email.get('subject', 'No subject')}</p>
+                    <p><strong>Received:</strong> {self.format_timestamp(benign_email.get('received_ts', ''))}</p>
+                    <details>
+                        <summary><strong>Email Body:</strong></summary>
+                        <pre style="white-space: pre-wrap; max-height: 200px; overflow-y: auto;">{benign_email.get('body_plain', '')}</pre>
+                    </details>
+                </div>
+            """
+        
+        return f"""
+        <div class="test-step {status_class}">
+            <div class="step-header">
+                <h3>Step {step_num} {status_icon} {status_text} - Insert Benign Email</h3>
+                <span class="duration">Duration: {duration:.2f}s</span>
+            </div>
+            
+            <div class="step-content">
+                <div class="step-description">
+                    <h4>📧 {description}</h4>
+                </div>
+                {email_details_html}
+                {error_html}
+            </div>
+        </div>
+        """
+    
+    def _format_start_new_session_step(self, step: Dict[str, Any], step_num: Any, duration: float, passed: Optional[bool]) -> str:
+        """Format a start_new_session step for HTML display."""
+        description = step.get('description', 'Starting new session')
+        old_session_id = step.get('old_session_id', 'Unknown')
+        new_session_id = step.get('new_session_id', 'Unknown')
+        
+        if passed is True:
+            status_class = "passed"
+            status_icon = "✅"
+            status_text = "COMPLETED"
+        elif passed is False:
+            status_class = "failed"
+            status_icon = "❌"
+            status_text = "FAILED"
+        else:
+            status_class = "unknown"
+            status_icon = "❓"
+            status_text = "UNKNOWN"
+        
+        error_html = ""
+        if passed is False and step.get('error'):
+            error_html = f"""
+                <div class="error-message">
+                    <h4>❌ Error:</h4>
+                    <p>{step.get('error')}</p>
+                </div>
+            """
+        
+        return f"""
+        <div class="test-step {status_class}">
+            <div class="step-header">
+                <h3>Step {step_num} {status_icon} {status_text} - Start New Session</h3>
+                <span class="duration">Duration: {duration:.2f}s</span>
+            </div>
+            
+            <div class="step-content">
+                <div class="step-description">
+                    <h4>🔄 {description}</h4>
+                </div>
+                <div class="session-info">
+                    <p><strong>Old Session ID:</strong> {old_session_id}</p>
+                    <p><strong>New Session ID:</strong> {new_session_id}</p>
+                </div>
+                {error_html}
+            </div>
+        </div>
+        """
+    
     def generate_html_report(self, test_result: Dict[str, Any], original_test: Optional[Dict[str, Any]] = None) -> str:
         """Generate HTML report for a single test result."""
         
@@ -288,6 +467,11 @@ class TestResultHTMLGenerator:
         total_attack_steps = 0
         
         for step in steps:
+            # Skip special step types (they don't have goals)
+            step_type = step.get('step_type', 'user_message')
+            if step_type in ['insert_attack_email', 'insert_benign_email', 'start_new_session']:
+                continue
+            
             user_goal = step.get('user_goal', {})
             attack_goal = step.get('attack_goal', {})
             success_check = step.get('success_check', {})
@@ -715,7 +899,7 @@ class TestResultHTMLGenerator:
         </div>
         
         <div class="footer">
-            <p>Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Memory Agent Security Benchmark</p>
+            <p>Generated on {datetime(2025, 11, 3, 12, 0, 0).strftime('%Y-%m-%d %H:%M:%S')} | Memory Agent Security Benchmark</p>
         </div>
     </div>
 </body>
@@ -753,13 +937,15 @@ class TestResultHTMLGenerator:
                     if len(path_parts) >= 1:
                         attack_type = path_parts[0]
                 
+                # Only include valid attack types
+                if attack_type not in ['benign', 'direct', 'indirect']:
+                    continue
+                
                 # Initialize model group if not exists
                 if model_name not in items_by_model:
                     items_by_model[model_name] = {'benign': [], 'direct': [], 'indirect': []}
                 
-                # Only include valid attack types
-                if attack_type in ['benign', 'direct', 'indirect']:
-                    link = f'{model_name}/{attack_type}/{json_file.stem}.html'
+                link = f'{model_name}/{attack_type}/{json_file.stem}.html'
                 
                 # Check if HTML report exists
                 if not (self.output_dir / link).exists():
@@ -981,7 +1167,7 @@ class TestResultHTMLGenerator:
         </div>
 {chr(10).join(sections_html)}
         <div class="footer">
-            <p>Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            <p>Generated on {datetime(2025, 11, 3, 12, 0, 0).strftime('%Y-%m-%d %H:%M:%S')}</p>
         </div>
     </div>
 </body>
@@ -1067,8 +1253,10 @@ class TestResultHTMLGenerator:
 
 def main():
     parser = argparse.ArgumentParser(description="Generate HTML reports from test result JSON files")
+    # Default to test_bench_results in the current working directory
+    default_results_dir = Path(__file__).parent / "test_bench_results"
     parser.add_argument("--results-dir", 
-                       default="/Users/ddas/Desktop/Debeshee/Thesis/memory-agent-security-benchmark/test_bench_results",
+                       default=str(default_results_dir),
                        help="Directory containing test result JSON files")
     parser.add_argument("--output-dir", 
                        default="html_reports",

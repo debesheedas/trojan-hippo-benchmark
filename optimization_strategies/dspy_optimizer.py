@@ -1015,7 +1015,7 @@ class DSPyOptimizer(BaseOptimizer):
             attack_email['body_plain'] = attack_email.get('body')
         if 'received_ts' not in attack_email:
             from datetime import datetime
-            attack_email['received_ts'] = datetime.now().isoformat() + 'Z'
+            attack_email['received_ts'] = datetime(2025, 11, 3, 12, 0, 0).isoformat() + 'Z'
         
         if 'metadata' not in attack_email:
             attack_email['metadata'] = {"folder": "inbox", "read": False}

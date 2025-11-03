@@ -85,7 +85,8 @@ class AdaptiveBenchmark:
             self.logger.removeHandler(handler)
         
         # File handler for detailed logs
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Use fixed date for reproducibility (November 3, 2025)
+        timestamp = datetime(2025, 11, 3, 12, 0, 0).strftime("%Y%m%d_%H%M%S")
         log_file = log_dir / f"adaptive_benchmark_{timestamp}.log"
         file_handler = logging.FileHandler(log_file, encoding='utf-8')
         file_handler.setLevel(logging.DEBUG)
@@ -240,7 +241,7 @@ class AdaptiveBenchmark:
                 "test_name": test_name,
                 "test_file": str(test_file),
                 "session_id": session_id,
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime(2025, 11, 3, 12, 0, 0).isoformat(),
                 "overall_success": all_passed,
                 "steps": step_results,
                 "optimization_used": optimization_used,
@@ -484,7 +485,7 @@ class AdaptiveBenchmark:
         # Add optimization metadata
         cached_test["optimization_metadata"] = {
             "optimized": True,
-            "optimization_timestamp": datetime.now().isoformat(),
+            "optimization_timestamp": datetime(2025, 11, 3, 12, 0, 0).isoformat(),
             "model_name": self.model_name
         }
         

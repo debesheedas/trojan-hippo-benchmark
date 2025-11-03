@@ -28,7 +28,8 @@ load_dotenv()
 
 from agent_core import invoke_agent, clear_session_agent, clear_agent_cache
 from utils import read_trace_events, load_config, ensure_data_directories
-from test_validators import create_validator
+from test_validators import create_validator, CompositeValidator
+from colored_trace_printer import get_colored_printer
 
 
 class TestBench:
@@ -93,7 +94,8 @@ class TestBench:
             for h in self.logger.handlers[:]:
                 self.logger.removeHandler(h)
             from datetime import datetime
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            # Use fixed date for reproducibility (November 3, 2025)
+            timestamp = datetime(2025, 11, 3, 12, 0, 0).strftime("%Y%m%d_%H%M%S")
             log_file = log_dir / f"adaptive_benchmark_{timestamp}.log"
             file_handler = logging.FileHandler(log_file, encoding='utf-8')
             file_handler.setLevel(logging.DEBUG)
@@ -292,8 +294,10 @@ class TestBench:
         if initial_data:
             print(f"Initial Data: {initial_data}")
         
-        # Clear agent cache to ensure clean state for each test
+        # Clear agent cache and session store to ensure clean state for each test
         clear_agent_cache()
+        from agent_core import _session_store
+        _session_store.clear()  # Clear all session memories for deterministic runs
         
         # Create isolated test environment
         test_config = self.create_test_environment(test_name, initial_data)
@@ -301,9 +305,14 @@ class TestBench:
 
         
         try:
-            # Generate unique session ID for this test
-            session_id = f"bench_{int(time.time()*1000)}"
+            # Generate unique session ID for this test - use test name hash for reproducibility
+            import hashlib
+            test_hash = hashlib.md5(f"{test_file.name}_{test_name}".encode()).hexdigest()[:8]
+            session_id = f"bench_{test_hash}"
             print(f"Session ID: {session_id}")
+            
+            # Clear any existing agent for this session to ensure fresh state
+            clear_session_agent(session_id)
             
             # Run test steps
             step_results = []
@@ -331,9 +340,11 @@ class TestBench:
                     except Exception as e:
                         print(f"Warning: Could not save session history: {e}")
                     
-                    # Start new session
+                    # Start new session - use deterministic ID based on test and step
                     old_session_id = session_id
-                    session_id = f"bench_{int(time.time()*1000)}"
+                    import hashlib
+                    session_hash = hashlib.md5(f"{test_file.name}_{test_name}_step{i}".encode()).hexdigest()[:8]
+                    session_id = f"bench_{session_hash}"
                     print(f"New session: {session_id} (was {old_session_id})")
                     
                     # Clear the agent cache for the old session to ensure clean state
@@ -365,8 +376,123 @@ class TestBench:
                     })
                     continue
                 
+                if step_type == "insert_attack_email":
+                    # Handle attack email insertion step
+                    print(f"📧 {step.get('description', 'Inserting attack email into inbox')}")
+                    
+                    # Get the attack email from the step
+                    attack_email = step.get("attack_email")
+                    if not attack_email:
+                        print(f"⚠️ Warning: Step {i} has step_type 'insert_attack_email' but no 'attack_email' field. Skipping.")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_attack_email",
+                            "description": step.get('description', 'Inserting attack email'),
+                            "duration_s": 0.0,
+                            "passed": False,
+                            "error": "Missing attack_email field"
+                        })
+                        continue
+                    
+                    # Get inbox directory from test config
+                    inbox_dir = Path(test_config["data"]["mailbox_dir"])
+                    inbox_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Generate unique filename for attack email
+                    attack_email_id = str(uuid.uuid4())[:8]
+                    attack_email_file = inbox_dir / f"attack_{attack_email_id}.json"
+                    
+                    # Write attack email to inbox
+                    try:
+                        with open(attack_email_file, 'w', encoding='utf-8') as f:
+                            json.dump(attack_email, f, indent=2, ensure_ascii=False)
+                        
+                        print(f"✅ Added attack email: {attack_email.get('subject', 'No subject')} from {attack_email.get('from', 'Unknown sender')}")
+                        
+                        # Record this as a successful step
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_attack_email",
+                            "description": step.get('description', 'Inserting attack email'),
+                            "email_subject": attack_email.get('subject', 'No subject'),
+                            "email_from": attack_email.get('from', 'Unknown sender'),
+                            "duration_s": 0.0,
+                            "passed": True
+                        })
+                    except Exception as e:
+                        print(f"❌ Error inserting attack email: {e}")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_attack_email",
+                            "description": step.get('description', 'Inserting attack email'),
+                            "duration_s": 0.0,
+                            "passed": False,
+                            "error": str(e)
+                        })
+                    continue
+                
+                if step_type == "insert_benign_email":
+                    # Handle benign email insertion step
+                    print(f"📧 {step.get('description', 'Inserting benign email into inbox')}")
+                    
+                    # Get the benign email from the step
+                    benign_email = step.get("benign_email")
+                    if not benign_email:
+                        print(f"⚠️ Warning: Step {i} has step_type 'insert_benign_email' but no 'benign_email' field. Skipping.")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_benign_email",
+                            "description": step.get('description', 'Inserting benign email'),
+                            "duration_s": 0.0,
+                            "passed": False,
+                            "error": "Missing benign_email field"
+                        })
+                        continue
+                    
+                    # Get inbox directory from test config
+                    inbox_dir = Path(test_config["data"]["mailbox_dir"])
+                    inbox_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Generate unique filename for benign email
+                    benign_email_id = str(uuid.uuid4())[:8]
+                    benign_email_file = inbox_dir / f"benign_{benign_email_id}.json"
+                    
+                    # Write benign email to inbox
+                    try:
+                        with open(benign_email_file, 'w', encoding='utf-8') as f:
+                            json.dump(benign_email, f, indent=2, ensure_ascii=False)
+                        
+                        print(f"✅ Added benign email: {benign_email.get('subject', 'No subject')} from {benign_email.get('from', 'Unknown sender')}")
+                        
+                        # Record this as a successful step
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_benign_email",
+                            "description": step.get('description', 'Inserting benign email'),
+                            "email_subject": benign_email.get('subject', 'No subject'),
+                            "email_from": benign_email.get('from', 'Unknown sender'),
+                            "duration_s": 0.0,
+                            "passed": True
+                        })
+                    except Exception as e:
+                        print(f"❌ Error inserting benign email: {e}")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_benign_email",
+                            "description": step.get('description', 'Inserting benign email'),
+                            "duration_s": 0.0,
+                            "passed": False,
+                            "error": str(e)
+                        })
+                    continue
+                
                 # Handle regular user message steps
-                print(f"User: {step['user_message']}")
+                printer = get_colored_printer()
+                print(printer.format_trace_event({
+                    "event_type": "user_input",
+                    "payload": {"text": step['user_message']},
+                    "ts": ""
+                }))
                 print(f"Expected: {step['expected_behavior']}")
                 
                 # Invoke agent (pure Python, no HTTP)
@@ -380,15 +506,27 @@ class TestBench:
                     duration = time.time() - start_time
                     
                     response = result["response"]
-                    print(f"Agent Response: {response[:200]}...")
-                    print(f"Duration: {duration:.2f}s")
                     
                     # Collect traces for this step
                     try:
                         step_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+                        # Print only tool_call and tool_result events (to avoid duplicate user_input/agent_response)
+                        for trace_event in step_traces:
+                            event_type = trace_event.get('event_type', '')
+                            # Skip user_input and agent_response as we print them separately
+                            if event_type in ['tool_call', 'tool_result']:
+                                printer.print_trace_event(trace_event)
                     except Exception as e:
                         print(f"Warning: Could not read traces for step: {e}")
                         step_traces = []
+                    
+                    # Print agent response with color
+                    print(printer.format_trace_event({
+                        "event_type": "agent_response",
+                        "payload": {"text": response},
+                        "ts": ""
+                    }))
+                    print(f"Duration: {duration:.2f}s")
                     
                     # Run dual evaluation system (user_goal and attack_goal)
                     user_goal_passed = None
@@ -406,7 +544,16 @@ class TestBench:
                                 user_goal_check = step["user_goal"]["success_check"]
                                 if isinstance(user_goal_check, dict):
                                     validator = create_validator(user_goal_check, test_config)
-                                    user_goal_passed = validator.validate(response, session_id, step_traces)
+                                    # Use validate_with_print if it's a composite validator
+                                    if isinstance(validator, CompositeValidator):
+                                        print("\n🔍 User Goal Validator Results:")
+                                        user_goal_passed = validator.validate_with_print(response, session_id, step_traces)
+                                    else:
+                                        user_goal_passed = validator.validate(response, session_id, step_traces)
+                                        # Print single validator result
+                                        from colored_trace_printer import print_validator_result
+                                        validator_type = user_goal_check.get("type", "validator")
+                                        print_validator_result(validator_type, "User goal", user_goal_passed)
                                 else:
                                     # String-based check function (legacy support)
                                     check_function = user_goal_check
@@ -425,7 +572,17 @@ class TestBench:
                                 attack_goal_check = step["attack_goal"]["success_check"]
                                 if isinstance(attack_goal_check, dict):
                                     validator = create_validator(attack_goal_check, test_config)
-                                    attack_goal_passed = validator.validate(response, session_id, step_traces)
+                                    # Use validate_with_print if it's a composite validator
+                                    if isinstance(validator, CompositeValidator):
+                                        print("\n🔍 Validator Results:")
+                                        attack_goal_passed = validator.validate_with_print(response, session_id, step_traces)
+                                    else:
+                                        attack_goal_passed = validator.validate(response, session_id, step_traces)
+                                        # Print single validator result
+                                        from colored_trace_printer import print_validator_result
+                                        validator_type = attack_goal_check.get("type", "validator")
+                                        print_validator_result(validator_type, "Attack goal", attack_goal_passed)
+                                    
                                     # compute partial score if available
                                     try:
                                         partial_attack_score = float(validator.score(response, session_id, step_traces))
@@ -557,7 +714,7 @@ class TestBench:
                 "test_file": str(test_file),
                 "description": description,
                 "session_id": session_id,
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime(2025, 11, 3, 12, 0, 0).isoformat(),
                 "overall_success": all_passed,
                 "steps": step_results,
                 "session_history": session_history,
@@ -709,6 +866,134 @@ class TestBench:
                         "passed": True
                     })
                     continue
+                
+                if step_type == "insert_attack_email":
+                    # Handle attack email insertion step
+                    print(f"📧 {step.get('description', 'Inserting attack email into inbox')}")
+                    
+                    # Get the attack email from the step
+                    attack_email = step.get("attack_email")
+                    if not attack_email:
+                        print(f"⚠️ Warning: Step {i} has step_type 'insert_attack_email' but no 'attack_email' field. Skipping.")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_attack_email",
+                            "description": step.get('description', 'Inserting attack email'),
+                            "duration_s": 0.0,
+                            "passed": False,
+                            "error": "Missing attack_email field"
+                        })
+                        continue
+                    
+                    # Get inbox directory from test config
+                    inbox_dir = Path(test_config["data"]["mailbox_dir"])
+                    inbox_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Generate unique filename for attack email
+                    attack_email_id = str(uuid.uuid4())[:8]
+                    attack_email_file = inbox_dir / f"attack_{attack_email_id}.json"
+                    
+                    # Write attack email to inbox
+                    try:
+                        with open(attack_email_file, 'w', encoding='utf-8') as f:
+                            json.dump(attack_email, f, indent=2, ensure_ascii=False)
+                        
+                        print(f"✅ Added attack email: {attack_email.get('subject', 'No subject')} from {attack_email.get('from', 'Unknown sender')}")
+                        
+                        # Update state manager with new email
+                        try:
+                            current_state = self.state_manager.get_current_state()
+                            if current_state:
+                                # Add email to state's inbox_emails list
+                                current_state.inbox_emails.append(attack_email)
+                        except Exception as e:
+                            print(f"Warning: Could not update state manager with new email: {e}")
+                        
+                        # Record this as a successful step and continue
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_attack_email",
+                            "description": step.get('description', 'Inserting attack email'),
+                            "email_subject": attack_email.get('subject', 'No subject'),
+                            "email_from": attack_email.get('from', 'Unknown sender'),
+                            "duration_s": 0.0,
+                            "passed": True
+                        })
+                    except Exception as e:
+                        print(f"❌ Error inserting attack email: {e}")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_attack_email",
+                            "description": step.get('description', 'Inserting attack email'),
+                            "duration_s": 0.0,
+                            "passed": False,
+                            "error": str(e)
+                        })
+                    continue
+                
+                if step_type == "insert_benign_email":
+                    # Handle benign email insertion step
+                    print(f"📧 {step.get('description', 'Inserting benign email into inbox')}")
+                    
+                    # Get the benign email from the step
+                    benign_email = step.get("benign_email")
+                    if not benign_email:
+                        print(f"⚠️ Warning: Step {i} has step_type 'insert_benign_email' but no 'benign_email' field. Skipping.")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_benign_email",
+                            "description": step.get('description', 'Inserting benign email'),
+                            "duration_s": 0.0,
+                            "passed": False,
+                            "error": "Missing benign_email field"
+                        })
+                        continue
+                    
+                    # Get inbox directory from test config
+                    inbox_dir = Path(test_config["data"]["mailbox_dir"])
+                    inbox_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Generate unique filename for benign email
+                    benign_email_id = str(uuid.uuid4())[:8]
+                    benign_email_file = inbox_dir / f"benign_{benign_email_id}.json"
+                    
+                    # Write benign email to inbox
+                    try:
+                        with open(benign_email_file, 'w', encoding='utf-8') as f:
+                            json.dump(benign_email, f, indent=2, ensure_ascii=False)
+                        
+                        print(f"✅ Added benign email: {benign_email.get('subject', 'No subject')} from {benign_email.get('from', 'Unknown sender')}")
+                        
+                        # Update state manager with new email
+                        try:
+                            current_state = self.state_manager.get_current_state()
+                            if current_state:
+                                # Add email to state's inbox_emails list
+                                current_state.inbox_emails.append(benign_email)
+                        except Exception as e:
+                            print(f"Warning: Could not update state manager with new email: {e}")
+                        
+                        # Record this as a successful step and continue
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_benign_email",
+                            "description": step.get('description', 'Inserting benign email'),
+                            "email_subject": benign_email.get('subject', 'No subject'),
+                            "email_from": benign_email.get('from', 'Unknown sender'),
+                            "duration_s": 0.0,
+                            "passed": True
+                        })
+                    except Exception as e:
+                        print(f"❌ Error inserting benign email: {e}")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_benign_email",
+                            "description": step.get('description', 'Inserting benign email'),
+                            "duration_s": 0.0,
+                            "passed": False,
+                            "error": str(e)
+                        })
+                    continue
 
                 # Check if this step has an attack goal
                 if "attack_goal" in step and step["attack_goal"]:
@@ -786,7 +1071,7 @@ class TestBench:
                 "test_name": test_name,
                 "test_file": str(test_file),
                 "session_id": session_id,
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime(2025, 11, 3, 12, 0, 0).isoformat(),
                 "overall_success": all_passed,
                 "steps": step_results,
                 "optimization_used": optimization_used,
@@ -1028,7 +1313,7 @@ class TestBench:
         # Add optimization metadata
         cached_test["optimization_metadata"] = {
             "optimized": True,
-            "optimization_timestamp": datetime.now().isoformat(),
+            "optimization_timestamp": datetime(2025, 11, 3, 12, 0, 0).isoformat(),
             "model_name": self.model_name
         }
         

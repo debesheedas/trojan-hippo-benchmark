@@ -84,7 +84,8 @@ class SessionManager:
     def create_session(self, first_message: str = "") -> Session:
         """Create a new session."""
         session_id = self._generate_session_id()
-        now = datetime.now().isoformat()
+        # Use fixed date for reproducibility (November 3, 2025)
+        now = datetime(2025, 11, 3, 12, 0, 0).isoformat()
         title = self._generate_session_title(first_message) if first_message else "New Chat"
         
         session = Session(
@@ -137,7 +138,8 @@ class SessionManager:
     
     def update_session(self, session: Session):
         """Update a session."""
-        session.last_updated = datetime.now().isoformat()
+        # Use fixed date for reproducibility (November 3, 2025)
+        session.last_updated = datetime(2025, 11, 3, 12, 0, 0).isoformat()
         self._save_session(session)
         
         # Update session index
@@ -168,7 +170,8 @@ class SessionManager:
         session.conversation_history.append({
             "message": message,
             "is_user": is_user,
-            "timestamp": datetime.now().isoformat()
+            # Use fixed date for reproducibility (November 3, 2025)
+            "timestamp": datetime(2025, 11, 3, 12, 0, 0).isoformat()
         })
         
         session.message_count += 1

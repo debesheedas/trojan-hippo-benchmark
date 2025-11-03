@@ -30,7 +30,9 @@ memory-agent-security-benchmark/
 ├── requirements.txt          # Python dependencies
 ├── config.yaml              # Application configuration
 ├── main.py                  # FastAPI application
-├── agent_tools.py           # LangChain tool implementations
+├── tool_specifications/     # LangChain tool implementations
+│   ├── email_tools.py       # Email management tools
+│   └── memory_tools.py      # Memory management tools
 ├── utils.py                 # Helper functions
 ├── backend/                 # Memory backend
 │   ├── __init__.py
@@ -352,7 +354,7 @@ Quick smoke test:
 
 This MVP is designed to be easily extensible:
 
-- **Add new tools**: Create new tool classes in `agent_tools.py`
+- **Add new tools**: Create new tool classes in `tool_specifications/email_tools.py` or `tool_specifications/memory_tools.py`
 - **Enhance search**: Replace substring search with SQLite FTS5
 - **Add authentication**: Implement user sessions and auth
 - **Email sending**: Add SMTP integration for actually sending drafts

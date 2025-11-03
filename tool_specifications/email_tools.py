@@ -5,12 +5,98 @@ Each tool logs trace events for observability.
 """
 
 import json
+import os
 from pathlib import Path
 from typing import List, Optional
 from langchain.tools import BaseTool
 from pydantic import BaseModel, Field
+import numpy as np
 
 from utils import generate_id, get_timestamp, append_trace_event, USER_EMAIL
+
+# Try to import OpenAI for embeddings, but make it optional
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    OpenAI = None
+
+
+def _keyword_relevance_score(query_lower: str, query_words: List[str], 
+                             email_from: str, email_subject: str, email_body: str) -> float:
+    """
+    Fallback keyword-based relevance scoring when embeddings are unavailable.
+    Returns a relevance score between 0 and 1.
+    """
+    email_from_lower = email_from.lower()
+    email_subject_lower = email_subject.lower()
+    email_body_lower = email_body.lower()
+    
+    if not query_words:
+        return 0.5  # Base score for empty query
+    
+    # Calculate keyword matches with field weighting
+    words_in_subject = sum(1 for word in query_words if word in email_subject_lower)
+    words_in_from = sum(1 for word in query_words if word in email_from_lower)
+    words_in_body = sum(1 for word in query_words if word in email_body_lower)
+    
+    # Exact phrase matches get bonus
+    exact_subject_match = query_lower in email_subject_lower
+    exact_body_match = query_lower in email_body_lower
+    
+    # Calculate base score (0-1 range)
+    total_words = len(query_words)
+    if total_words == 0:
+        return 0.5
+    
+    # Weighted scoring: subject (3x), from (2x), body (1x)
+    base_score = ((words_in_subject * 3) + (words_in_from * 2) + words_in_body) / (total_words * 3)
+    
+    # Add bonuses for exact phrase matches
+    if exact_subject_match:
+        base_score = min(1.0, base_score + 0.3)
+    elif exact_body_match:
+        base_score = min(1.0, base_score + 0.1)
+    
+    # Normalize: if all words found in subject, give maximum score
+    if words_in_subject == total_words:
+        base_score = min(1.0, base_score * 1.2)
+    
+    return min(1.0, base_score)
+
+def _get_embedding(text: str, api_key: Optional[str] = None) -> Optional[List[float]]:
+    """
+    Get embedding for text using OpenAI's text-embedding-3-small model.
+    Returns None if embeddings are not available or API call fails.
+    """
+    if not OPENAI_AVAILABLE or OpenAI is None:
+        return None
+    
+    try:
+        api_key = api_key or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return None
+        
+        client = OpenAI(api_key=api_key)
+        response = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text
+        )
+        return response.data[0].embedding
+    except Exception:
+        return None
+
+def _cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+    """Calculate cosine similarity between two vectors."""
+    vec1_arr = np.array(vec1, dtype=float)
+    vec2_arr = np.array(vec2, dtype=float)
+    dot_product = np.dot(vec1_arr, vec2_arr)
+    norm1 = np.linalg.norm(vec1_arr)
+    norm2 = np.linalg.norm(vec2_arr)
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    return float(dot_product / (norm1 * norm2))
 
 
 def _find_best_email_match(search_query: str, config, folder: str = "inbox", limit: int = 1):
@@ -37,35 +123,51 @@ def _find_best_email_match(search_query: str, config, folder: str = "inbox", lim
         return []
     
     matches = []
-    query_lower = search_query.lower()
+    query_lower = search_query.lower().strip()
     query_words = query_lower.split()
     
-    # Search across all emails in the folder
-    for file_path in search_dir.glob("*.json"):
+    # Get query embedding for semantic search (fallback to keyword search if unavailable)
+    api_key = os.getenv("OPENAI_API_KEY")
+    query_embedding = _get_embedding(search_query, api_key) if search_query and OPENAI_AVAILABLE else None
+    
+    # Search across all emails in the folder - sort files for deterministic order
+    email_files = sorted(search_dir.glob("*.json"), key=lambda p: p.name)
+    
+    for file_path in email_files:
         with open(file_path, "r", encoding="utf-8") as f:
             email = json.load(f)
             
-            # Search in from, to, subject, and body
-            searchable_text = (
-                f"{email.get('from', '')} "
-                f"{email.get('to', '')} "
-                f"{email.get('subject', '')} "
-                f"{email.get('body', email.get('body_plain', ''))}"
-            ).lower()
+            # Extract email fields for searchable content
+            email_from = email.get('from', '')
+            email_subject = email.get('subject', '')
+            email_body = email.get('body_plain', email.get('body', ''))
             
-            # Calculate relevance score (number of matching words)
-            relevance = sum(1 for word in query_words if word in searchable_text)
+            # Create searchable text (subject and body, with subject weighted more)
+            searchable_text = f"{email_subject}\n\n{email_body}"
             
-            # If query is empty, include all emails (relevance = 1)
-            if not query_words:
-                relevance = 1
+            if not search_query.strip():
+                # Empty query - include all emails with base relevance
+                relevance = 0.5  # Base score for empty query
+            elif query_embedding is not None:
+                # Use semantic similarity (embeddings)
+                email_embedding = _get_embedding(searchable_text, api_key)
+                if email_embedding is not None:
+                    # Cosine similarity gives us a score between -1 and 1, normalize to 0-1
+                    similarity = _cosine_similarity(query_embedding, email_embedding)
+                    relevance = max(0.0, similarity)  # Ensure non-negative
+                else:
+                    # Fallback to keyword matching if embedding fails for this email
+                    relevance = _keyword_relevance_score(query_lower, query_words, email_from, email_subject, email_body)
+            else:
+                # Fallback to keyword-based relevance if embeddings unavailable
+                relevance = _keyword_relevance_score(query_lower, query_words, email_from, email_subject, email_body)
             
             if relevance > 0:
                 email['_relevance'] = relevance
                 email['_file_path'] = str(file_path)
                 matches.append(email)
     
-    # Sort by relevance (most relevant first), then by date (newest first)
+    # Sort by relevance (most relevant first), then by date (newest first) as tie-breaker
     def parse_timestamp(ts: str) -> float:
         """Convert ISO timestamp to float for sorting. Returns 0 if invalid."""
         try:
@@ -74,9 +176,14 @@ def _find_best_email_match(search_query: str, config, folder: str = "inbox", lim
         except:
             return 0.0
     
+    # Sort: Primary by relevance (descending, so highest relevance first)
+    #        Secondary by recency (descending, so newest first) - ONLY as tie-breaker
+    #        Tertiary by file path (ascending) - for determinism
+    # The large relevance scores ensure recency only matters when relevance is equal
     matches.sort(key=lambda x: (
-        -x.get('_relevance', 0),
-        -parse_timestamp(x.get('received_ts', x.get('created_ts', '')))
+        -x.get('_relevance', 0),  # Negative for descending (highest first)
+        -parse_timestamp(x.get('received_ts', x.get('created_ts', ''))),  # Newest first as tie-breaker
+        x.get('_file_path', '')  # File path for determinism
     ))
     
     return matches[:limit]
@@ -93,7 +200,11 @@ class EmailToolsConfig:
 
 
 class ReadAllEmailsInput(BaseModel):
-    """Input schema for read_all_emails tool - no input required."""
+    """Input schema for read_all_emails tool."""
+    unread_only: bool = Field(
+        default=False,
+        description="If True, only return unread emails. If False (default), return all emails sorted with unread first."
+    )
 
 
 class SearchEmailsInput(BaseModel):
@@ -121,7 +232,7 @@ class ForwardEmailInput(BaseModel):
     forward_to: str = Field(description="Email address to forward to")
     message: str = Field(
         default="",
-        description="Optional message to include with the forwarded email"
+        description="Optional note/comment to add above the forwarded email (e.g., 'Please review this'). The original email content (subject, body, etc.) is automatically included in the forward - you do NOT need to include it in this message parameter."
     )
 
 
@@ -142,12 +253,19 @@ class ComposeEmailInput(BaseModel):
 class ReadAllEmailsTool(BaseTool):
     """Tool for reading all emails in the inbox."""
     name: str = "read_all_emails"
-    description: str = """Read all emails in the inbox. Returns complete information about each email including sender, recipient, subject, body, date, and status. Emails are sorted from newest to oldest. Use this to get an overview of all emails."""
+    description: str = """Read all emails in the inbox. Returns complete information about each email including sender, recipient, subject, body, date, and read status.
+
+Sorting: Emails are sorted with unread emails first, then read emails. Within each category, emails are sorted from newest to oldest (most recent first).
+
+Optional parameter:
+- unread_only: If set to True, only returns unread emails. If False (default), returns all emails with unread ones listed first.
+
+When you read emails using this tool, they are automatically marked as read in the inbox."""
     args_schema: type[BaseModel] = ReadAllEmailsInput
     config: Optional[EmailToolsConfig] = None
     
-    def _run(self) -> str:
-        """Read and return all inbox emails."""
+    def _run(self, unread_only: bool = False) -> str:
+        """Read and return all inbox emails, optionally filtered to unread only."""
         call_id = generate_id("tcall")
         
         # Log tool call
@@ -158,29 +276,81 @@ class ReadAllEmailsTool(BaseTool):
                 self.config.session_id,
                 {
                     "tool_name": self.name,
-                    "inputs": {},
+                    "inputs": {"unread_only": unread_only},
                     "call_id": call_id
                 }
             )
         
         try:
-            # Use shared helper to get all emails (empty query returns all)
-            emails = _find_best_email_match("", self.config, "inbox", limit=1000)
+            # Get all emails from inbox directory
+            inbox_dir = self.config.mailbox_dir
+            email_files = sorted(inbox_dir.glob("*.json"), key=lambda p: p.name)
+            
+            emails = []
+            def parse_timestamp(ts: str) -> float:
+                """Convert ISO timestamp to float for sorting. Returns 0 if invalid."""
+                try:
+                    from datetime import datetime
+                    return datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
+                except:
+                    return 0.0
+            
+            # Read all emails and prepare for sorting
+            for file_path in email_files:
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        email = json.load(f)
+                        
+                        # Filter by unread status if requested
+                        if unread_only:
+                            is_read = email.get("metadata", {}).get("read", False)
+                            if is_read:
+                                continue
+                        
+                        email['_file_path'] = str(file_path)
+                        emails.append(email)
+                except Exception:
+                    continue
             
             if not emails:
-                result = "No emails found in inbox."
+                result = "No emails found in inbox." if not unread_only else "No unread emails found in inbox."
             else:
+                # Sort emails: unread first, then read; within each group, newest first
+                emails.sort(key=lambda x: (
+                    x.get("metadata", {}).get("read", False),  # False (unread) sorts before True (read)
+                    -parse_timestamp(x.get('received_ts', x.get('created_ts', ''))),  # Newest first (negative for descending)
+                    x.get('_file_path', '')  # File path for determinism
+                ))
+                
+                # Mark all displayed emails as read and save back to file
+                for email in emails:
+                    file_path = Path(email.get('_file_path'))
+                    if file_path.exists():
+                        # Ensure metadata exists
+                        if "metadata" not in email:
+                            email["metadata"] = {}
+                        
+                        # Mark as read
+                        email["metadata"]["read"] = True
+                        
+                        # Save updated email back to file
+                        try:
+                            with open(file_path, "w", encoding="utf-8") as f:
+                                json.dump(email, f, indent=2, ensure_ascii=False)
+                        except Exception:
+                            pass  # If we can't write, continue anyway
+                
                 result_lines = [f"Found {len(emails)} email(s) in inbox:\n"]
                 for i, email in enumerate(emails, 1):
                     read_status = "Read" if email.get("metadata", {}).get("read") else "Unread"
                     result_lines.append(
                         f"\n--- Email {i} ---\n"
-                        f"From: {email['from']}\n"
-                        f"To: {email['to']}\n"
-                        f"Subject: {email['subject']}\n"
-                        f"Date: {email['received_ts']}\n"
+                        f"From: {email.get('from', 'N/A')}\n"
+                        f"To: {email.get('to', 'N/A')}\n"
+                        f"Subject: {email.get('subject', 'N/A')}\n"
+                        f"Date: {email.get('received_ts', email.get('created_ts', 'N/A'))}\n"
                         f"Status: {read_status}\n"
-                        f"Body:\n{email['body_plain']}\n"
+                        f"Body:\n{email.get('body_plain', email.get('body', 'N/A'))}\n"
                     )
                 result = "\n".join(result_lines)
             
@@ -219,9 +389,20 @@ class ReadAllEmailsTool(BaseTool):
 
 
 class SearchEmailsTool(BaseTool):
-    """Tool for searching emails with smart ranking."""
+    """Tool for searching emails with semantic search."""
     name: str = "search_emails"
-    description: str = """Search for emails matching a query in inbox, outbox, or drafts. Searches across sender, recipient, subject, and body. Returns most relevant matches sorted by relevance and recency. Use this to find specific emails when you need more details than read_all_emails provides."""
+    description: str = """Search for emails matching a query in inbox, outbox, or drafts using semantic search.
+    
+Uses intelligent semantic matching to find emails that are most relevant to your query, not just keyword matches.
+Results are sorted by relevance (most relevant first), with recency used only as a tie-breaker.
+
+Writing effective search queries:
+- Be specific: Use key phrases or terms that describe what you're looking for (e.g., "Q4 strategy pricing discussion" not just "Q4")
+- Include context: Mention sender names, topics, or specific details you remember
+- Use natural language: The search understands meaning (e.g., "budget planning meeting" finds emails about budget meetings)
+- Avoid generic terms: Terms like "email" or "message" are too broad
+
+Searches across sender, recipient, subject, and body. Returns most relevant matches sorted by semantic similarity."""
     args_schema: type[BaseModel] = SearchEmailsInput
     config: Optional[EmailToolsConfig] = None
     
@@ -312,7 +493,20 @@ class SearchEmailsTool(BaseTool):
 class ReplyToEmailTool(BaseTool):
     """Tool for replying to an email."""
     name: str = "reply_to_email"
-    description: str = """Reply to an email. Automatically finds the email using your search query, extracts the sender's email address, constructs a 'Re: [subject]' reply, and sends it. If multiple emails match, the MOST RECENT one is used. This is a one-step operation - no need to manually construct the reply email."""
+    description: str = """Reply to an email using semantic search to find the most relevant match.
+
+How it works:
+1. Uses semantic search to find the email that best matches your search_query
+2. Automatically extracts the sender address and constructs a 'Re: [subject]' subject line
+3. Sends your reply with the original email quoted
+
+Writing effective search queries:
+- Be specific: Use descriptive phrases that identify the email (e.g., "Q4 strategy email from thomas" not just "thomas")
+- Include context: Mention sender name, topic, or specific details (e.g., "meeting invitation tomorrow alice")
+- Use natural language: The search understands meaning (e.g., "budget discussion Q4" finds emails about Q4 budgets)
+- Avoid generic terms: Terms like "email" or "message" are too broad
+
+This is a one-step operation - no need to manually construct the reply email. If multiple emails match, the MOST RELEVANT (semantically similar) one is used, not necessarily the newest."""
     args_schema: type[BaseModel] = ReplyToEmailInput
     config: Optional[EmailToolsConfig] = None
     
@@ -428,7 +622,21 @@ class ReplyToEmailTool(BaseTool):
 class ForwardEmailTool(BaseTool):
     """Tool for forwarding an email."""
     name: str = "forward_to_email"
-    description: str = """Forward an email to someone else. Automatically finds the email using your search query, constructs a 'Fwd: [subject]' forward, and sends it with your optional message. If multiple emails match, the MOST RECENT one is forwarded."""
+    description: str = """Forward an email to someone else using semantic search to find the most relevant match.
+    
+How it works:
+1. Uses semantic search to find the email that best matches your search_query
+2. Automatically includes the COMPLETE original email content (subject, body, sender, date) in the forwarded email
+3. Adds your optional message (if provided) as a note above the forwarded email content
+4. Constructs a 'Fwd: [subject]' subject line and sends it
+
+Writing effective search queries:
+- Be specific: Use key phrases or terms that uniquely identify the email (e.g., "Q4 strategy pricing" not just "email")
+- Include context: Mention the sender name, topic, or specific details you remember
+- Use natural language: The search understands meaning, not just keywords (e.g., "budget allocation Q4" finds emails about Q4 budgets)
+- Avoid generic terms: Terms like "inbox" or "email" match too many results
+
+Important: The original email body and all content is automatically included - you only need to provide an optional note/comment in the message parameter if you want to add your own text above the forwarded email. The search prioritizes RELEVANCE over recency, so the most semantically similar email will be selected, even if it's not the newest."""
     args_schema: type[BaseModel] = ForwardEmailInput
     config: Optional[EmailToolsConfig] = None
     
@@ -462,8 +670,29 @@ class ForwardEmailTool(BaseTool):
                 original_from = original_email.get('from', '')
                 original_to = original_email.get('to', '')
                 original_subject = original_email.get('subject', '')
+                # Get body - prefer body_plain, fall back to body, ensure it's a string
                 original_body = original_email.get('body_plain', original_email.get('body', ''))
-                original_date = original_email.get('received_ts', '')
+                if original_body is None:
+                    original_body = ''
+                # Ensure we have a string (not bytes or other type)
+                original_body = str(original_body)
+                original_date = original_email.get('received_ts', original_email.get('created_ts', ''))
+                
+                # Validate that we actually have email body content
+                if not original_body or len(original_body.strip()) == 0:
+                    result = f"Warning: Email found ('{original_subject}') but it has no body content. Cannot forward empty email."
+                    if self.config and self.config.session_id:
+                        append_trace_event(
+                            self.config.trace_file,
+                            "tool_result",
+                            self.config.session_id,
+                            {
+                                "tool_name": self.name,
+                                "outputs": {"error": result},
+                                "call_id": call_id
+                            }
+                        )
+                    return result
                 
                 # Construct forward subject
                 if original_subject.lower().startswith('fwd:'):
@@ -494,14 +723,29 @@ class ForwardEmailTool(BaseTool):
                     "to": forward_to,
                     "subject": forward_subject,
                     "body": forward_body,
+                    "body_plain": forward_body,  # Also store as body_plain for consistency
                     "created_ts": get_timestamp(),
                     "sent_ts": get_timestamp(),
                     "status": "sent",
                     "forwarded_from": original_email.get('id', 'unknown')
                 }
                 
+                # Use ensure_ascii=False to preserve unicode characters, and don't indent to avoid
+                # potential issues with very long strings containing newlines
                 with open(email_file, "w", encoding="utf-8") as f:
-                    json.dump(forward_email, f, indent=2)
+                    json.dump(forward_email, f, indent=2, ensure_ascii=False)
+                
+                # Debug: Print the forwarded email contents to terminal
+                print("\n" + "="*80)
+                print("📧 DEBUG: Forwarded Email Contents (written to outbox)")
+                print("="*80)
+                print(f"From: {forward_email.get('from', 'N/A')}")
+                print(f"To: {forward_email.get('to', 'N/A')}")
+                print(f"Subject: {forward_email.get('subject', 'N/A')}")
+                print(f"\nBody Length: {len(forward_body)} characters")
+                print(f"\n--- Full Body Content ---")
+                print(forward_body)
+                print("="*80 + "\n")
                 
                 match_info = ""
                 if len(matches) > 1:

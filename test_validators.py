@@ -7,6 +7,7 @@ via parameters in the test JSON files.
 
 import json
 import re
+import os
 from pathlib import Path
 from typing import List, Dict, Any, Union, Optional
 
@@ -157,6 +158,10 @@ class ToolCallValidator(TestValidator):
                     normalized_params = self._normalized_tool_params[tool_name]
                     
                     for param_name, expected_value in expected_params.items():
+                        # Skip validation-only parameters (not actual tool parameters)
+                        if param_name == 'min_required':
+                            continue
+                        
                         if param_name not in actual_inputs:
                             return False
                         
@@ -168,14 +173,28 @@ class ToolCallValidator(TestValidator):
                             if normalized_params[param_name] not in str(actual_value).lower():
                                 return False
                         elif isinstance(expected_value, list):
-                            # List of keywords - check if any are present in the parameter
+                            # List of keywords - check how many are present in the parameter
                             actual_lower = str(actual_value).lower()
                             normalized_keywords = normalized_params[param_name]
-                            for keyword in normalized_keywords:
-                                if keyword in actual_lower:
-                                    break
+                            
+                            # Check if min_required is specified for this parameter
+                            min_required = expected_params.get('min_required')
+                            if min_required is not None:
+                                # Count how many keywords are found
+                                found_count = 0
+                                for keyword in normalized_keywords:
+                                    if keyword in actual_lower:
+                                        found_count += 1
+                                # Need at least min_required keywords
+                                if found_count < min_required:
+                                    return False
                             else:
-                                return False
+                                # Default behavior: check if any keyword is present
+                                for keyword in normalized_keywords:
+                                    if keyword in actual_lower:
+                                        break
+                                else:
+                                    return False
                         elif isinstance(expected_value, dict):
                             # Nested parameter validation
                             if not self._validate_nested_params(actual_value, expected_value):
@@ -225,6 +244,10 @@ class ToolCallValidator(TestValidator):
             # Determine if params fully match according to validate logic
             params_ok = True
             for param_name, expected_value in expected_params.items():
+                # Skip validation-only parameters (not actual tool parameters)
+                if param_name == 'min_required':
+                    continue
+                
                 if param_name not in actual_inputs:
                     params_ok = False
                     break
@@ -236,9 +259,20 @@ class ToolCallValidator(TestValidator):
                 elif isinstance(expected_value, list):
                     actual_lower = str(actual_value).lower()
                     normalized_keywords = normalized_params.get(param_name, [])
-                    if not any(kw in actual_lower for kw in normalized_keywords):
-                        params_ok = False
-                        break
+                    
+                    # Check if min_required is specified for this parameter
+                    min_required = expected_params.get('min_required')
+                    if min_required is not None:
+                        # Count how many keywords are found
+                        found_count = sum(1 for kw in normalized_keywords if kw in actual_lower)
+                        if found_count < min_required:
+                            params_ok = False
+                            break
+                    else:
+                        # Default behavior: check if any keyword is present
+                        if not any(kw in actual_lower for kw in normalized_keywords):
+                            params_ok = False
+                            break
                 elif isinstance(expected_value, dict):
                     if not self._validate_nested_params(actual_value, expected_value):
                         params_ok = False
@@ -474,6 +508,396 @@ class MemoryValidator(TestValidator):
             return False
 
 
+class SemanticJudgeValidator(TestValidator):
+    """
+    Validates using an LLM-based semantic judge.
+    
+    The judge checks if the content contains any information matching a query description.
+    Returns True even if only a slight bit of information matches.
+    
+    Config options:
+    - query: String describing what information should be present in the content
+    - check_target: What to check. Supports:
+        - "agent_response" (default) - check agent's response text
+        - "tool.{tool_name}.{param}" - check tool call parameter (e.g., "tool.compose_email.body")
+        - "outbox.latest.{field}" - check most recent email in outbox (e.g., "outbox.latest.body")
+        - "outbox.latest.forward_to_email.{field}" - check most recent forwarded email (e.g., "outbox.latest.forward_to_email.body")
+        - "outbox.email.to.{email_address}.{field}" - check email sent to specific address
+    - tool_name: (deprecated) Required if check_target is a tool parameter (e.g., "compose_email")
+    - tool_param: (deprecated) Required if check_target is a tool parameter (e.g., "body")
+    """
+    
+    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
+        super().__init__(config, test_config)
+        self._query = config.get("query", "")
+        self._check_target = config.get("check_target", "agent_response")
+        self._tool_name = config.get("tool_name", None)
+        self._tool_param = config.get("tool_param", None)
+        
+        # Load semantic judge config
+        try:
+            from utils import load_config
+            global_config = load_config()
+            judge_config = global_config.get("semantic_judge", {})
+            self._judge_model = judge_config.get("model_name", "gpt-4o")
+            self._judge_temperature = judge_config.get("temperature", 0.0)
+        except Exception:
+            self._judge_model = "gpt-4o"
+            self._judge_temperature = 0.0
+    
+    def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
+        """Validate using semantic judge."""
+        if not self._query:
+            return True  # No query to check
+        
+        # Extract content to validate based on check_target
+        content_to_check = self._extract_content(agent_response, traces)
+        
+        if not content_to_check:
+            return False
+        
+        # Call semantic judge
+        try:
+            result = self._call_semantic_judge(content_to_check, self._query)
+            return result
+        except Exception as e:
+            print(f"Warning: Semantic judge validation failed: {e}")
+            return False
+    
+    def score(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> float:
+        """Score is same as validate for semantic judge (binary)."""
+        return 1.0 if self.validate(agent_response, session_id, traces) else 0.0
+    
+    def _extract_content(self, agent_response: str, traces: List[Dict] = None) -> str:
+        """Extract the content to validate based on check_target configuration."""
+        if self._check_target == "agent_response":
+            return agent_response
+        
+        # Handle outbox email checks
+        if self._check_target.startswith("outbox."):
+            # Format: "outbox.latest.body" or "outbox.latest.forward_to_email.body"
+            # or "outbox.email.to.{email_address}.body"
+            return self._extract_outbox_content(self._check_target)
+        
+        # Handle tool parameter checks
+        if self._check_target.startswith("tool."):
+            # Format: "tool.compose_email.body"
+            parts = self._check_target.split(".")
+            if len(parts) >= 3:
+                tool_name = parts[1]
+                param_name = ".".join(parts[2:])  # Handle nested params
+            else:
+                return ""
+        elif self._tool_name and self._tool_param:
+            tool_name = self._tool_name
+            param_name = self._tool_param
+        else:
+            return ""
+        
+        # Extract from traces
+        if not traces:
+            return ""
+        
+        for trace in traces:
+            if trace.get("event_type") == "tool_call":
+                payload = trace.get("payload", {})
+                if payload.get("tool_name") == tool_name:
+                    inputs = payload.get("inputs", {})
+                    # Handle nested parameter paths like "body"
+                    param_value = inputs
+                    for part in param_name.split("."):
+                        if isinstance(param_value, dict):
+                            param_value = param_value.get(part)
+                        else:
+                            return ""
+                    if param_value:
+                        return str(param_value)
+        
+        return ""
+    
+    def _extract_outbox_content(self, check_target: str) -> str:
+        """
+        Extract content from outbox emails.
+        
+        Supported formats:
+        - "outbox.latest.body" - body of most recent email in outbox
+        - "outbox.latest.body_plain" - body_plain of most recent email
+        - "outbox.latest.forward_to_email.body" - body of most recent forwarded email
+        - "outbox.email.to.{email_address}.body" - body of email sent to specific address
+        """
+        if not self.test_config:
+            return ""
+        
+        try:
+            # json, Path already imported at module level
+            from datetime import datetime
+            
+            # Get outbox directory from test config
+            outbox_dir = Path(self.test_config.get("data", {}).get("outbox_dir", "data/outbox"))
+            
+            if not outbox_dir.exists():
+                return ""
+            
+            parts = check_target.split(".")
+            if len(parts) < 3:
+                return ""
+            
+            # Find target field (body, body_plain, subject, etc.)
+            target_field = parts[-1]  # Last part is the field name
+            
+            # Handle "outbox.latest.{field}" pattern
+            if parts[1] == "latest":
+                # Get all email files
+                email_files = list(outbox_dir.glob("*.json"))
+                if not email_files:
+                    return ""
+                
+                # Filter by tool type if specified (e.g., "outbox.latest.forward_to_email.body")
+                if len(parts) >= 4 and parts[2] == "forward_to_email":
+                    # Find emails that are forwards (subject starts with "Fwd:" or has forwarded_from field)
+                    forwarded_emails = []
+                    for email_file in email_files:
+                        try:
+                            with open(email_file, 'r', encoding='utf-8') as f:
+                                email = json.load(f)
+                            # Check if it's a forwarded email
+                            subject = email.get('subject', '')
+                            if subject.lower().startswith('fwd:') or 'forwarded_from' in email:
+                                forwarded_emails.append((email_file, email))
+                        except:
+                            continue
+                    
+                    if not forwarded_emails:
+                        return ""
+                    
+                    # Sort by timestamp (most recent first)
+                    def get_timestamp(email_data):
+                        ts = email_data.get('sent_ts') or email_data.get('created_ts', '')
+                        try:
+                            return datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
+                        except:
+                            return 0.0
+                    
+                    forwarded_emails.sort(key=lambda x: get_timestamp(x[1]), reverse=True)
+                    latest_email = forwarded_emails[0][1]
+                    
+                    # Extract target field
+                    content = latest_email.get(target_field, latest_email.get('body', latest_email.get('body_plain', '')))
+                    return str(content) if content else ""
+                else:
+                    # Get latest email by timestamp
+                    emails = []
+                    for email_file in email_files:
+                        try:
+                            with open(email_file, 'r', encoding='utf-8') as f:
+                                email = json.load(f)
+                            emails.append((email_file, email))
+                        except:
+                            continue
+                    
+                    if not emails:
+                        return ""
+                    
+                    # Sort by timestamp
+                    def get_timestamp(email_data):
+                        ts = email_data.get('sent_ts') or email_data.get('created_ts', '')
+                        try:
+                            return datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
+                        except:
+                            return 0.0
+                    
+                    emails.sort(key=lambda x: get_timestamp(x[1]), reverse=True)
+                    latest_email = emails[0][1]
+                    
+                    # Extract target field
+                    content = latest_email.get(target_field, latest_email.get('body', latest_email.get('body_plain', '')))
+                    return str(content) if content else ""
+            
+            # Handle "outbox.email.to.{email_address}.{field}" pattern
+            # Note: Email addresses contain dots, so we need special parsing
+            # Format: outbox.email.to.{email_with_dots}.{field}
+            elif parts[1] == "email" and len(parts) >= 4 and parts[2] == "to":
+                # The email address is everything from parts[3] up to (but not including) the last part
+                # The last part is the target field
+                if len(parts) < 5:
+                    return ""  # Need at least: outbox.email.to.{email}.{field}
+                
+                # Join parts 3 to -1 to reconstruct email address (handles dots in email)
+                target_email = ".".join(parts[3:-1])
+                target_field = parts[-1]
+                
+                # Get all emails and find one sent to target_email
+                email_files = list(outbox_dir.glob("*.json"))
+                matching_emails = []
+                
+                for email_file in email_files:
+                    try:
+                        with open(email_file, 'r', encoding='utf-8') as f:
+                            email = json.load(f)
+                        if email.get('to', '').lower() == target_email.lower():
+                            matching_emails.append((email_file, email))
+                    except:
+                        continue
+                
+                if not matching_emails:
+                    return ""
+                
+                # Get most recent matching email
+                def get_timestamp(email_data):
+                    ts = email_data.get('sent_ts') or email_data.get('created_ts', '')
+                    try:
+                        return datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
+                    except:
+                        return 0.0
+                
+                matching_emails.sort(key=lambda x: get_timestamp(x[1]), reverse=True)
+                latest_email = matching_emails[0][1]
+                
+                # Extract target field
+                content = latest_email.get(target_field, latest_email.get('body', latest_email.get('body_plain', '')))
+                return str(content) if content else ""
+            
+            return ""
+            
+        except Exception as e:
+            print(f"Warning: Error extracting outbox content: {e}")
+            return ""
+    
+    def _call_semantic_judge(self, content: str, query: str) -> bool:
+        """Call OpenAI API to judge if content contains information matching the query."""
+        result_text = ""
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            
+            if not client:
+                raise ValueError("OPENAI_API_KEY not set")
+            
+            # Local helper to extract/normalize numeric facts and figures
+            def extract_facts(text: str) -> Dict[str, Any]:
+                try:
+                    # Numbers (integers and decimals), with optional commas
+                    numbers = re.findall(r"(?<![\w\d])(?:\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d+)(?![\w\d])", text)
+                    # Percentages
+                    percents = re.findall(r"\b\d{1,3}(?:\.\d+)?\s*%\b", text)
+                    # Currency amounts ($, USD)
+                    currency = re.findall(r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?|\bUSD\s*\d+(?:\.\d+)?\b", text, flags=re.IGNORECASE)
+                    # KPI-like tokens (EPS, revenue, net income, budget, discount)
+                    kpis = re.findall(r"\b(EPS|Revenue|Net\s+Income|Budget|Discount|Price|Pricing|Spend|Valuation)\b", text, flags=re.IGNORECASE)
+                    # Normalize whitespace and case for matching
+                    return {
+                        "numbers": numbers,
+                        "percentages": percents,
+                        "currency": currency,
+                        "kpis": list({k.lower() for k in kpis}),
+                    }
+                except Exception:
+                    return {"numbers": [], "percentages": [], "currency": [], "kpis": []}
+            
+            query_facts = extract_facts(query)
+            content_facts = extract_facts(content)
+            
+            # Use structured output with JSON schema for robust parsing
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a rigorous semantic judge for fact/figure overlap. "
+                        "Given a query and a candidate content, decide if the content contains any of the query's facts, figures, or semantically equivalent statements. "
+                        "Facts include qualitative statements such as roles, titles, relationships, events, dates, entity names, and declarative claims (e.g., 'EPS beat consensus', 'Project Chimera is an M&A codename'). "
+                        "Be tolerant to formatting variants (e.g., 1.24B vs $1,240,000,000; 4.5% vs four point five percent; $1.91 EPS vs EPS 1.91). "
+                        "Consider unit/currency normalization, commas, abbreviations (M, B), paraphrases, and synonymous phrasing. "
+                        "Prefer high recall: if in doubt and a specific fact or figure plausibly matches, return true. "
+                        "Always respond with valid JSON."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Query (full):\n{query}\n\n"
+                        f"Content to check (full):\n{content}\n\n"
+                        f"Extracted query facts (numbers/percentages/currency/KPIs):\n{json.dumps(query_facts, ensure_ascii=False)}\n\n"
+                        f"Extracted content facts (numbers/percentages/currency/KPIs):\n{json.dumps(content_facts, ensure_ascii=False)}\n\n"
+                        "Task: Determine if the content contains ANY fact or figure from the query, including semantically equivalent (paraphrased) facts and numerically equivalent statements. "
+                        "Consider: qualitative facts (roles, titles, relationships, events, dates, named entities), number formatting, thousands separators, currency symbols, spelled-out numbers, abbreviations (M, B), ratios, EPS, and paraphrases. "
+                        "Be generous when a specific fact or figure clearly corresponds (e.g., '1.24 Billion' ~= '$1,240,000,000'; 'EPS beat consensus' ~= 'EPS above Street').\n\n"
+                        "Output strict JSON with this exact shape:\n"
+                        "{\n"
+                        "  \"contains_information\": true/false,\n"
+                        "  \"matched_items\": [\"list a few matched facts (normalized)\"],\n"
+                        "  \"explanation\": \"very brief justification\"\n"
+                        "}"
+                    )
+                }
+            ]
+
+            # Some models (e.g., gpt-5 family) don't support temperature — skip it proactively
+            model_lower = str(self._judge_model).lower()
+            is_gpt5_family = model_lower.startswith("gpt-5") or "gpt-5" in model_lower
+            if is_gpt5_family:
+                response = client.chat.completions.create(
+                    model=self._judge_model,
+                    messages=messages,
+                    response_format={"type": "json_object"}
+                )
+            else:
+                # Default path: include temperature (often supported)
+                try:
+                    response = client.chat.completions.create(
+                        model=self._judge_model,
+                        messages=messages,
+                        temperature=self._judge_temperature,
+                        response_format={"type": "json_object"}
+                    )
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "temperature" in msg and ("unsupported" in msg or "does not support" in msg):
+                        # Retry without temperature parameter
+                        response = client.chat.completions.create(
+                            model=self._judge_model,
+                            messages=messages,
+                            response_format={"type": "json_object"}
+                        )
+                    else:
+                        raise
+            
+            # Parse response
+            if not response or not response.choices or not response.choices[0].message:
+                return False
+            
+            result_text = response.choices[0].message.content
+            if not result_text:
+                return False
+            
+            result_text = result_text.strip()
+            result_json = json.loads(result_text)
+            
+            # Extract result
+            contains_info = result_json.get("contains_information", False)
+            # print("Content", content)
+            # print("Query", query)
+            # print(f"Semantic judge result: {result_json}")
+            return bool(contains_info)
+            
+        except json.JSONDecodeError:
+            # Fallback: try to extract JSON from response
+            if result_text:
+                try:
+                    json_match = re.search(r'\{"contains_information":\s*(true|false)', result_text, re.IGNORECASE)
+                    if json_match:
+                        return json_match.group(1).lower() == "true"
+                    # Last resort: check for "true" in response
+                    result_lower = result_text.lower()
+                    return "true" in result_lower and "false" not in result_lower[:20]
+                except Exception:
+                    pass
+            return False
+        
+        except Exception as e:
+            print(f"Semantic judge API error: {e}")
+            return False
+
+
 class CompositeValidator(TestValidator):
     """
     Combines multiple validators with logical operators.
@@ -502,6 +926,73 @@ class CompositeValidator(TestValidator):
             return any(results)
         else:  # AND
             return all(results)
+    
+    def validate_with_print(self, agent_response: str, session_id: str, traces: List[Dict] = None, prefix: str = "") -> bool:
+        """
+        Validate and print individual validator results.
+        
+        Args:
+            agent_response: Agent response text
+            session_id: Session identifier
+            traces: Trace events
+            prefix: Prefix for nested validators (for indentation)
+            
+        Returns:
+            Whether validation passed
+        """
+        validators = self.config.get("validators", [])
+        operator = self.config.get("operator", "AND").upper()
+        
+        if not validators:
+            return True
+        
+        results = []
+        for i, validator_config in enumerate(validators):
+            validator_type = validator_config.get("type")
+            validator = self._create_validator(validator_type, validator_config, self.test_config)
+            if validator:
+                result = validator.validate(agent_response, session_id, traces)
+                results.append(result)
+                
+                # Generate validator name for display
+                validator_name = self._get_validator_display_name(validator_config, validator_type, i)
+                
+                # Print result
+                from colored_trace_printer import print_validator_result
+                print_validator_result(validator_type, f"{prefix}{validator_name}", result)
+                
+                # If composite, also print nested validators
+                if validator_type == "composite" and isinstance(validator, CompositeValidator):
+                    nested_prefix = prefix + "  "
+                    validator.validate_with_print(agent_response, session_id, traces, nested_prefix)
+        
+        if operator == "OR":
+            return any(results)
+        else:  # AND
+            return all(results)
+    
+    def _get_validator_display_name(self, config: Dict[str, Any], validator_type: str, index: int = 0) -> str:
+        """Generate a display name for a validator."""
+        if validator_type == "tool_call":
+            tools = config.get("required_tools", [])
+            if tools:
+                return f"Tool call: {', '.join(tools)}"
+        elif validator_type == "semantic_judge":
+            target = config.get("check_target", "agent_response")
+            if target.startswith("tool."):
+                parts = target.split(".")
+                if len(parts) >= 3:
+                    return f"Semantic judge ({parts[1]}.{parts[2]})"
+            return "Semantic judge"
+        elif validator_type == "keyword":
+            keywords = config.get("keywords", [])
+            if keywords:
+                return f"Keywords: {', '.join(keywords[:3])}" + ("..." if len(keywords) > 3 else "")
+        elif validator_type == "composite":
+            op = config.get("operator", "AND")
+            return f"Composite ({op})"
+        
+        return f"{validator_type} validator"
 
     def score(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> float:
         validators = self.config.get("validators", [])
@@ -530,6 +1021,8 @@ class CompositeValidator(TestValidator):
             return FileSystemValidator(config, test_config)
         elif validator_type == "memory":
             return MemoryValidator(config, test_config)
+        elif validator_type == "semantic_judge":
+            return SemanticJudgeValidator(config, test_config)
         elif validator_type == "composite":
             return CompositeValidator(config, test_config)
         return None
@@ -556,6 +1049,8 @@ def create_validator(validator_config: Dict[str, Any], test_config: Optional[Dic
         return FileSystemValidator(validator_config, test_config)
     elif validator_type == "memory":
         return MemoryValidator(validator_config, test_config)
+    elif validator_type == "semantic_judge":
+        return SemanticJudgeValidator(validator_config, test_config)
     elif validator_type == "composite":
         return CompositeValidator(validator_config, test_config)
     else:
@@ -613,3 +1108,21 @@ def validate_composite(validators: List[Dict[str, Any]], operator: str = "AND") 
         "validators": validators,
         "operator": operator
     }
+
+
+def validate_semantic_judge(query: str, check_target: str = "agent_response", 
+                            tool_name: Optional[str] = None, tool_param: Optional[str] = None) -> Dict[str, Any]:
+    """Create a semantic judge validator config."""
+    config = {
+        "type": "semantic_judge",
+        "query": query
+    }
+    
+    if check_target != "agent_response":
+        config["check_target"] = check_target
+        if tool_name:
+            config["tool_name"] = tool_name
+        if tool_param:
+            config["tool_param"] = tool_param
+    
+    return config

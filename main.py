@@ -172,18 +172,37 @@ def create_agent_executor():
             # Use a mock response if no API key
             print("Warning: OPENAI_API_KEY not set. Agent will have limited functionality.")
         
-        llm = ChatOpenAI(
-            model=model_config.get("model_name", "gpt-4o"),
-            temperature=model_config.get("temperature", 0.7),
-            api_key=api_key if api_key else "dummy-key"
-        )
+        # Build LLM with error handling for unsupported parameters
+        model_name = model_config.get("model_name", "gpt-4o")
+        temperature = model_config.get("temperature", 0.7)
+        
+        try:
+            # Try with temperature parameter
+            llm = ChatOpenAI(
+                model=model_name,
+                temperature=temperature,
+                api_key=api_key if api_key else "dummy-key"
+            )
+        except (TypeError, ValueError) as e:
+            # If model doesn't support temperature, use minimal config
+            print(f"Warning: Model {model_name} may not support temperature parameter. Using minimal configuration. Error: {e}")
+            llm = ChatOpenAI(
+                model=model_name,
+                api_key=api_key if api_key else "dummy-key"
+            )
     else:
         # Mock LLM for testing
-        llm = ChatOpenAI(
-            model="gpt-4o",
-            temperature=0.7,
-            api_key="dummy-key"
-        )
+        try:
+            llm = ChatOpenAI(
+                model="gpt-4o",
+                temperature=0.7,
+                api_key="dummy-key"
+            )
+        except (TypeError, ValueError):
+            llm = ChatOpenAI(
+                model="gpt-4o",
+                api_key="dummy-key"
+            )
     
     # Load memory prompt
     memory_prompt_file = Path("system_prompts/memory_prompt.txt")
@@ -251,11 +270,12 @@ GUIDELINES:
     )
     
     # Create agent using new API
+    # Note: debug mode can be enabled for development, but verbose output is noisy
     agent = create_agent(
         model=llm,
         tools=all_tools,
         system_prompt=system_message,
-        debug=config.get("agent", {}).get("verbose", True)
+        debug=config.get("agent", {}).get("verbose", True)  # Keep verbose for main.py (web interface)
     )
     
     return agent
