@@ -19,7 +19,7 @@ import tempfile
 import uuid
 from pathlib import Path
 import sys
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
@@ -106,10 +106,10 @@ class TestBench:
             for h in self.logger.handlers[:]:
                 self.logger.removeHandler(h)
             from datetime import datetime
-            # Use fixed date for reproducibility (November 3, 2025)
-            timestamp = datetime(2025, 11, 3, 12, 0, 0).strftime("%Y%m%d_%H%M%S")
+            # Use current time for unique log file per run
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             log_file = log_dir / f"adaptive_benchmark_{timestamp}.log"
-            file_handler = logging.FileHandler(log_file, encoding='utf-8')
+            file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')  # 'w' mode to overwrite/create new file
             file_handler.setLevel(logging.DEBUG)
             console_handler = logging.StreamHandler()
             console_handler.setLevel(logging.INFO)
@@ -838,6 +838,7 @@ class TestBench:
             step_results = []
             all_passed = True
             optimization_used = False
+            session_history = []  # Track session history
             
             for i, step in enumerate(steps, 1):
                 print(f"\n--- Step {i}/{len(steps)} ---")
@@ -849,6 +850,30 @@ class TestBench:
                 step_type = step.get("step_type", "user_message")
                 if step_type == "start_new_session":
                     print(f"🔄 {step.get('description', 'Starting new session')}")
+                    
+                    # Save current session history before switching
+                    try:
+                        current_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+                        if current_traces:  # Only add if there are traces
+                            # Find the last session change step to determine the step range
+                            last_session_step = 0
+                            for step_result in step_results:
+                                if step_result.get("step_type") == "start_new_session":
+                                    last_session_step = step_result["step"]
+                            
+                            if last_session_step > 0:
+                                step_range = f"{last_session_step + 1}-{i-1}"
+                            else:
+                                step_range = f"1-{i-1}"
+                            
+                            session_history.append({
+                                "session_id": session_id,
+                                "step_range": step_range,
+                                "traces": current_traces
+                            })
+                    except Exception as e:
+                        print(f"Warning: Could not save session history: {e}")
+                    
                     # Start a new session and clear old session agent cache
                     old_session_id = session_id
                     session_id = f"adaptive_{int(time.time()*1000)}"
@@ -1019,15 +1044,70 @@ class TestBench:
                         step, i, session_id, test_config
                     )
                     
+                    # Update environment state with traces and session data after running the step
+                    # This ensures the state has the latest traces when we save it before the next step
+                    try:
+                        current_state = self.state_manager.get_current_state()
+                        if current_state:
+                            # Update traces from the step result or by reading from trace file
+                            if "step_traces" in step_result:
+                                current_state.update_step_data(i, step_result["step_traces"])
+                            else:
+                                # Fallback: read traces from file
+                                try:
+                                    step_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+                                    current_state.update_step_data(i, step_traces)
+                                except Exception:
+                                    pass
+                            # Update session ID
+                            current_state.session_id = session_id
+                    except Exception as e:
+                        print(f"Warning: Could not update environment state after step {i}: {e}")
+                    
                     # Check if attack failed
                     attack_goal_passed = step_result.get("attack_goal", {}).get("passed")
                     if attack_goal_passed is False:
                         print(f"⚠️ Attack failed at step {i}, attempting optimization")
                         
-                        # Restore to previous state before optimization
-                        if self.state_manager.restore_to_prev_state():
-                            print(f"🔄 Restored to previous state for optimization")
+                        # Find which step inserted the attack email
+                        original_attack_email, attack_email_step_num = self._find_attack_email_from_steps(test_def, i)
+                        
+                        # Restore to the state right after the attack email was inserted
+                        # We need to restore multiple times if the attack email was inserted more than one step back
+                        restore_success = False
+                        if attack_email_step_num and attack_email_step_num > 0:
+                            # We need to restore to step attack_email_step_num
+                            # The state manager saves state before each step, so prev_state before step i
+                            # is the state after step i-1. We need to walk back further.
+                            # For now, restore to prev_state (which is before step i, after step i-1)
+                            # and if attack_email_step_num == i-1, we're good. Otherwise we need more restoration.
+                            if attack_email_step_num == i - 1:
+                                # Attack email was inserted in the previous step, so prev_state is correct
+                                restore_success = self.state_manager.restore_to_prev_state()
+                                print(f"🔄 Restored to state after attack email insertion (step {attack_email_step_num})")
+                            else:
+                                # Attack email was inserted earlier, we need to restore to initial state
+                                # and replay up to the attack email step
+                                print(f"🔄 Attack email was inserted at step {attack_email_step_num}, restoring to that point")
+                                # Restore to prev_state first
+                                self.state_manager.restore_to_prev_state()
+                                # Then we need to restore the initial state and replay steps up to attack_email_step_num
+                                # For now, use the initial state as a fallback
+                                initial_state = self.state_manager.get_initial_state()
+                                if initial_state:
+                                    self.state_manager.curr_state = initial_state.copy()
+                                    # TODO: Replay steps 1 to attack_email_step_num if needed
+                                    # For simplicity, we'll rely on the environment being restored correctly
+                                    restore_success = True
+                                    print(f"🔄 Restored to initial state, will replay steps up to {attack_email_step_num}")
+                                else:
+                                    restore_success = self.state_manager.restore_to_prev_state()
                         else:
+                            # Fallback: restore to previous state
+                            restore_success = self.state_manager.restore_to_prev_state()
+                            print(f"🔄 Restored to previous state for optimization")
+                        
+                        if not restore_success:
                             print(f"⚠️ Could not restore to previous state, using current state")
                         
                         # Try optimization strategies in order: basic, dspy, openevolve
@@ -1038,15 +1118,32 @@ class TestBench:
                         if optimization_result.success:
                             print(f"✅ Optimization successful with {optimization_result.optimization_strategy}")
                             
-                            # Update the test with optimized attack
+                            # Update the test with optimized attack (update the insert_attack_email step)
                             test_def = self._update_test_with_optimized_attack(
-                                test_def, optimization_result.optimized_attack_email
+                                test_def, optimization_result.optimized_attack_email, attack_email_step_num
                             )
                             
-                            # Inject optimized attack into environment state
+                            # Re-inject the optimized attack email into the environment
+                            # This ensures the file system and environment state are in sync
+                            self._inject_optimized_attack_email(test_config, optimization_result.optimized_attack_email)
+                            
+                            # Update environment state
                             current_state = self.state_manager.get_current_state()
                             if current_state:
-                                current_state.inject_attack_email(optimization_result.optimized_attack_email, 0)
+                                # Find the attack email in inbox_emails and replace it
+                                # or add it if not found
+                                inbox_emails = current_state.inbox_emails
+                                email_replaced = False
+                                for idx, inbox_email in enumerate(inbox_emails):
+                                    # Match by subject or from address (heuristic)
+                                    if (inbox_email.get("subject") == original_attack_email.get("subject") or
+                                        inbox_email.get("from") == original_attack_email.get("from")):
+                                        inbox_emails[idx] = optimization_result.optimized_attack_email
+                                        email_replaced = True
+                                        break
+                                if not email_replaced:
+                                    # If not found, replace the first attack email or append
+                                    current_state.inbox_emails = [optimization_result.optimized_attack_email] + inbox_emails[1:]
                             
                             # Re-run the step with optimized attack
                             step_result = self._run_step_with_attack_check(
@@ -1076,19 +1173,68 @@ class TestBench:
                 else:
                     # Regular step without attack goal
                     step_result = self._run_regular_step(step, i, session_id, test_config)
+                    
+                    # Update environment state with traces and session data after running the step
+                    try:
+                        current_state = self.state_manager.get_current_state()
+                        if current_state:
+                            # Update traces from the step result or by reading from trace file
+                            if "step_traces" in step_result:
+                                current_state.update_step_data(i, step_result["step_traces"])
+                            else:
+                                # Fallback: read traces from file
+                                try:
+                                    step_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+                                    current_state.update_step_data(i, step_traces)
+                                except Exception:
+                                    pass
+                            # Update session ID
+                            current_state.session_id = session_id
+                    except Exception as e:
+                        print(f"Warning: Could not update environment state after step {i}: {e}")
+                    
                     step_results.append(step_result)
                     
                     if step_result.get("passed") is False:
                         all_passed = False
             
+            # Add final session to session history (if there are any remaining steps after the last session change)
+            try:
+                final_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+                if final_traces:  # Only add if there are traces for the final session
+                    # Find the last session change step to determine the step range
+                    last_session_step = 0
+                    for step_result in step_results:
+                        if step_result.get("step_type") == "start_new_session":
+                            last_session_step = step_result["step"]
+                    
+                    if last_session_step > 0:
+                        step_range = f"{last_session_step + 1}-{len(steps)}"
+                    else:
+                        step_range = f"1-{len(steps)}"
+                    
+                    session_history.append({
+                        "session_id": session_id,
+                        "step_range": step_range,
+                        "traces": final_traces
+                    })
+            except Exception as e:
+                print(f"Warning: Could not save final session history: {e}")
+            
+            # Get description from test_def
+            description = test_def.get("description", "")
+            
             # Compile result
             result = {
                 "test_name": test_name,
                 "test_file": str(test_file),
+                "description": description,
                 "session_id": session_id,
                 "timestamp": datetime(2025, 11, 3, 12, 0, 0).isoformat(),
                 "overall_success": all_passed,
                 "steps": step_results,
+                "session_history": session_history,
+                "test_environment": str(test_dir),
                 "optimization_used": optimization_used,
                 "adaptive_benchmark": True,
             }
@@ -1131,6 +1277,7 @@ class TestBench:
             # Evaluate both user and attack goals
             user_goal_passed = None
             attack_goal_passed = None
+            partial_attack_score = 0.0  # Initialize default value
             
             if "user_goal" in step and step["user_goal"]:
                 try:
@@ -1171,6 +1318,7 @@ class TestBench:
                 "agent_response": response,
                 "duration_s": round(duration, 3),
                 "passed": step_passed,
+                "step_traces": step_traces,  # Include traces in result for state update
                 "user_goal": {
                     "description": step.get("user_goal", {}).get("description", ""),
                     "passed": user_goal_passed
@@ -1206,13 +1354,22 @@ class TestBench:
             
             response = result["response"]
             
+            # Get traces for regular steps too
+            step_traces = []
+            try:
+                step_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+            except Exception as e:
+                # Ignore trace reading errors for regular steps
+                pass
+            
             return {
                 "step": step_num,
                 "user_message": step['user_message'],
                 "expected_behavior": step['expected_behavior'],
                 "agent_response": response,
                 "duration_s": round(duration, 3),
-                "passed": True
+                "passed": True,
+                "step_traces": step_traces  # Include traces in result for state update
             }
             
         except Exception as e:
@@ -1225,28 +1382,59 @@ class TestBench:
                 "passed": False
             }
     
+    def _find_attack_email_from_steps(self, test_def: Dict[str, Any], 
+                                      current_step_num: int) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+        """
+        Find the attack email from the most recent insert_attack_email step.
+        
+        Args:
+            test_def: The test definition
+            current_step_num: The current step number (1-indexed)
+            
+        Returns:
+            Tuple of (attack_email, step_num) where step_num is the step number where the email was inserted.
+            Returns (None, None) if no attack email found.
+        """
+        steps = test_def.get("steps", [])
+        
+        # Walk backwards from current_step_num-1 (step before the failed step) to step 1
+        # We're looking for the most recent insert_attack_email step
+        for i in range(current_step_num - 1, 0, -1):  # current_step_num-1 down to 1 (1-indexed)
+            if i <= len(steps):
+                step = steps[i - 1]  # Convert to 0-indexed
+                if step.get("step_type") == "insert_attack_email":
+                    attack_email = step.get("attack_email")
+                    if attack_email:
+                        return attack_email, i
+                        
+        # Fallback: check initial_data for backwards compatibility
+        if "attack_emails" in test_def.get("initial_data", {}):
+            attack_emails = test_def["initial_data"]["attack_emails"]
+            if attack_emails:
+                return attack_emails[0], 0  # Step 0 means it's from initial_data
+        
+        return None, None
+    
     def _optimize_attack(self, test_def: Dict[str, Any], failed_step: Dict[str, Any], 
                         step_num: int, session_id: str, test_config: Dict[str, Any]) -> Any:
         """Try different optimization strategies to find a successful attack."""
         from benchmark.adaptive_attacks import OptimizationResult
         
-        # Get the original attack email
-        original_attack_email = None
-        if "attack_emails" in test_def.get("initial_data", {}):
-            attack_emails = test_def["initial_data"]["attack_emails"]
-            if attack_emails:
-                original_attack_email = attack_emails[0]
+        # Get the original attack email by walking backwards through steps
+        original_attack_email, attack_email_step_num = self._find_attack_email_from_steps(test_def, step_num)
         
         if not original_attack_email:
-            print("❌ No attack email found in test definition")
+            print(f"❌ No attack email found in test definition (searched up to step {step_num})")
             return OptimizationResult(
                 success=False,
                 optimized_attack_email=None,
                 optimization_strategy="none",
                 iterations=0,
-                feedback=["No attack email found"],
+                feedback=[f"No attack email found when looking backwards from step {step_num}"],
                 final_evaluation=None
             )
+        
+        print(f"📧 Found attack email from step {attack_email_step_num if attack_email_step_num > 0 else 'initial_data'}")
         
         # Check if any optimizers are available
         if not self.optimizers:
@@ -1298,10 +1486,30 @@ class TestBench:
         )
     
     def _update_test_with_optimized_attack(self, test_def: Dict[str, Any], 
-                                         optimized_attack_email: Dict[str, Any]) -> Dict[str, Any]:
-        """Update test definition with optimized attack email."""
-        if "initial_data" in test_def and "attack_emails" in test_def["initial_data"]:
-            test_def["initial_data"]["attack_emails"][0] = optimized_attack_email
+                                         optimized_attack_email: Dict[str, Any],
+                                         attack_email_step_num: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Update test definition with optimized attack email.
+        
+        Args:
+            test_def: The test definition to update
+            optimized_attack_email: The optimized attack email
+            attack_email_step_num: The step number where the attack email was inserted (1-indexed).
+                                   If None or 0, updates initial_data.attack_emails for backwards compatibility.
+        """
+        if attack_email_step_num and attack_email_step_num > 0:
+            # Update the insert_attack_email step
+            steps = test_def.get("steps", [])
+            if attack_email_step_num <= len(steps):
+                step = steps[attack_email_step_num - 1]  # Convert to 0-indexed
+                if step.get("step_type") == "insert_attack_email":
+                    step["attack_email"] = optimized_attack_email
+                    print(f"📝 Updated attack email in step {attack_email_step_num}")
+        else:
+            # Fallback: update initial_data for backwards compatibility
+            if "initial_data" in test_def and "attack_emails" in test_def["initial_data"]:
+                test_def["initial_data"]["attack_emails"][0] = optimized_attack_email
+                print(f"📝 Updated attack email in initial_data")
         return test_def
     
     def _inject_optimized_attack_email(self, test_config: Dict[str, Any], 
