@@ -1,14 +1,19 @@
 """
 Utility functions for the email agent MVP.
-Provides helpers for ID generation, timestamps, trace logging, and config loading.
+Provides helpers for ID generation, timestamps, trace logging, config loading, and LLM initialization.
 """
 
 import json
 import uuid
 import yaml
+import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, Literal
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Global constants
 USER_EMAIL = "vince.j.kaminski@enron.com"  # User's email address - change this to update user email globally
@@ -376,4 +381,478 @@ def print_cache_validation_report(validation_result: Dict[str, Any]) -> None:
             else:
                 print("   (completely identical)")
     print("=" * 80)
+
+
+# ============================================================================
+# LLM Utility Functions
+# ============================================================================
+# Functions for LLM initialization supporting multiple providers (OpenAI, Gemini).
+
+
+def detect_provider(model_name: str) -> Literal["openai", "gemini"]:
+    """
+    Detect the provider based on model name.
+    
+    Args:
+        model_name: Name of the model (e.g., "gpt-4o", "gemini-2.5-pro")
+    
+    Returns:
+        Provider name: "openai" or "gemini"
+    """
+    model_lower = model_name.lower()
+    
+    # Gemini models start with "gemini"
+    if model_lower.startswith("gemini"):
+        return "gemini"
+    
+    # Default to OpenAI for all other models
+    return "openai"
+
+
+def get_openai_client(api_key: Optional[str] = None):
+    """
+    Get an OpenAI client instance.
+    
+    Args:
+        api_key: Optional API key (defaults to OPENAI_API_KEY env var)
+    
+    Returns:
+        OpenAI client instance
+    """
+    from openai import OpenAI
+    
+    if api_key is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+    
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not set")
+    
+    return OpenAI(api_key=api_key)
+
+
+def get_gemini_client(api_key: Optional[str] = None):
+    """
+    Get a Google Generative AI client instance.
+    
+    Args:
+        api_key: Optional API key (defaults to GEMINI_API_KEY env var)
+    
+    Returns:
+        Google Generative AI client instance
+    """
+    try:
+        import google.generativeai as genai
+    except ImportError:
+        raise ImportError(
+            "google-generativeai package is required for Gemini models. "
+            "Install it with: pip install google-generativeai"
+        )
+    
+    if api_key is None:
+        api_key = os.getenv("GEMINI_API_KEY")
+    
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is not set")
+    
+    genai.configure(api_key=api_key)
+    return genai
+
+
+def call_openai_chat_completion(
+    client,
+    model: str,
+    messages: list,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    max_completion_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+    presence_penalty: Optional[float] = None,
+    frequency_penalty: Optional[float] = None,
+    response_format: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """
+    Call OpenAI chat completion API.
+    
+    Args:
+        client: OpenAI client instance
+        model: Model name
+        messages: List of message dicts with "role" and "content"
+        temperature: Temperature parameter
+        max_tokens: Maximum tokens for response
+        max_completion_tokens: Maximum completion tokens (for reasoning models)
+        top_p: Top-p parameter
+        presence_penalty: Presence penalty
+        frequency_penalty: Frequency penalty
+        response_format: Response format (e.g., {"type": "json_object"})
+    
+    Returns:
+        Response object from OpenAI API
+    """
+    params = {
+        "model": model,
+        "messages": messages,
+    }
+    
+    # Add optional parameters
+    if temperature is not None:
+        params["temperature"] = temperature
+    if max_tokens is not None:
+        params["max_tokens"] = max_tokens
+    if max_completion_tokens is not None:
+        params["max_completion_tokens"] = max_completion_tokens
+    if top_p is not None:
+        params["top_p"] = top_p
+    if presence_penalty is not None:
+        params["presence_penalty"] = presence_penalty
+    if frequency_penalty is not None:
+        params["frequency_penalty"] = frequency_penalty
+    if response_format is not None:
+        params["response_format"] = response_format
+    
+    return client.chat.completions.create(**params)
+
+
+def call_gemini_chat_completion(
+    _genai_module,
+    model: str,
+    messages: list,
+    temperature: Optional[float] = None,
+    max_output_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+) -> Any:
+    """
+    Call Gemini chat completion API.
+    
+    Args:
+        _genai_module: Google Generative AI module (from get_gemini_client) - unused, genai imported directly
+        model: Model name (e.g., "gemini-2.5-pro")
+        messages: List of message dicts with "role" and "content"
+        temperature: Temperature parameter
+        max_output_tokens: Maximum output tokens
+        top_p: Top-p parameter
+    
+    Returns:
+        Response object from Gemini API (wrapped to be OpenAI-compatible)
+    """
+    import google.generativeai as genai
+    
+    # Extract system instruction from messages
+    system_instruction = None
+    chat_messages = []
+    
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        
+        if role == "system":
+            # Collect system instructions
+            if system_instruction is None:
+                system_instruction = content
+            else:
+                system_instruction += "\n\n" + content
+        else:
+            # Add to chat history
+            chat_messages.append({
+                "role": "user" if role == "user" else "model",
+                "parts": [content]
+            })
+    
+    # Build generation config
+    generation_config = {}
+    if temperature is not None:
+        generation_config["temperature"] = temperature
+    if max_output_tokens is not None:
+        generation_config["max_output_tokens"] = max_output_tokens
+    if top_p is not None:
+        generation_config["top_p"] = top_p
+    
+    gen_config = genai.types.GenerationConfig(**generation_config) if generation_config else None
+    
+    # Get the model instance - system_instruction is passed during model creation
+    if system_instruction:
+        model_instance = genai.GenerativeModel(
+            model,
+            system_instruction=system_instruction
+        )
+    else:
+        model_instance = genai.GenerativeModel(model)
+    
+    # Build the prompt from messages
+    # For chat, we need to handle the conversation history
+    if len(chat_messages) == 0:
+        raise ValueError("No user messages found in messages list")
+    
+    # If we have multiple messages, use chat history
+    if len(chat_messages) > 1:
+        # Separate history from the last message
+        history = chat_messages[:-1]
+        last_message = chat_messages[-1]["parts"][0]
+        
+        # Start chat with history
+        chat = model_instance.start_chat(history=history)
+        
+        # Send the last message
+        response = chat.send_message(last_message, generation_config=gen_config if gen_config else None)
+    else:
+        # Single message - use generate_content
+        prompt = chat_messages[0]["parts"][0]
+        if gen_config:
+            response = model_instance.generate_content(
+                prompt,
+                generation_config=gen_config
+            )
+        else:
+            response = model_instance.generate_content(prompt)
+    
+    # Convert Gemini response to OpenAI-like format for compatibility
+    class GeminiResponse:
+        """Wrapper to make Gemini response compatible with OpenAI response format."""
+        def __init__(self, gemini_response):
+            self.choices = [GeminiChoice(gemini_response)]
+            self.usage = GeminiUsage(gemini_response)
+    
+    class GeminiChoice:
+        """Wrapper for Gemini choice."""
+        def __init__(self, gemini_response):
+            self.message = GeminiMessage(gemini_response)
+            # Check finish reason
+            if hasattr(gemini_response, "candidates") and gemini_response.candidates:
+                finish_reason = gemini_response.candidates[0].finish_reason if gemini_response.candidates else None
+                if finish_reason is not None:
+                    # Handle finish_reason - it might be an enum or string
+                    if hasattr(finish_reason, "name"):
+                        self.finish_reason = finish_reason.name.lower()
+                    elif isinstance(finish_reason, str):
+                        self.finish_reason = finish_reason.lower()
+                    else:
+                        self.finish_reason = str(finish_reason).lower()
+                else:
+                    self.finish_reason = "stop"
+            else:
+                self.finish_reason = "stop"
+    
+    class GeminiMessage:
+        """Wrapper for Gemini message."""
+        def __init__(self, gemini_response):
+            # Check for refusal/safety blocks FIRST before trying to get content
+            self.refusal = None
+            finish_reason_code = None
+            finish_reason_name = None
+            
+            if hasattr(gemini_response, "candidates") and gemini_response.candidates:
+                candidate = gemini_response.candidates[0]
+                if hasattr(candidate, "finish_reason"):
+                    finish_reason = candidate.finish_reason
+                    # finish_reason can be an enum or integer
+                    if hasattr(finish_reason, "name"):
+                        finish_reason_name = finish_reason.name
+                        finish_reason_code = finish_reason.value if hasattr(finish_reason, "value") else None
+                    elif isinstance(finish_reason, int):
+                        finish_reason_code = finish_reason
+                        # Map common codes: 1=STOP, 2=MAX_TOKENS, 3=SAFETY, 4=RECITATION
+                        finish_reason_map = {1: "STOP", 2: "MAX_TOKENS", 3: "SAFETY", 4: "RECITATION"}
+                        finish_reason_name = finish_reason_map.get(finish_reason, f"UNKNOWN_{finish_reason}")
+                    else:
+                        finish_reason_name = str(finish_reason)
+                    
+                    # Check if blocked by safety (code 3 or name contains SAFETY)
+                    if finish_reason_code == 3 or (finish_reason_name and "SAFETY" in finish_reason_name.upper()):
+                        self.refusal = f"Blocked by safety filter: {finish_reason_name} (code: {finish_reason_code})"
+                    elif finish_reason_code == 4 or (finish_reason_name and "RECITATION" in finish_reason_name.upper()):
+                        self.refusal = f"Blocked by recitation filter: {finish_reason_name} (code: {finish_reason_code})"
+                    elif finish_reason_code == 2:
+                        # MAX_TOKENS - not a block, but content might be truncated
+                        pass
+            
+            # Get text from response - handle cases where content might be blocked
+            # IMPORTANT: Check candidates/parts FIRST before trying response.text to avoid errors
+            try:
+                # First check candidates (safer - doesn't trigger the quick accessor error)
+                if hasattr(gemini_response, "candidates") and gemini_response.candidates:
+                    candidate = gemini_response.candidates[0]
+                    # Check if candidate has content with parts
+                    if hasattr(candidate, "content"):
+                        if hasattr(candidate.content, "parts") and candidate.content.parts:
+                            # Extract text from parts safely
+                            parts_text = []
+                            for part in candidate.content.parts:
+                                if hasattr(part, "text"):
+                                    parts_text.append(part.text)
+                            self.content = "".join(parts_text)
+                        else:
+                            # No parts in content - this usually means blocked/empty response
+                            self.content = ""
+                    else:
+                        # No content attribute - response was likely blocked
+                        self.content = ""
+                # Only try response.text if we didn't get content from candidates
+                elif hasattr(gemini_response, "text"):
+                    # This might throw an error if there are no parts, so wrap in try-except
+                    try:
+                        self.content = gemini_response.text
+                    except Exception:
+                        # If response.text fails, it means no valid parts
+                        self.content = ""
+                else:
+                    self.content = ""
+            except Exception as e:
+                # If we can't get text, this is an error
+                error_details = f"Finish reason: {finish_reason_name} (code: {finish_reason_code})" if finish_reason_name else "Unknown finish reason"
+                if self.refusal:
+                    raise RuntimeError(
+                        f"Gemini model response was blocked: {self.refusal}. "
+                        f"{error_details}. "
+                        f"Original error: {e}"
+                    ) from e
+                else:
+                    raise RuntimeError(
+                        f"Gemini model response has no valid content. "
+                        f"{error_details}. "
+                        f"Error accessing response: {e}"
+                    ) from e
+            
+            # If content is empty and we have a refusal or finish_reason indicates a block, that's an error
+            if not self.content:
+                if self.refusal:
+                    raise RuntimeError(
+                        f"Gemini model response was blocked and returned no content: {self.refusal}. "
+                        f"Finish reason: {finish_reason_name} (code: {finish_reason_code})"
+                    )
+                elif finish_reason_code == 3:  # SAFETY
+                    raise RuntimeError(
+                        f"Gemini model response was blocked by safety filter (finish_reason code: 3). "
+                        f"No content was returned."
+                    )
+                elif finish_reason_code == 4:  # RECITATION
+                    raise RuntimeError(
+                        f"Gemini model response was blocked by recitation filter (finish_reason code: 4). "
+                        f"No content was returned."
+                    )
+                elif finish_reason_code == 2 and not self.content:
+                    # MAX_TOKENS with no content - this is unusual
+                    # It could mean the response was so truncated that no parts were returned
+                    # Or it could indicate a block. Either way, we can't proceed without content.
+                    # Log additional debug info before raising
+                    debug_info = []
+                    if hasattr(gemini_response, "candidates") and gemini_response.candidates:
+                        candidate = gemini_response.candidates[0]
+                        debug_info.append(f"candidate has content: {hasattr(candidate, 'content')}")
+                        if hasattr(candidate, "content"):
+                            debug_info.append(f"content has parts: {hasattr(candidate.content, 'parts')}")
+                            if hasattr(candidate.content, "parts"):
+                                debug_info.append(f"parts count: {len(candidate.content.parts) if candidate.content.parts else 0}")
+                    raise RuntimeError(
+                        f"Gemini model response was truncated (finish_reason=MAX_TOKENS, code: 2) "
+                        f"but no content was extracted. This may indicate: "
+                        f"(1) The response was severely truncated, (2) The token limit is too low, "
+                        f"or (3) The response was blocked. Consider increasing max_output_tokens. "
+                        f"Debug info: {', '.join(debug_info) if debug_info else 'No debug info available'}"
+                    )
+    
+    class GeminiUsage:
+        """Wrapper for Gemini usage stats."""
+        def __init__(self, gemini_response):
+            # Gemini provides usage info in usage_metadata
+            if hasattr(gemini_response, "usage_metadata"):
+                self.prompt_tokens = gemini_response.usage_metadata.prompt_token_count
+                self.completion_tokens = gemini_response.usage_metadata.candidates_token_count
+                self.total_tokens = gemini_response.usage_metadata.total_token_count
+            else:
+                self.prompt_tokens = 0
+                self.completion_tokens = 0
+                self.total_tokens = 0
+    
+    return GeminiResponse(response)
+
+
+def create_llm_client(provider: Optional[str] = None, model_name: Optional[str] = None, api_key: Optional[str] = None):
+    """
+    Create an LLM client for the specified provider.
+    
+    Args:
+        provider: Provider name ("openai" or "gemini"). If None, auto-detects from model_name.
+        model_name: Model name (used for auto-detection if provider is None)
+        api_key: Optional API key (defaults to env vars)
+    
+    Returns:
+        Client instance (OpenAI client or genai module)
+    """
+    if provider is None:
+        if model_name is None:
+            raise ValueError("Either provider or model_name must be provided")
+        provider = detect_provider(model_name)
+    
+    if provider == "openai":
+        return get_openai_client(api_key)
+    elif provider == "gemini":
+        return get_gemini_client(api_key)
+    else:
+        raise ValueError(f"Unsupported provider: {provider}")
+
+
+def call_llm_chat_completion(
+    model: str,
+    messages: list,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    max_completion_tokens: Optional[int] = None,
+    max_output_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+    presence_penalty: Optional[float] = None,
+    frequency_penalty: Optional[float] = None,
+    response_format: Optional[Dict[str, Any]] = None,
+    client: Optional[Any] = None,
+) -> Any:
+    """
+    Unified function to call LLM chat completion for any provider.
+    
+    Args:
+        model: Model name (e.g., "gpt-4o", "gemini-2.5-pro")
+        messages: List of message dicts with "role" and "content"
+        temperature: Temperature parameter
+        max_tokens: Maximum tokens (OpenAI)
+        max_completion_tokens: Maximum completion tokens (OpenAI reasoning models)
+        max_output_tokens: Maximum output tokens (Gemini)
+        top_p: Top-p parameter
+        presence_penalty: Presence penalty (OpenAI only)
+        frequency_penalty: Frequency penalty (OpenAI only)
+        response_format: Response format (OpenAI only)
+        client: Optional pre-created client (auto-created if not provided)
+    
+    Returns:
+        Response object (compatible format across providers)
+    """
+    provider = detect_provider(model)
+    
+    if client is None:
+        client = create_llm_client(provider=provider, model_name=model)
+    
+    if provider == "openai":
+        return call_openai_chat_completion(
+            client=client,
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            max_completion_tokens=max_completion_tokens,
+            top_p=top_p,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            response_format=response_format,
+        )
+    elif provider == "gemini":
+        # Map max_tokens or max_completion_tokens to max_output_tokens for Gemini
+        if max_output_tokens is None:
+            max_output_tokens = max_completion_tokens if max_completion_tokens is not None else max_tokens
+        
+        return call_gemini_chat_completion(
+            _genai_module=client,
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            top_p=top_p,
+        )
+    else:
+        raise ValueError(f"Unsupported provider: {provider}")
 

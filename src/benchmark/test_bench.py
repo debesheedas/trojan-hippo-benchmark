@@ -1145,6 +1145,12 @@ class TestBench:
                                     # If not found, replace the first attack email or append
                                     current_state.inbox_emails = [optimization_result.optimized_attack_email] + inbox_emails[1:]
                             
+                            # CRITICAL FIX: Clear session history to match the fresh state used during scoring
+                            # During optimization, each variant was scored with a fresh session_id like "adaptive_xxx_iter5_var1"
+                            # We need to clear the current session's history to match that fresh state
+                            print(f"🔄 Clearing session history for {session_id} to match fresh optimization state")
+                            clear_session_agent(session_id)
+                            
                             # Re-run the step with optimized attack
                             step_result = self._run_step_with_attack_check(
                                 step, i, session_id, test_config, 
@@ -1155,7 +1161,8 @@ class TestBench:
                             step_result["optimization"] = {
                                 "strategy": optimization_result.optimization_strategy,
                                 "iterations": optimization_result.iterations,
-                                "feedback": optimization_result.feedback
+                                "feedback": optimization_result.feedback,
+                                "optimized_attack_email": optimization_result.optimized_attack_email
                             }
                         else:
                             print(f"❌ All optimization strategies failed for step {i}")
@@ -1537,6 +1544,21 @@ class TestBench:
         # Load original test and update with optimized attacks
         with open(test_file, 'r', encoding='utf-8') as f:
             cached_test = json.load(f)
+        
+        # Update the test with optimized attack emails from the result
+        steps = result.get("steps", [])
+        for i, step in enumerate(steps):
+            if "optimization" in step and "optimized_attack_email" in step["optimization"]:
+                optimized_email = step["optimization"]["optimized_attack_email"]
+                # Find the corresponding insert_attack_email step and update it
+                if i < len(cached_test.get("steps", [])):
+                    cached_step = cached_test["steps"][i]
+                    # Look backwards for the insert_attack_email step
+                    for j in range(i, -1, -1):
+                        if j < len(cached_test["steps"]) and cached_test["steps"][j].get("step_type") == "insert_attack_email":
+                            cached_test["steps"][j]["attack_email"] = optimized_email
+                            print(f"💾 Updated attack email in step {j+1} with optimized version")
+                            break
         
         # Add optimization metadata
         cached_test["optimization_metadata"] = {

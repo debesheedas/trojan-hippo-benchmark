@@ -275,13 +275,38 @@ class DSPyOptimizer(BaseOptimizer):
             return
             
         try:
-            # Configure DSPy with OpenAI model
+            # Configure DSPy with model (supports OpenAI and Gemini)
             # Use model and max_tokens from config if provided
             model_name = self.dspy_config.get("model_name", "gpt-4o-mini")
             max_tokens = int(self.dspy_config.get("max_tokens", 2000))
+            
+            # Detect provider from model name
+            from agent.utils import detect_provider
+            provider = detect_provider(model_name)
+            
+            # DSPy uses different prefixes for different providers
+            if provider == "openai":
+                dspy_model_string = f"openai/{model_name}"
+            elif provider == "gemini":
+                # DSPy may support Gemini through google/ prefix or similar
+                # Try google/ prefix first, fallback to openai/ if not supported
+                dspy_model_string = f"google/{model_name}"
+            else:
+                dspy_model_string = f"openai/{model_name}"
+            
             # Enforce determinism during optimization
-            dspy.configure(lm=dspy.LM(f"openai/{model_name}", temperature=0.0, top_p=1.0, max_tokens=max_tokens))
-            self._log_info(f"Configured DSPy with {model_name}")
+            try:
+                dspy.configure(lm=dspy.LM(dspy_model_string, temperature=0.0, top_p=1.0, max_tokens=max_tokens))
+                self._log_info(f"Configured DSPy with {model_name} (provider: {provider})")
+            except Exception as e:
+                # If Gemini doesn't work with google/ prefix, try openai/ as fallback
+                if provider == "gemini":
+                    self._log_warning(f"DSPy may not support Gemini models directly. Trying OpenAI fallback. Error: {e}")
+                    dspy_model_string = f"openai/gpt-4o-mini"
+                    dspy.configure(lm=dspy.LM(dspy_model_string, temperature=0.0, top_p=1.0, max_tokens=max_tokens))
+                    self._log_info(f"Configured DSPy with OpenAI fallback (gpt-4o-mini)")
+                else:
+                    raise
         except Exception as e:
             self._log_warning(f"Failed to configure DSPy LM: {e}")
             # Try with a fallback

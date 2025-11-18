@@ -183,7 +183,14 @@ def create_agent_executor():
     
     # Initialize LLM based on config
     model_config = config.get("agent", {})
-    provider = model_config.get("provider", "openai")
+    # Auto-detect provider from model name if not explicitly set
+    model_name = model_config.get("target_model_name", model_config.get("model_name", "gpt-4o"))
+    provider = model_config.get("provider")
+    
+    # Auto-detect provider from model name
+    from agent.utils import detect_provider
+    if provider is None:
+        provider = detect_provider(model_name)
     
     if provider == "openai":
         api_key = os.getenv("OPENAI_API_KEY")
@@ -192,7 +199,6 @@ def create_agent_executor():
             print("Warning: OPENAI_API_KEY not set. Agent will have limited functionality.")
         
         # Build LLM with error handling for unsupported parameters
-        model_name = model_config.get("model_name", "gpt-4o")
         temperature = model_config.get("temperature", 0.7)
         
         try:
@@ -209,8 +215,17 @@ def create_agent_executor():
                 model=model_name,
                 api_key=api_key if api_key else "dummy-key"
             )
+    elif provider == "gemini":
+        # Note: langchain-google-genai has version conflicts with langchain 1.0+
+        # For now, we'll use a workaround or fallback
+        raise NotImplementedError(
+            "Gemini models are not yet supported with LangChain integration due to version conflicts. "
+            "Direct API calls via google-generativeai work (used in adaptive attacks). "
+            "For LangChain agent, please use OpenAI models or install langchain-google-genai manually "
+            "with compatible versions."
+        )
     else:
-        # Mock LLM for testing
+        # Mock LLM for testing (fallback to OpenAI mock)
         try:
             llm = ChatOpenAI(
                 model="gpt-4o",

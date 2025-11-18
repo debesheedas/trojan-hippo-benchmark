@@ -198,8 +198,15 @@ def _create_agent_executor_for_python(
 
     # Model
     model_config = config.get("agent", {})
-    provider = model_config.get("provider", "openai")
-
+    # Auto-detect provider from model name if not explicitly set
+    model_name = model_config.get("target_model_name", "gpt-4o")
+    provider = model_config.get("provider")
+    
+    # Auto-detect provider from model name
+    from agent.utils import detect_provider
+    if provider is None:
+        provider = detect_provider(model_name)
+    
     if provider == "openai":
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -207,7 +214,6 @@ def _create_agent_executor_for_python(
         
         # Try to create LLM with all parameters, fallback to minimal params if model doesn't support them
         # Some models (e.g., future GPT versions) may not support all parameters
-        model_name = model_config.get("target_model_name", "gpt-4o")
         
         # Try with all parameters first (most common case)
         try:
@@ -236,6 +242,16 @@ def _create_agent_executor_for_python(
                     model=model_name,
                     api_key=api_key,
                 )
+    elif provider == "gemini":
+        # Note: langchain-google-genai has version conflicts with langchain 1.0+
+        # For now, we'll use a workaround or fallback
+        # The direct google-generativeai API is used in utils.py for non-LangChain calls
+        raise NotImplementedError(
+            "Gemini models are not yet supported with LangChain integration due to version conflicts. "
+            "Direct API calls via google-generativeai work (used in adaptive attacks). "
+            "For LangChain agent, please use OpenAI models or install langchain-google-genai manually "
+            "with compatible versions."
+        )
     else:
         raise ValueError(f"Unsupported provider: {provider}")
 

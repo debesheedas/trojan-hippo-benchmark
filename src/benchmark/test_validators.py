@@ -768,14 +768,12 @@ class SemanticJudgeValidator(TestValidator):
             return ""
     
     def _call_semantic_judge(self, content: str, query: str) -> bool:
-        """Call OpenAI API to judge if content contains information matching the query."""
+        """Call LLM API to judge if content contains information matching the query."""
         result_text = ""
         try:
-            from openai import OpenAI
-            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            from agent.utils import call_llm_chat_completion, detect_provider
             
-            if not client:
-                raise ValueError("OPENAI_API_KEY not set")
+            provider = detect_provider(self._judge_model)
             
             # Local helper to extract/normalize numeric facts and figures
             def extract_facts(text: str) -> Dict[str, Any]:
@@ -838,32 +836,34 @@ class SemanticJudgeValidator(TestValidator):
             # Some models (e.g., gpt-5 family) don't support temperature — skip it proactively
             model_lower = str(self._judge_model).lower()
             is_gpt5_family = model_lower.startswith("gpt-5") or "gpt-5" in model_lower
-            if is_gpt5_family:
-                response = client.chat.completions.create(
+            
+            # Prepare parameters
+            temperature = None if is_gpt5_family else self._judge_temperature
+            response_format = {"type": "json_object"} if provider == "openai" else None
+            
+            # Call unified LLM function
+            try:
+                response = call_llm_chat_completion(
                     model=self._judge_model,
                     messages=messages,
-                    response_format={"type": "json_object"}
+                    temperature=temperature,
+                    response_format=response_format,
+                    max_tokens=2000,
+                    max_output_tokens=2000  # For Gemini
                 )
-            else:
-                # Default path: include temperature (often supported)
-                try:
-                    response = client.chat.completions.create(
+            except Exception as e:
+                msg = str(e).lower()
+                if "temperature" in msg and ("unsupported" in msg or "does not support" in msg):
+                    # Retry without temperature parameter
+                    response = call_llm_chat_completion(
                         model=self._judge_model,
                         messages=messages,
-                        temperature=self._judge_temperature,
-                        response_format={"type": "json_object"}
+                        response_format=response_format,
+                        max_tokens=2000,
+                        max_output_tokens=2000  # For Gemini
                     )
-                except Exception as e:
-                    msg = str(e).lower()
-                    if "temperature" in msg and ("unsupported" in msg or "does not support" in msg):
-                        # Retry without temperature parameter
-                        response = client.chat.completions.create(
-                            model=self._judge_model,
-                            messages=messages,
-                            response_format={"type": "json_object"}
-                        )
-                    else:
-                        raise
+                else:
+                    raise
             
             # Parse response
             if not response or not response.choices or not response.choices[0].message:
