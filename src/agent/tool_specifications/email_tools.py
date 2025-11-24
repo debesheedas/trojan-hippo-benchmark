@@ -205,6 +205,14 @@ class ReadAllEmailsInput(BaseModel):
         default=False,
         description="If True, only return unread emails. If False (default), return all emails sorted with unread first."
     )
+    offset: int = Field(
+        default=0,
+        description="Offset for pagination (number of emails to skip). Use 0 for first page."
+    )
+    limit: Optional[int] = Field(
+        default=None,
+        description="Maximum number of emails to return. If None, returns all emails (may be paginated automatically if output exceeds page size)."
+    )
 
 
 class SearchEmailsInput(BaseModel):
@@ -257,14 +265,18 @@ class ReadAllEmailsTool(BaseTool):
 
 Sorting: Emails are sorted with unread emails first, then read emails. Within each category, emails are sorted from newest to oldest (most recent first).
 
-Optional parameter:
+Optional parameters:
 - unread_only: If set to True, only returns unread emails. If False (default), returns all emails with unread ones listed first.
+- offset: Number of emails to skip (for pagination). Use 0 for first page.
+- limit: Maximum number of emails to return. If not specified, returns all emails (may be automatically paginated if output is too large).
+
+Pagination: If the total output would exceed the page size limit, the tool will automatically return a paginated response. You can use offset and limit parameters to read additional pages.
 
 When you read emails using this tool, they are automatically marked as read in the inbox."""
     args_schema: type[BaseModel] = ReadAllEmailsInput
     config: Optional[EmailToolsConfig] = None
     
-    def _run(self, unread_only: bool = False) -> str:
+    def _run(self, unread_only: bool = False, offset: int = 0, limit: Optional[int] = None) -> str:
         """Read and return all inbox emails, optionally filtered to unread only."""
         call_id = generate_id("tcall")
         
@@ -276,10 +288,19 @@ When you read emails using this tool, they are automatically marked as read in t
                 self.config.session_id,
                 {
                     "tool_name": self.name,
-                    "inputs": {"unread_only": unread_only},
+                    "inputs": {"unread_only": unread_only, "offset": offset, "limit": limit},
                     "call_id": call_id
                 }
             )
+        
+        # Get page size from config
+        page_size = 20000  # Default
+        try:
+            from agent.utils import load_config
+            config = load_config()
+            page_size = config.get("agent", {}).get("email_reading", {}).get("page_size", 20000)
+        except:
+            pass
         
         try:
             # Get all emails from inbox directory
@@ -322,6 +343,14 @@ When you read emails using this tool, they are automatically marked as read in t
                     x.get('_file_path', '')  # File path for determinism
                 ))
                 
+                total_emails = len(emails)
+                
+                # Apply pagination
+                if limit is not None:
+                    emails = emails[offset:offset+limit]
+                else:
+                    emails = emails[offset:]
+                
                 # Mark all displayed emails as read and save back to file
                 for email in emails:
                     file_path = Path(email.get('_file_path'))
@@ -340,11 +369,17 @@ When you read emails using this tool, they are automatically marked as read in t
                         except Exception:
                             pass  # If we can't write, continue anyway
                 
-                result_lines = [f"Found {len(emails)} email(s) in inbox:\n"]
+                # Build result with pagination info
+                result_lines = [f"Found {total_emails} email(s) in inbox"]
+                if offset > 0 or (limit is not None and offset + len(emails) < total_emails):
+                    result_lines[0] += f" (showing {len(emails)} starting from email {offset + 1})"
+                result_lines[0] += ":\n"
+                
                 for i, email in enumerate(emails, 1):
+                    display_index = offset + i
                     read_status = "Read" if email.get("metadata", {}).get("read") else "Unread"
                     result_lines.append(
-                        f"\n--- Email {i} ---\n"
+                        f"\n--- Email {display_index} of {total_emails} ---\n"
                         f"From: {email.get('from', 'N/A')}\n"
                         f"To: {email.get('to', 'N/A')}\n"
                         f"Subject: {email.get('subject', 'N/A')}\n"
@@ -352,7 +387,64 @@ When you read emails using this tool, they are automatically marked as read in t
                         f"Status: {read_status}\n"
                         f"Body:\n{email.get('body_plain', email.get('body', 'N/A'))}\n"
                     )
+                
                 result = "\n".join(result_lines)
+                
+                # Check if result exceeds page size and needs automatic pagination
+                if limit is None and len(result) > page_size:
+                    # Recalculate: how many emails fit in page_size?
+                    # Build incrementally to find the exact number that fits
+                    result_lines_test = [f"Found {total_emails} email(s) in inbox (showing first N due to size limit):\n"]
+                    test_result = "\n".join(result_lines_test)
+                    emails_safe = []
+                    
+                    for email in emails:
+                        # Test if adding this email would exceed page size
+                        test_email_line = (
+                            f"\n--- Email {len(emails_safe) + 1} of {total_emails} ---\n"
+                            f"From: {email.get('from', 'N/A')}\n"
+                            f"To: {email.get('to', 'N/A')}\n"
+                            f"Subject: {email.get('subject', 'N/A')}\n"
+                            f"Date: {email.get('received_ts', email.get('created_ts', 'N/A'))}\n"
+                            f"Status: {'Read' if email.get('metadata', {}).get('read') else 'Unread'}\n"
+                            f"Body:\n{email.get('body_plain', email.get('body', 'N/A'))}\n"
+                        )
+                        
+                        if len(test_result) + len(test_email_line) + 200 > page_size:  # 200 chars buffer for pagination note
+                            break
+                        
+                        emails_safe.append(email)
+                        test_result += test_email_line
+                    
+                    # Rebuild result with safe emails
+                    result_lines = [f"Found {total_emails} email(s) in inbox (showing first {len(emails_safe)} due to size limit):\n"]
+                    
+                    for i, email in enumerate(emails_safe, 1):
+                        read_status = "Read" if email.get("metadata", {}).get("read") else "Unread"
+                        result_lines.append(
+                            f"\n--- Email {i} of {total_emails} ---\n"
+                            f"From: {email.get('from', 'N/A')}\n"
+                            f"To: {email.get('to', 'N/A')}\n"
+                            f"Subject: {email.get('subject', 'N/A')}\n"
+                            f"Date: {email.get('received_ts', email.get('created_ts', 'N/A'))}\n"
+                            f"Status: {read_status}\n"
+                            f"Body:\n{email.get('body_plain', email.get('body', 'N/A'))}\n"
+                        )
+                    
+                    # Add pagination instruction
+                    remaining = len(emails) - len(emails_safe)
+                    if remaining > 0:
+                        # Calculate safe limit for next page
+                        estimated_chars_per_email = max(200, sum(len(str(e.get('body_plain', e.get('body', '')))) for e in emails_safe[:5]) // min(5, len(emails_safe)) if emails_safe else 500)
+                        safe_limit = max(1, (page_size - 500) // estimated_chars_per_email)
+                        
+                        result_lines.append(
+                            f"\n[Note: There are {remaining} more email(s). "
+                            f"To read more, call this tool again with offset={len(emails_safe)} "
+                            f"(optionally with limit={safe_limit} to control batch size)]"
+                        )
+                    
+                    result = "\n".join(result_lines)
             
             # Log tool result
             if self.config and self.config.session_id:

@@ -25,6 +25,7 @@ from agent.utils import (
     set_global_seeds,
 )
 from agent.backend.memory_manager import get_memory_manager
+from agent.backend.rag_memory_manager import get_rag_memory_manager
 
 
 # Load env early for API keys, etc.
@@ -50,11 +51,35 @@ def clear_agent_cache():
     _agent_cache.clear()
 
 
-def clear_session_agent(session_id: str):
-    """Clear the agent executor for a specific session - useful when starting new sessions."""
+def clear_session_agent(session_id: str, config: Optional[dict] = None, auto_store_rag: bool = True):
+    """
+    Clear the agent executor for a specific session - useful when starting new sessions.
+    
+    Args:
+        session_id: Session ID to clear
+        config: Configuration dictionary (needed for RAG storage)
+        auto_store_rag: If True, automatically store session conversation in RAG memory before clearing
+    """
     global _agent_cache
+    
+    # Store session in RAG memory before clearing (if enabled)
+    if auto_store_rag and config:
+        try:
+            from benchmark.rag_poisoning_attack import store_session_in_rag_memory
+            rag_config = config.get("memory", {}).get("rag_memory", {})
+            if rag_config.get("enabled", False):
+                chunks_stored = store_session_in_rag_memory(session_id, config)
+                if chunks_stored > 0:
+                    print(f"Automatically stored {chunks_stored} chunks from session {session_id} to RAG memory")
+        except Exception as e:
+            print(f"Warning: Could not auto-store session in RAG memory: {e}")
+    
     if session_id in _agent_cache:
         del _agent_cache[session_id]
+    
+    # Also clear session memory
+    if session_id in _session_store:
+        del _session_store[session_id]
 
 
 def _get_or_create_agent_executor(session_id: str, config: Optional[dict] = None) -> Any:
@@ -259,17 +284,31 @@ def _create_agent_executor_for_python(
     memory_prompt_file = Path(__file__).parent / "memory_prompt.txt"
     memory_instructions = memory_prompt_file.read_text(encoding="utf-8") if memory_prompt_file.exists() else ""
 
-    try:
-        # Get memory file path from config, default to standard location
-        memory_file = config.get("data", {}).get("memory_file", "data/interactive_agent/agent_memory.json")
-        # Force new instance to ensure test isolation
-        memory_manager = get_memory_manager(memory_file=memory_file, force_new=True)
-        memory_context = memory_manager.get_long_term_as_text()
-    except Exception:
-        memory_context = ""
+    # Initialize memory systems based on config
+    memory_config = config.get("memory", {})
+    simple_memory_enabled = memory_config.get("simple_memory", {}).get("enabled", True)
+    rag_memory_enabled = memory_config.get("rag_memory", {}).get("enabled", False)
+    
+    simple_memory_context = ""
+    
+    # Simple memory system
+    if simple_memory_enabled:
+        try:
+            memory_file = memory_config.get("simple_memory", {}).get("memory_file", 
+                config.get("data", {}).get("memory_file", "data/interactive_agent/agent_memory.json"))
+            memory_manager = get_memory_manager(memory_file=memory_file, force_new=True)
+            simple_memory_context = memory_manager.get_long_term_as_text()
+        except Exception as e:
+            print(f"Warning: Could not load simple memory: {e}")
+            simple_memory_context = ""
+    
+    # RAG memory system - retrieve relevant context for current query
+    # Note: RAG context is retrieved per-query in invoke_agent, so we don't initialize here
+    # The RAG memory manager will be initialized on-demand in invoke_agent
 
-    # Build system prompt
-    system_prompt = _build_agent_prompt(memory_instructions, memory_context)
+    # Build system prompt with simple memory context
+    # RAG context will be added dynamically per query
+    system_prompt = _build_agent_prompt(memory_instructions, simple_memory_context)
 
     # Create agent using new API
     # Disable debug output (comment out [values] and [updates] prints)
@@ -293,10 +332,16 @@ def invoke_agent(
     Run a single agent turn directly in Python and return response + metadata.
     Uses cached agent for better performance.
     """
-    session_id = session_id or f"session_cli"
+    session_id = session_id or "session_cli"
     
-    # Log user input to traces (optional, matches behavior in main.py)
+    # Load config and ensure it has required structure
     cfg = config or load_config()
+    
+    # Ensure config has "data" section with trace_file
+    if "data" not in cfg:
+        cfg["data"] = {}
+    if "trace_file" not in cfg["data"]:
+        cfg["data"]["trace_file"] = "data/interactive_agent/trace.jsonl"
     
     # DEBUG: Print the actual system prompt that will be used (with current memory context)
     try:
@@ -304,26 +349,58 @@ def invoke_agent(
         memory_instructions = memory_prompt_file.read_text(encoding="utf-8") if memory_prompt_file.exists() else ""
         
         # Get current memory context (this is what's actually being used)
-        memory_file = cfg.get("data", {}).get("memory_file", "data/agent_memory.json")
-        memory_manager = get_memory_manager(memory_file=memory_file, force_new=False)
-        memory_context = memory_manager.get_long_term_as_text()
+        memory_config = cfg.get("memory", {})
+        simple_memory_enabled = memory_config.get("simple_memory", {}).get("enabled", True)
+        simple_memory_context = ""
         
-        # Build the actual system prompt that will be used
-        system_prompt = _build_agent_prompt(memory_instructions, memory_context)
+        if simple_memory_enabled:
+            memory_file = memory_config.get("simple_memory", {}).get("memory_file",
+                cfg.get("data", {}).get("memory_file", "data/interactive_agent/agent_memory.json"))
+            memory_manager = get_memory_manager(memory_file=memory_file, force_new=False)
+            simple_memory_context = memory_manager.get_long_term_as_text()
+        
+        # Build the actual system prompt that will be used (for debugging if needed)
+        # system_prompt = _build_agent_prompt(memory_instructions, simple_memory_context)
         # print(f"\n🔍 DEBUG: System Prompt (Session: {session_id}, Length: {len(system_prompt)} chars)\n{system_prompt}\n")
     except Exception as e:
         print(f"Warning: Could not print system prompt: {e}")
     
     # Get or create cached agent for this session
-    agent = _get_or_create_agent_executor(session_id, config)
+    agent = _get_or_create_agent_executor(session_id, cfg)
 
-    append_trace_event(cfg["data"]["trace_file"], "user_input", session_id, {"text": text})
+    # Log user input to traces (with error handling)
+    try:
+        append_trace_event(cfg["data"]["trace_file"], "user_input", session_id, {"text": text})
+    except Exception as e:
+        print(f"Warning: Could not append trace event: {e}")
+
+    # Retrieve RAG memory context if enabled
+    rag_memory_config = cfg.get("memory", {}).get("rag_memory", {})
+    rag_memory_enabled = rag_memory_config.get("enabled", False)
+    rag_context = ""
+    
+    if rag_memory_enabled:
+        try:
+            rag_memory_manager = get_rag_memory_manager(
+                embedding_model=rag_memory_config.get("embedding_model", "text-embedding-3-small"),
+                top_k=rag_memory_config.get("top_k", 3),
+                chunk_size=rag_memory_config.get("chunk_size", 512),
+                vectorstore_path=rag_memory_config.get("vectorstore_path", "data/interactive_agent/rag_vectorstore"),
+                force_new=False
+            )
+            rag_context = rag_memory_manager.get_context(text)
+            if rag_context:
+                rag_context = "\n\n# Relevant Memory Context\n" + rag_context + "\n"
+        except Exception as e:
+            print(f"Warning: Could not retrieve RAG memory context: {e}")
+            rag_context = ""
 
     # Get session history
     session_messages = _get_session_memory(session_id)
     
-    # Add user message to session
-    session_messages.append({"role": "user", "content": text})
+    # Add user message to session (with RAG context if available)
+    user_message = rag_context + text if rag_context else text
+    session_messages.append({"role": "user", "content": user_message})
     
     # Prepare input for the agent
     inputs = {"messages": session_messages}
@@ -349,11 +426,34 @@ def invoke_agent(
     # Add AI response to session
     session_messages.append({"role": "assistant", "content": response_text})
     
+    # Store conversation in RAG memory if enabled
+    if rag_memory_enabled:
+        try:
+            rag_memory_manager = get_rag_memory_manager(
+                embedding_model=rag_memory_config.get("embedding_model", "text-embedding-3-small"),
+                top_k=rag_memory_config.get("top_k", 3),
+                chunk_size=rag_memory_config.get("chunk_size", 512),
+                vectorstore_path=rag_memory_config.get("vectorstore_path", "data/interactive_agent/rag_vectorstore"),
+                force_new=False
+            )
+            # Store user query and assistant response as a conversation turn
+            conversation_turn = f"User: {text}\nAssistant: {response_text}"
+            rag_memory_manager.add_memory(conversation_turn, metadata={
+                "session_id": session_id,
+                "type": "conversation"
+            })
+        except Exception as e:
+            print(f"Warning: Could not store conversation in RAG memory: {e}")
+    
     # Keep only last 15 messages (similar to old behavior)
     if len(session_messages) > 15:
         session_messages = session_messages[-15:]
 
-    append_trace_event(cfg["data"]["trace_file"], "agent_response", session_id, {"text": response_text})
+    # Log agent response to traces (with error handling)
+    try:
+        append_trace_event(cfg["data"]["trace_file"], "agent_response", session_id, {"text": response_text})
+    except Exception as e:
+        print(f"Warning: Could not append trace event: {e}")
 
     return {
         "response": response_text,
