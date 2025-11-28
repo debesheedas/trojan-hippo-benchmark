@@ -51,9 +51,52 @@ class TestBench:
         self.model_name = self.config.get("agent", {}).get("target_model_name")
         if not self.model_name:
             raise ValueError("Config missing agent.target_model_name. Please set it in config.yaml.")
-        self.results_dir = Path("data/benchmark/test_bench_results")
-        self.results_dir.mkdir(exist_ok=True)
         self.test_dirs = []  # Track test directories for cleanup
+        
+        # Determine which memory system is enabled
+        memory_config = self.config.get("memory", {})
+        self.simple_memory_enabled = memory_config.get("simple_memory", {}).get("enabled", False)
+        mem0_config = memory_config.get("mem0_memory", {})
+        self.mem0_memory_enabled = mem0_config.get("enabled", False)
+        self.mem0_print_enabled = mem0_config.get("mem0_print", False)
+        
+        # Get defense type from config
+        self.defense_type = mem0_config.get("defense_type", "none")
+        
+        # Use different results directory for mem0 tests, with defense suffix
+        if self.mem0_memory_enabled:
+            base_dir = Path("data/benchmark/test_bench_results_mem0")
+            # Map "none" to "no_defense" for consistency
+            if self.defense_type == "none":
+                defense_folder = "no_defense"
+            else:
+                defense_folder = self.defense_type
+            self.results_dir = base_dir / f"defense_{defense_folder}"
+        else:
+            self.results_dir = Path("data/benchmark/test_bench_results")
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Determine test directory based on memory system
+        if self.simple_memory_enabled:
+            self.test_bench_dir = Path("data/benchmark/attack_bench")
+            self.memory_type = "simple"
+        elif self.mem0_memory_enabled:
+            self.test_bench_dir = Path("data/benchmark/attack_bench_mem0")
+            self.memory_type = "mem0"
+        else:
+            # Default to simple memory if neither is explicitly enabled
+            self.test_bench_dir = Path("data/benchmark/attack_bench")
+            self.memory_type = "simple"
+            print("⚠️ Warning: No memory system explicitly enabled. Defaulting to simple memory.")
+        
+        print(f"🧠 Memory System: {self.memory_type.upper()}")
+        if self.mem0_memory_enabled:
+            if self.defense_type == "none":
+                print(f"🛡️ Defense: no_defense")
+            else:
+                print(f"🛡️ Defense: {self.defense_type}")
+        print(f"📁 Test Directory: {self.test_bench_dir}")
+        print(f"📊 Results Directory: {self.results_dir}")
         
         # Check if adaptive benchmark is enabled
         self.adaptive_enabled = self.config.get("benchmark", {}).get("enable_adaptive_benchmark", False)
@@ -94,6 +137,232 @@ class TestBench:
             print("🔧 Adaptive benchmark mode ENABLED")
         else:
             print("📊 Static benchmark mode")
+    
+    def _debug_print_initial_mem0_memories(self, test_config: Dict[str, Any]):
+        """Debug print: Print all initial mem0 memories loaded in the vectorstore at the start of a test case."""
+        if not self.mem0_memory_enabled:
+            return
+        
+        try:
+            from agent.backend.mem0_memory_manager import get_mem0_memory_manager
+            from pathlib import Path
+            
+            mem0_config = test_config.get("memory", {}).get("mem0_memory", {})
+            vectorstore_path = mem0_config.get("vectorstore_path", "data/interactive_agent/mem0_vectorstore")
+            user_id = mem0_config.get("user_id", "vince")
+            # Memories are stored with agent_id=None, so we query with None
+            agent_id = None
+            
+            # Check if vectorstore directory exists and has files
+            vectorstore_path_obj = Path(vectorstore_path)
+            faiss_files = list(vectorstore_path_obj.glob("*.faiss")) if vectorstore_path_obj.exists() else []
+            
+            print(f"\n{'='*80}")
+            print(f"🔍 DEBUG: Initial mem0 Memories in Vectorstore")
+            print(f"{'='*80}")
+            print(f"Vectorstore Path: {vectorstore_path}")
+            print(f"Vectorstore Exists: {vectorstore_path_obj.exists()}")
+            print(f"FAISS Files Found: {len(faiss_files)}")
+            print(f"User ID: {user_id}, Agent ID: {agent_id} (memories are stored with agent_id=None)")
+            
+            # Initialize mem0 memory manager
+            # Note: agent_id parameter here is just for manager initialization, not for querying
+            mem0_manager = get_mem0_memory_manager(
+                llm_provider=mem0_config.get("llm_provider", "openai"),
+                llm_model=mem0_config.get("llm_model", "gpt-4o-mini"),
+                llm_temperature=mem0_config.get("llm_temperature", 0.0),
+                embedding_provider=mem0_config.get("embedding_provider", "openai"),
+                embedding_model=mem0_config.get("embedding_model", "text-embedding-3-small"),
+                vector_store_provider=mem0_config.get("vector_store_provider", "faiss"),
+                vectorstore_path=vectorstore_path,
+                top_k=mem0_config.get("top_k", 3),
+                user_id=user_id,
+                agent_id=None,  # Memories are stored with agent_id=None
+                force_new=False
+            )
+            
+            # Get all memories with agent_id=None (this is how they're stored)
+            all_memories = mem0_manager.get_all_memories(user_id=user_id, agent_id=None, limit=1000)
+            
+            print(f"Total Memories Found: {len(all_memories)}")
+            print(f"{'-'*80}")
+            
+            if all_memories:
+                for i, memory in enumerate(all_memories, 1):
+                    if isinstance(memory, dict):
+                        memory_text = memory.get("memory", "")
+                        memory_id = memory.get("id", "unknown")
+                        memory_metadata = memory.get("metadata", {})
+                        memory_user_id = memory.get("user_id", "unknown")
+                        memory_agent_id = memory.get("agent_id", "None")
+                        print(f"\n[{i}] Memory ID: {memory_id}")
+                        print(f"    User ID: {memory_user_id}, Agent ID: {memory_agent_id}")
+                        print(f"    Text: {memory_text}")
+                        if memory_metadata:
+                            print(f"    Metadata: {memory_metadata}")
+                    else:
+                        print(f"\n[{i}] {str(memory)}")
+            else:
+                print("(No memories found in vectorstore)")
+                # Additional debugging: try to get users/stats
+                try:
+                    users = mem0_manager.get_users()
+                    print(f"\nDebug: get_users() returned: {users}")
+                except Exception as e:
+                    print(f"\nDebug: Could not get users: {e}")
+            
+            print(f"{'='*80}\n")
+        except Exception as e:
+            print(f"\n⚠️ DEBUG: Could not print initial mem0 memories: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _print_mem0_memories(self, test_config: Dict[str, Any], user_message: Optional[str] = None):
+        """Print mem0 memory contents and context if mem0_print is enabled."""
+        if not (self.mem0_memory_enabled and self.mem0_print_enabled):
+            return
+        
+        try:
+            from agent.backend.mem0_memory_manager import get_mem0_memory_manager
+            from agent.agent_core import _build_agent_prompt
+            
+            mem0_config = test_config.get("memory", {}).get("mem0_memory", {})
+            vectorstore_path = mem0_config.get("vectorstore_path", "data/interactive_agent/mem0_vectorstore")
+            user_id = mem0_config.get("user_id", "vince")
+            agent_id = mem0_config.get("agent_id", "email_agent")
+            
+            # Initialize mem0 memory manager
+            mem0_manager = get_mem0_memory_manager(
+                llm_provider=mem0_config.get("llm_provider", "openai"),
+                llm_model=mem0_config.get("llm_model", "gpt-5-mini"),
+                llm_temperature=mem0_config.get("llm_temperature", 0.0),
+                embedding_provider=mem0_config.get("embedding_provider", "openai"),
+                embedding_model=mem0_config.get("embedding_model", "text-embedding-3-small"),
+                vector_store_provider=mem0_config.get("vector_store_provider", "faiss"),
+                vectorstore_path=vectorstore_path,
+                top_k=mem0_config.get("top_k", 3),
+                user_id=user_id,
+                agent_id=agent_id,
+                force_new=False
+            )
+            
+            # Get all memories
+            memories = mem0_manager.get_all_memories(user_id=user_id, agent_id=agent_id, limit=1000)
+            
+            if memories:
+                print("\n🧠 Mem0 Memories:")
+                print("-" * 80)
+                for memory in memories:
+                    if isinstance(memory, dict):
+                        memory_text = memory.get("memory", "")
+                        if memory_text:
+                            print(f"  • {memory_text}")
+                    else:
+                        print(f"  • {str(memory)}")
+                print("-" * 80)
+            else:
+                print("\n🧠 Mem0 Memories: (empty)")
+            
+            # Get mem0 context that would be added to user message (if user_message provided)
+            if user_message:
+                try:
+                    # Build the final user message exactly as it would be sent to the model
+                    context_parts = []
+                    
+                    # Check for RAG context (if RAG memory is enabled)
+                    rag_context = ""
+                    memory_config = test_config.get("memory", {})
+                    rag_memory_enabled = memory_config.get("rag_memory", {}).get("enabled", False)
+                    if rag_memory_enabled:
+                        try:
+                            from agent.backend.rag_memory_manager import get_rag_memory_manager
+                            rag_config = memory_config.get("rag_memory", {})
+                            rag_memory_manager = get_rag_memory_manager(
+                                embedding_model=rag_config.get("embedding_model", "text-embedding-3-small"),
+                                top_k=rag_config.get("top_k", 3),
+                                chunk_size=rag_config.get("chunk_size", 512),
+                                vectorstore_path=rag_config.get("vectorstore_path", "data/interactive_agent/rag_vectorstore"),
+                                force_new=False
+                            )
+                            rag_context = rag_memory_manager.get_context(user_message)
+                            if rag_context:
+                                rag_context = "\n\n# Relevant Memory Context\n" + rag_context + "\n"
+                                context_parts.append(rag_context)
+                        except Exception:
+                            pass
+                    
+                    # Get mem0 context
+                    mem0_context = mem0_manager.get_context(user_message, user_id=user_id)
+                    if mem0_context:
+                        formatted_mem0_context = "\n\n# Relevant Mem0 Memory Context\n" + mem0_context + "\n"
+                        context_parts.append(formatted_mem0_context)
+                        print("\n📝 Mem0 Context Added to User Message:")
+                        print("-" * 80)
+                        print(formatted_mem0_context)
+                        print("-" * 80)
+                    else:
+                        print("\n📝 Mem0 Context Added to User Message: (none - no relevant memories found)")
+                    
+                    # Build final user message (same logic as in agent_core.py)
+                    final_user_message = "".join(context_parts) + user_message if context_parts else user_message
+                    
+                    print("\n💬 Final User Message Sent to Model:")
+                    print("=" * 80)
+                    print(final_user_message)
+                    print("=" * 80)
+                except Exception as e:
+                    print(f"\n⚠️ Warning: Could not retrieve mem0 context: {e}")
+                    print("\n💬 Final User Message Sent to Model:")
+                    print("=" * 80)
+                    print(user_message)
+                    print("=" * 80)
+            else:
+                print("\n💬 Final User Message Sent to Model: (no user message provided)")
+            
+            # Print system prompt (memory-related parts)
+            try:
+                from pathlib import Path
+                from agent.agent_core import _build_agent_prompt
+                
+                memory_config = test_config.get("memory", {})
+                simple_memory_enabled = memory_config.get("simple_memory", {}).get("enabled", False)
+                
+                # Load memory instructions if simple memory is enabled
+                memory_instructions = ""
+                simple_memory_context = ""
+                if simple_memory_enabled:
+                    # Find memory_prompt.txt relative to agent_core.py location
+                    agent_core_path = Path(__file__).parent.parent / "agent" / "memory_prompt.txt"
+                    if agent_core_path.exists():
+                        memory_instructions = agent_core_path.read_text(encoding="utf-8")
+                    
+                    # Try to load simple memory context
+                    try:
+                        from agent.backend.memory_manager import get_memory_manager
+                        memory_file = memory_config.get("simple_memory", {}).get("memory_file", 
+                            test_config.get("data", {}).get("memory_file", "data/interactive_agent/agent_memory.json"))
+                        memory_manager = get_memory_manager(memory_file=memory_file, force_new=True)
+                        simple_memory_context = memory_manager.get_long_term_as_text()
+                    except Exception:
+                        simple_memory_context = ""
+                
+                print("\n📋 System Prompt (Memory-Related Sections):")
+                print("=" * 80)
+                if memory_instructions:
+                    print("\n[Memory Instructions Section]")
+                    print("-" * 80)
+                    print(memory_instructions)
+                    print("-" * 80)
+                if simple_memory_context:
+                    print("\n[Simple Memory Context Section]")
+                    print("-" * 80)
+                    print(simple_memory_context)
+                    print("-" * 80)
+            except Exception as e:
+                print(f"\n⚠️ Warning: Could not print system prompt: {e}")
+                
+        except Exception as e:
+            print(f"\n⚠️ Warning: Could not print mem0 memories: {e}")
     
     def _setup_optimizer_logging(self):
         """Initialize a file logger for optimization runs when using TestBench."""
@@ -145,8 +414,13 @@ class TestBench:
         drafts_dir = test_dir / "drafts"
         sessions_dir = test_dir / "sessions"
         traces_dir = test_dir / "traces"
+        mem0_vectorstore_dir = test_dir / "mem0_vectorstore"
         
-        for dir_path in [inbox_dir, outbox_dir, drafts_dir, sessions_dir, traces_dir]:
+        dirs_to_create = [inbox_dir, outbox_dir, drafts_dir, sessions_dir, traces_dir]
+        if self.mem0_memory_enabled:
+            dirs_to_create.append(mem0_vectorstore_dir)
+        
+        for dir_path in dirs_to_create:
             dir_path.mkdir(exist_ok=True)
         
         # Copy initial data based on configuration
@@ -201,33 +475,75 @@ class TestBench:
                 for email_file in original_mailbox.glob("*.json"):
                     shutil.copy2(email_file, inbox_dir)
         
-        # Copy agent memory file to test environment
-        if initial_data and "memory_set" in initial_data:
-            # Copy from specified memory set
-            memory_set = initial_data["memory_set"]
-            source_memory = Path(f"data/benchmark/initial_memory/{memory_set}.json")
-            if source_memory.exists():
-                shutil.copy2(source_memory, test_dir / "agent_memory.json")
-            else:
-                print(f"Warning: Memory set '{memory_set}' not found at {source_memory}")
-                # Create empty memory file as fallback
-                empty_memory = {
-                    "long_term": []
-                }
-                with open(test_dir / "agent_memory.json", 'w', encoding='utf-8') as f:
-                    json.dump(empty_memory, f, indent=2)
+        # Initialize memory based on which system is enabled
+        if self.mem0_memory_enabled:
+            # Initialize mem0 memory vectorstore
+            mem0_memory_set = None
+            if initial_data:
+                mem0_memory_set = initial_data.get("mem0_memory_set")
+                if not mem0_memory_set and "memory_set" in initial_data:
+                    # Fallback: convert memory_set to mem0_memory_set
+                    memory_set_name = initial_data["memory_set"]
+                    if memory_set_name.startswith("memory_set_"):
+                        mem0_memory_set = memory_set_name.replace("memory_set_", "mem0_memory_set_", 1)
+                    else:
+                        mem0_memory_set = f"mem0_{memory_set_name}"
+            
+            if not mem0_memory_set:
+                mem0_memory_set = "mem0_memory_set_0"
+            
+            # Load initial mem0 memory set from pre-processed vectorstore
+            try:
+                from benchmark.mem0_memory_loader import load_mem0_memory_set
+                # Create temporary config for loading
+                temp_config = self.config.copy()
+                temp_config["memory"]["mem0_memory"]["vectorstore_path"] = str(mem0_vectorstore_dir)
+                # Use force_new=False to use existing vectorstore if it exists
+                # The loader will copy from initial_mem0_memory if needed
+                load_mem0_memory_set(
+                    mem0_memory_set=mem0_memory_set,
+                    config=temp_config,
+                    vectorstore_path=str(mem0_vectorstore_dir),
+                    force_new=False  # Use existing vectorstore if available
+                )
+                print(f"✅ Loaded mem0 memory set: {mem0_memory_set}")
+            except Exception as e:
+                print(f"⚠️ Warning: Could not load mem0 memory set '{mem0_memory_set}': {e}")
+                import traceback
+                traceback.print_exc()
+            
+            # Still create empty memory file for compatibility
+            empty_memory = {"long_term": []}
+            with open(test_dir / "agent_memory.json", 'w', encoding='utf-8') as f:
+                json.dump(empty_memory, f, indent=2)
         else:
-            # Fallback to original behavior
-            original_memory = Path("data/interactive_agent/agent_memory.json")
-            if original_memory.exists():
-                shutil.copy2(original_memory, test_dir / "agent_memory.json")
+            # Initialize simple memory (original behavior)
+            if initial_data and "memory_set" in initial_data:
+                # Copy from specified memory set
+                memory_set = initial_data["memory_set"]
+                source_memory = Path(f"data/benchmark/initial_memory/{memory_set}.json")
+                if source_memory.exists():
+                    shutil.copy2(source_memory, test_dir / "agent_memory.json")
+                else:
+                    print(f"Warning: Memory set '{memory_set}' not found at {source_memory}")
+                    # Create empty memory file as fallback
+                    empty_memory = {
+                        "long_term": []
+                    }
+                    with open(test_dir / "agent_memory.json", 'w', encoding='utf-8') as f:
+                        json.dump(empty_memory, f, indent=2)
             else:
-                # Create empty memory file if it doesn't exist
-                empty_memory = {
-                    "long_term": []
-                }
-                with open(test_dir / "agent_memory.json", 'w', encoding='utf-8') as f:
-                    json.dump(empty_memory, f, indent=2)
+                # Fallback to original behavior
+                original_memory = Path("data/interactive_agent/agent_memory.json")
+                if original_memory.exists():
+                    shutil.copy2(original_memory, test_dir / "agent_memory.json")
+                else:
+                    # Create empty memory file if it doesn't exist
+                    empty_memory = {
+                        "long_term": []
+                    }
+                    with open(test_dir / "agent_memory.json", 'w', encoding='utf-8') as f:
+                        json.dump(empty_memory, f, indent=2)
         
         # Copy initial session data to test environment
         if initial_data and "session_set" in initial_data:
@@ -253,8 +569,29 @@ class TestBench:
         test_config["data"]["outbox_dir"] = str(outbox_dir)
         test_config["data"]["drafts_dir"] = str(drafts_dir)
         test_config["data"]["sessions_dir"] = str(sessions_dir)
-        test_config["data"]["trace_file"] = str(traces_dir / "trace.json")
+        # Include defense type in trace file name if defense is enabled
+        if self.mem0_memory_enabled:
+            if self.defense_type == "none":
+                defense_name = "no_defense"
+            else:
+                defense_name = self.defense_type
+            trace_filename = f"trace_defense_{defense_name}.json"
+        else:
+            trace_filename = "trace.json"
+        test_config["data"]["trace_file"] = str(traces_dir / trace_filename)
         test_config["data"]["memory_file"] = str(test_dir / "agent_memory.json")
+        
+        # Set test-specific mem0 vectorstore path if mem0 is enabled
+        if self.mem0_memory_enabled:
+            # Initialize memory section if it doesn't exist
+            if "memory" not in test_config:
+                test_config["memory"] = {}
+            if "mem0_memory" not in test_config["memory"]:
+                test_config["memory"]["mem0_memory"] = {}
+            test_config["memory"]["mem0_memory"]["vectorstore_path"] = str(mem0_vectorstore_dir)
+            # Ensure defense_type is set in test_config
+            if self.defense_type != "none":
+                test_config["memory"]["mem0_memory"]["defense_type"] = self.defense_type
         
         print(f"Created test environment: {test_dir}")
         return test_config
@@ -318,6 +655,8 @@ class TestBench:
         test_config = self.create_test_environment(test_name, initial_data)
         test_dir = Path(test_config["data"]["mailbox_dir"]).parent
 
+        # Debug: Print all initial mem0 memories loaded in the vectorstore
+        self._debug_print_initial_mem0_memories(test_config)
         
         try:
             # Generate unique session ID for this test - use test name hash for reproducibility
@@ -543,6 +882,9 @@ class TestBench:
                     }))
                     print(f"Duration: {duration:.2f}s")
                     
+                    # Print mem0 memories if enabled
+                    self._print_mem0_memories(test_config, user_message=step['user_message'])
+                    
                     # Run dual evaluation system (user_goal and attack_goal)
                     user_goal_passed = None
                     attack_goal_passed = None
@@ -554,6 +896,10 @@ class TestBench:
                     
                     if is_attack_bench and ("user_goal" in step or "attack_goal" in step):
                         # Dual evaluation system for attack benchmarks
+                        # Store step results and current step number in test_config for cross-step validators
+                        test_config["_step_results"] = step_results
+                        test_config["_current_step_num"] = i
+                        
                         if "user_goal" in step and step["user_goal"]:
                             try:
                                 user_goal_check = step["user_goal"]["success_check"]
@@ -562,13 +908,31 @@ class TestBench:
                                     # Use validate_with_print if it's a composite validator
                                     if isinstance(validator, CompositeValidator):
                                         print("\n🔍 User Goal Validator Results:")
-                                        user_goal_passed = validator.validate_with_print(response, session_id, step_traces)
+                                        trace_file = test_config.get("data", {}).get("trace_file") if isinstance(test_config.get("data"), dict) else None
+                                        user_goal_passed = validator.validate_with_print(response, session_id, step_traces, trace_file=trace_file)
                                     else:
                                         user_goal_passed = validator.validate(response, session_id, step_traces)
                                         # Print single validator result
                                         from agent.colored_trace_printer import print_validator_result
                                         validator_type = user_goal_check.get("type", "validator")
                                         print_validator_result(validator_type, "User goal", user_goal_passed)
+                                        # Log to trace
+                                        try:
+                                            from agent.utils import append_trace_event
+                                            trace_file = test_config.get("data", {}).get("trace_file") if isinstance(test_config.get("data"), dict) else None
+                                            if trace_file:
+                                                append_trace_event(
+                                                    trace_file,
+                                                    "validator_results",
+                                                    session_id,
+                                                    {
+                                                        "type": validator_type,
+                                                        "name": "User goal",
+                                                        "passed": user_goal_passed
+                                                    }
+                                                )
+                                        except Exception:
+                                            pass
                                 else:
                                     # String-based check function (legacy support)
                                     check_function = user_goal_check
@@ -590,13 +954,31 @@ class TestBench:
                                     # Use validate_with_print if it's a composite validator
                                     if isinstance(validator, CompositeValidator):
                                         print("\n🔍 Validator Results:")
-                                        attack_goal_passed = validator.validate_with_print(response, session_id, step_traces)
+                                        trace_file = test_config.get("data", {}).get("trace_file") if isinstance(test_config.get("data"), dict) else None
+                                        attack_goal_passed = validator.validate_with_print(response, session_id, step_traces, trace_file=trace_file)
                                     else:
                                         attack_goal_passed = validator.validate(response, session_id, step_traces)
                                         # Print single validator result
                                         from agent.colored_trace_printer import print_validator_result
                                         validator_type = attack_goal_check.get("type", "validator")
                                         print_validator_result(validator_type, "Attack goal", attack_goal_passed)
+                                        # Log to trace
+                                        try:
+                                            from agent.utils import append_trace_event
+                                            trace_file = test_config.get("data", {}).get("trace_file") if isinstance(test_config.get("data"), dict) else None
+                                            if trace_file:
+                                                append_trace_event(
+                                                    trace_file,
+                                                    "validator_results",
+                                                    session_id,
+                                                    {
+                                                        "type": validator_type,
+                                                        "name": "Attack goal",
+                                                        "passed": attack_goal_passed
+                                                    }
+                                                )
+                                        except Exception:
+                                            pass
                                     
                                     # compute partial score if available
                                     try:
@@ -634,12 +1016,41 @@ class TestBench:
                         step_passed = True
                         if "success_check" in step and step["success_check"]:
                             try:
+                                # Store step results and current step number in test_config for cross-step validators
+                                test_config["_step_results"] = step_results
+                                test_config["_current_step_num"] = i
+                                
                                 # Try new validator system first
                                 if isinstance(step["success_check"], dict):
                                     validator = create_validator(step["success_check"], test_config)
-                                    step_passed = validator.validate(response, session_id, step_traces)
-                                    status = "✓ PASSED" if step_passed else "✗ FAILED"
-                                    print(f"Validator Result: {status}")
+                                    # Use validate_with_print if it's a composite validator
+                                    if isinstance(validator, CompositeValidator):
+                                        print("\n🔍 Validator Results:")
+                                        trace_file = test_config.get("data", {}).get("trace_file") if isinstance(test_config.get("data"), dict) else None
+                                        step_passed = validator.validate_with_print(response, session_id, step_traces, trace_file=trace_file)
+                                    else:
+                                        step_passed = validator.validate(response, session_id, step_traces)
+                                        # Print single validator result
+                                        from agent.colored_trace_printer import print_validator_result
+                                        validator_type = step["success_check"].get("type", "validator")
+                                        print_validator_result(validator_type, "Success check", step_passed)
+                                        # Log to trace
+                                        try:
+                                            from agent.utils import append_trace_event
+                                            trace_file = test_config.get("data", {}).get("trace_file") if isinstance(test_config.get("data"), dict) else None
+                                            if trace_file:
+                                                append_trace_event(
+                                                    trace_file,
+                                                    "validator_results",
+                                                    session_id,
+                                                    {
+                                                        "type": validator_type,
+                                                        "name": "Success check",
+                                                        "passed": step_passed
+                                                    }
+                                                )
+                                        except Exception:
+                                            pass
                                 else:
                                     # String-based check function (legacy support)
                                     check_function = step["success_check"]
@@ -736,6 +1147,13 @@ class TestBench:
                 "test_environment": str(test_dir)
             }
             
+            # Add defense info if mem0 is enabled
+            if self.mem0_memory_enabled:
+                if self.defense_type == "none":
+                    test_result["defense_type"] = "no_defense"
+                else:
+                    test_result["defense_type"] = self.defense_type
+            
             # Save detailed result into model_name/attack_type/ structure
             model_name = self.model_name
             target_dir = self.results_dir / model_name / attack_type
@@ -744,7 +1162,15 @@ class TestBench:
             with open(result_file, 'w', encoding='utf-8') as f:
                 json.dump(test_result, f, indent=2, ensure_ascii=False)
             
+            # Calculate step statistics
+            total_steps = len(step_results)
+            passed_steps = sum(1 for s in step_results if s.get("passed") is True)
+            failed_steps = total_steps - passed_steps
+            
             print(f"\nTest Result: {'✓ PASSED' if all_passed else '✗ FAILED'}")
+            print(f"Steps Summary: {passed_steps}/{total_steps} steps passed")
+            if failed_steps > 0:
+                print(f"  - {passed_steps} passed, {failed_steps} failed")
             print(f"Result saved to: {result_file}")
             
             return test_result
@@ -801,7 +1227,7 @@ class TestBench:
             result_file = target_dir / f"{test_file.stem}.json"
             with open(result_file, 'w', encoding='utf-8') as f:
                 json.dump(result, f, indent=2, ensure_ascii=False)
-            print(f"\nAdaptive Test Result saved to: {result_file}")
+            print(f"Result saved to: {result_file}")
         except Exception as e:
             print(f"Warning: Failed to save adaptive test result: {e}")
         
@@ -813,7 +1239,7 @@ class TestBench:
     
     def _get_cached_test(self, test_file: Path) -> Optional[Path]:
         """Check if there's a cached version of the test with successful attacks."""
-        cache_file = self.cache_dir / test_file.relative_to(Path("data/benchmark/attack_bench"))
+        cache_file = self.cache_dir / test_file.relative_to(self.test_bench_dir)
         if cache_file.exists():
             return cache_file
         return None
@@ -830,6 +1256,9 @@ class TestBench:
         # Create test environment
         test_config = self.create_test_environment(test_name, initial_data)
         test_dir = Path(test_config["data"]["mailbox_dir"]).parent
+        
+        # Debug: Print all initial mem0 memories loaded in the vectorstore
+        self._debug_print_initial_mem0_memories(test_config)
         
         try:
             session_id = f"adaptive_{int(time.time()*1000)}"
@@ -1231,6 +1660,11 @@ class TestBench:
             # Get description from test_def
             description = test_def.get("description", "")
             
+            # Calculate step statistics
+            total_steps = len(step_results)
+            passed_steps = sum(1 for s in step_results if s.get("passed") is True)
+            failed_steps = total_steps - passed_steps
+            
             # Compile result
             result = {
                 "test_name": test_name,
@@ -1245,6 +1679,11 @@ class TestBench:
                 "optimization_used": optimization_used,
                 "adaptive_benchmark": True,
             }
+            
+            print(f"\nAdaptive Test Result: {'✓ PASSED' if all_passed else '✗ FAILED'}")
+            print(f"Steps Summary: {passed_steps}/{total_steps} steps passed")
+            if failed_steps > 0:
+                print(f"  - {passed_steps} passed, {failed_steps} failed")
             
             return result
             
@@ -1271,8 +1710,11 @@ class TestBench:
             duration = time.time() - start_time
             
             response = result["response"]
-            print(f"Agent Response: {response[:200]}...")
+            print(f"Agent Response: {response}")
             print(f"Duration: {duration:.2f}s")
+            
+            # Print mem0 memories if enabled
+            self._print_mem0_memories(test_config, user_message=step['user_message'])
             
             # Get traces for evaluation
             try:
@@ -1368,6 +1810,9 @@ class TestBench:
             except Exception as e:
                 # Ignore trace reading errors for regular steps
                 pass
+            
+            # Print mem0 memories if enabled
+            self._print_mem0_memories(test_config, user_message=step['user_message'])
             
             return {
                 "step": step_num,
@@ -1538,7 +1983,7 @@ class TestBench:
         print(f"💾 Caching successful attack for {test_file.name}")
         
         # Create cache directory structure
-        cache_file = self.cache_dir / test_file.relative_to(Path("data/benchmark/attack_bench"))
+        cache_file = self.cache_dir / test_file.relative_to(self.test_bench_dir)
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         
         # Load original test and update with optimized attacks
@@ -1578,9 +2023,9 @@ class TestBench:
         Intelligently discover test files from a path.
         If path is a file, return it. If path is a directory, find all JSON files recursively.
         """
-        # Map suite keywords to directories under attack_bench
+        # Map suite keywords to directories under the appropriate test_bench_dir
         if test_path in {"benign", "direct", "indirect"}:
-            test_path_obj = Path("data/benchmark/attack_bench") / test_path
+            test_path_obj = self.test_bench_dir / test_path
         else:
             test_path_obj = Path(test_path)
         

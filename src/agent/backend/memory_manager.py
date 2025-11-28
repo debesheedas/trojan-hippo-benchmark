@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from typing import List, Dict, Any
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 import threading
 
 
@@ -61,7 +61,7 @@ class MemoryManager:
             with open(self.memory_file, 'w', encoding='utf-8') as f:
                 json.dump({
                     "long_term": self.long_term,
-                    "last_updated": datetime.utcnow().isoformat()
+                    "last_updated": datetime.now(timezone.utc).isoformat()
                 }, f, indent=2, ensure_ascii=False)
         except IOError as e:
             print(f"Error saving memory file: {e}")

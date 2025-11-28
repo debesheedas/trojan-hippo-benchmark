@@ -3,11 +3,53 @@ Unified tools registry for the memory agent.
 Provides a single entry point for all agent tools (email and memory).
 """
 
-from typing import List, Optional
+from typing import List, Optional, Set
 from langchain.tools import BaseTool
 
 from agent.tool_specifications.email_tools import EmailToolsConfig, create_tools
 from agent.tool_specifications.memory_tools import create_memory_tools
+
+# Tool trust classification for defense mechanisms
+# Untrusted tools are those that read from untrusted data sources (inbox)
+UNTRUSTED_TOOLS: Set[str] = {
+    "read_all_emails",
+    "search_emails", 
+    "reply_to_email",
+    "forward_to_email"
+}
+
+# Trusted tools are those that don't read from untrusted sources
+TRUSTED_TOOLS: Set[str] = {
+    "compose_email",
+    "draft_email",
+    "update_memory"
+}
+
+
+def is_untrusted_tool(tool_name: str) -> bool:
+    """
+    Check if a tool is untrusted.
+    
+    Args:
+        tool_name: Name of the tool
+        
+    Returns:
+        True if the tool is untrusted, False otherwise
+    """
+    return tool_name in UNTRUSTED_TOOLS
+
+
+def is_trusted_tool(tool_name: str) -> bool:
+    """
+    Check if a tool is trusted.
+    
+    Args:
+        tool_name: Name of the tool
+        
+    Returns:
+        True if the tool is trusted, False otherwise
+    """
+    return tool_name in TRUSTED_TOOLS
 
 
 def create_all_tools(

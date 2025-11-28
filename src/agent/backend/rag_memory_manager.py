@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import threading
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 try:
     from langchain_openai import OpenAIEmbeddings
@@ -118,7 +118,7 @@ class RAGMemoryManager:
                     json.dump({
                         "documents": self.documents,
                         "chunk_counter": self._chunk_counter,
-                        "last_updated": datetime.utcnow().isoformat()
+                        "last_updated": datetime.now(timezone.utc).isoformat()
                     }, f, indent=2)
             except Exception as e:
                 print(f"Warning: Could not save vector store: {e}")
@@ -138,7 +138,7 @@ class RAGMemoryManager:
             # Create document with metadata
             doc_metadata = metadata or {}
             doc_metadata["chunk_id"] = self._chunk_counter
-            doc_metadata["timestamp"] = datetime.utcnow().isoformat()
+            doc_metadata["timestamp"] = datetime.now(timezone.utc).isoformat()
             
             doc = Document(page_content=text.strip(), metadata=doc_metadata)
             

@@ -24,6 +24,7 @@ class ColoredTracePrinter:
     ERROR = '\033[91m'  # Red
     INFO = '\033[90m'  # Dark gray
     META = '\033[95m'  # Magenta
+    PASSED_COLOR = '\033[92m'  # Green
     
     MAX_LENGTH = 400  # Maximum length for truncation
     
@@ -86,7 +87,7 @@ class ColoredTracePrinter:
                 if hasattr(last_msg, 'content') and last_msg.content:
                     content = str(last_msg.content)
                     if content.strip():
-                        content = self._truncate(content)
+                        # Don't truncate agent responses - show full content
                         return self._colorize(
                             f"🤖 Agent: {content}",
                             self.AGENT_RESPONSE
@@ -126,7 +127,7 @@ class ColoredTracePrinter:
                     elif hasattr(msg, 'content') and msg.content:
                         content = str(msg.content)
                         if content.strip():
-                            content = self._truncate(content)
+                            # Don't truncate agent responses - show full content
                             return self._colorize(
                                 f"🤖 Agent: {content}",
                                 self.AGENT_RESPONSE
@@ -157,7 +158,7 @@ class ColoredTracePrinter:
         
         elif event_type == 'agent_response':
             text = payload.get('text', '')
-            text = self._truncate(text)
+            # Don't truncate agent responses - show full content
             return self._colorize(
                 f"🤖 Agent: {text}",
                 self.AGENT_RESPONSE
@@ -198,6 +199,31 @@ class ColoredTracePrinter:
                     f"✅ Tool Result ({tool_name}): {outputs_str}",
                     self.TOOL_RESULT
                 )
+        
+        elif event_type == 'validator_results':
+            operator = payload.get('operator', 'AND')
+            overall_passed = payload.get('overall_passed', False)
+            validators = payload.get('validators', [])
+            
+            status_icon = "✓" if overall_passed else "✗"
+            status_text = "PASSED" if overall_passed else "FAILED"
+            status_color = self.PASSED_COLOR if overall_passed else self.ERROR
+            
+            result_lines = [
+                f"{status_color}{status_icon} Validator Results ({operator}): {status_text}{self.RESET}"
+            ]
+            
+            for v in validators:
+                v_type = v.get('type', 'unknown')
+                v_name = v.get('name', 'validator')
+                v_passed = v.get('passed', False)
+                v_icon = "✓" if v_passed else "✗"
+                v_color = self.PASSED_COLOR if v_passed else self.ERROR
+                result_lines.append(
+                    f"  {v_color}{v_icon}{self.RESET} [{v_type}] {v_name}: {'PASSED' if v_passed else 'FAILED'}"
+                )
+            
+            return "\n".join(result_lines)
         
         else:
             # Generic event
