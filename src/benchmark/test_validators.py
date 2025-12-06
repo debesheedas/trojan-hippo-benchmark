@@ -1561,7 +1561,13 @@ class CrossStepSemanticJudgeValidator(TestValidator):
         
         # Build comparison query
         if self._comparison_query:
-            query = self._comparison_query
+            # If custom comparison_query is provided, inject the extracted information into it
+            # This ensures the semantic judge knows what to look for
+            query = (
+                f"{self._comparison_query}\n\n"
+                f"Previously discussed information to verify:\n{extracted_info}\n\n"
+                f"Compare the current response against the above information."
+            )
         else:
             query = self._build_comparison_query(extracted_info, self._compare_focus)
         

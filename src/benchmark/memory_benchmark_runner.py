@@ -29,9 +29,9 @@ from benchmark.memory_metrics import evaluate_response, aggregate_metrics
 
 def run_memory_benchmark(
     test_cases: List[Dict[str, Any]],
-    config: Dict[str, Any],
+    config: Dict[str, Any]],
     use_rag_memory: bool = True,
-    use_simple_memory: bool = False,
+    use_explicit_memory: bool = False,
     output_dir: str = "data/benchmark/memory_benchmark_results",
     max_queries_per_case: Optional[int] = None
 ) -> Dict[str, Any]:
@@ -42,7 +42,7 @@ def run_memory_benchmark(
         test_cases: List of test case dictionaries
         config: Agent configuration dictionary
         use_rag_memory: Whether to use RAG memory
-        use_simple_memory: Whether to use simple memory
+        use_explicit_memory: Whether to use explicit memory
         output_dir: Directory to save results
         
     Returns:
@@ -60,8 +60,8 @@ def run_memory_benchmark(
         "vectorstore_path": "data/interactive_agent/rag_vectorstore"
     }
     
-    config["memory"]["simple_memory"] = {
-        "enabled": use_simple_memory,
+    config["memory"]["explicit_memory"] = {
+        "enabled": use_explicit_memory,
         "memory_file": "data/interactive_agent/agent_memory.json",
         "max_short_term": 15
     }
@@ -76,7 +76,7 @@ def run_memory_benchmark(
     print(f"\n{'='*80}")
     print(f"Running Memory Benchmark")
     print(f"RAG Memory: {'Enabled' if use_rag_memory else 'Disabled'}")
-    print(f"Simple Memory: {'Enabled' if use_simple_memory else 'Disabled'}")
+    print(f"Explicit Memory: {'Enabled' if use_explicit_memory else 'Disabled'}")
     print(f"Test Cases: {len(test_cases)}")
     print(f"{'='*80}\n")
     
@@ -146,9 +146,9 @@ def run_memory_benchmark(
                         f"This is a critical error. {error_msg}"
                     ) from e
             
-            if use_simple_memory:
-                # For simple memory, we could add a summary or key facts
-                # For now, we'll skip this as simple memory is more for user preferences
+            if use_explicit_memory:
+                # For explicit memory, we could add a summary or key facts
+                # For now, we'll skip this as explicit memory is more for user preferences
                 pass
         
         print(f"[Phase 1] Complete: {len(context_chunks)} chunks added to memory")
@@ -259,7 +259,7 @@ def run_memory_benchmark(
     benchmark_results = {
         "config": {
             "use_rag_memory": use_rag_memory,
-            "use_simple_memory": use_simple_memory,
+            "use_explicit_memory": use_explicit_memory,
             "num_test_cases": len(test_cases),
             "max_queries_per_case": max_queries_per_case,
             "total_queries": len(all_results)
@@ -271,7 +271,7 @@ def run_memory_benchmark(
     
     # Save results
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    memory_type = "rag" if use_rag_memory else "simple" if use_simple_memory else "none"
+    memory_type = "rag" if use_rag_memory else "explicit" if use_explicit_memory else "none"
     results_file = output_path / f"memory_benchmark_{memory_type}_{timestamp_str}.json"
     
     with open(results_file, 'w', encoding='utf-8') as f:
@@ -300,7 +300,7 @@ def main():
     """Main entry point for the benchmark runner."""
     parser = argparse.ArgumentParser(description="Run memory benchmark on email agent")
     parser.add_argument("--rag-memory", action="store_true", help="Enable RAG memory")
-    parser.add_argument("--simple-memory", action="store_true", help="Enable simple memory")
+    parser.add_argument("--explicit-memory", action="store_true", help="Enable explicit memory")
     parser.add_argument("--num-cases", type=int, default=5, help="Number of test cases to run")
     parser.add_argument("--max-queries-per-case", type=int, default=None,
                        help="Maximum number of queries to run per test case (default: all queries)")
@@ -412,7 +412,7 @@ def main():
         test_cases=test_cases,
         config=config,
         use_rag_memory=args.rag_memory,
-        use_simple_memory=args.simple_memory,
+        use_explicit_memory=args.explicit_memory,
         output_dir=args.output_dir,
         max_queries_per_case=args.max_queries_per_case
     )

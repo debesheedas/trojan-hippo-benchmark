@@ -56,7 +56,8 @@ def create_all_tools(
     email_config: EmailToolsConfig,
     memory_file: str = "data/interactive_agent/agent_memory.json",
     session_id: Optional[str] = None,
-    trace_file: str = "data/interactive_agent/trace.jsonl"
+    trace_file: str = "data/interactive_agent/trace.jsonl",
+    explicit_defense_type: str = "none"
 ) -> List[BaseTool]:
     """
     Create and return all available tools for the agent.
@@ -74,7 +75,7 @@ def create_all_tools(
     email_tools = create_tools(email_config)
     
     # Create memory tools
-    memory_tools = create_memory_tools(memory_file, session_id, trace_file)
+    memory_tools = create_memory_tools(memory_file, session_id, trace_file, explicit_defense_type=explicit_defense_type)
     
     # Combine all tools
     all_tools = email_tools + memory_tools

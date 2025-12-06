@@ -48,6 +48,7 @@ class Mem0DefenseManager:
                 - "disable_memory": Disable all memory indexing
                 - "user_only": Only index user messages
                 - "no_untrusted_tools": Only index when no untrusted tools called
+                - "limit_memory_length": Truncate extracted mem0 memories to a fixed length
             trace_file: Path to trace file for checking tool calls
         """
         self.defense_type = defense_type

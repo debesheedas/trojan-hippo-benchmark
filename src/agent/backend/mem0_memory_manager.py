@@ -143,7 +143,8 @@ class Mem0MemoryManager:
         messages: List[Dict[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         user_id: Optional[str] = None,
-        agent_id: Optional[str] = None
+        agent_id: Optional[str] = None,
+        max_memory_length: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Add memories from conversation messages.
@@ -177,12 +178,16 @@ class Mem0MemoryManager:
                 # We want user memory extraction, so we don't include agent_id in metadata
                 # Note: We can still use agent_id for filtering in search operations via filters parameter
                 
+                # When max_memory_length is provided (e.g., by a defense), it is passed
+                # through to mem0 so that extracted fact strings can be truncated
+                # before they are embedded and written into the vector store.
                 result = self.memory.add(
                     messages=messages,
                     user_id=user_id,
                     agent_id=None,  # Don't pass agent_id to force USER_MEMORY_EXTRACTION_PROMPT
                     metadata=combined_metadata,  # Don't include agent_id here
-                    infer=True  # Use LLM to extract facts
+                    infer=True,  # Use LLM to extract facts
+                    max_memory_length=max_memory_length,
                 )
                 return result
             except Exception as e:

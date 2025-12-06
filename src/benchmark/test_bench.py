@@ -40,7 +40,7 @@ from agent.colored_trace_printer import get_colored_printer
 class TestBench:
     """Pure-Python test bench for email agent."""
     
-    def __init__(self, config_path: str = "config.yaml"):
+    def __init__(self, config_path: str = "config.yaml", defense_type_override: Optional[str] = None):
         self.config = load_config(config_path)
         
         # Set global seed for reproducibility
@@ -55,17 +55,62 @@ class TestBench:
         
         # Determine which memory system is enabled
         memory_config = self.config.get("memory", {})
-        self.simple_memory_enabled = memory_config.get("simple_memory", {}).get("enabled", False)
+        self.explicit_memory_enabled = memory_config.get("explicit_memory", {}).get("enabled", False)
         mem0_config = memory_config.get("mem0_memory", {})
         self.mem0_memory_enabled = mem0_config.get("enabled", False)
         self.mem0_print_enabled = mem0_config.get("mem0_print", False)
+        rag_config = memory_config.get("rag_memory", {})
+        self.rag_memory_enabled = rag_config.get("enabled", False)
         
-        # Get defense type from config
-        self.defense_type = mem0_config.get("defense_type", "none")
+        # Get defense type from config, or use override if provided
+        if defense_type_override is not None:
+            self.defense_type = defense_type_override
+            # Also update the config in memory so it's used throughout
+            if "memory" not in self.config:
+                self.config["memory"] = {}
+            if self.rag_memory_enabled:
+                if "rag_memory" not in self.config["memory"]:
+                    self.config["memory"]["rag_memory"] = {}
+                self.config["memory"]["rag_memory"]["defense_type"] = defense_type_override
+            elif self.mem0_memory_enabled:
+                if "mem0_memory" not in self.config["memory"]:
+                    self.config["memory"]["mem0_memory"] = {}
+                self.config["memory"]["mem0_memory"]["defense_type"] = defense_type_override
+            elif self.explicit_memory_enabled:
+                if "explicit_memory" not in self.config["memory"]:
+                    self.config["memory"]["explicit_memory"] = {}
+                self.config["memory"]["explicit_memory"]["defense_type"] = defense_type_override
+        else:
+            # Get defense type from appropriate memory config
+            if self.rag_memory_enabled:
+                self.defense_type = rag_config.get("defense_type", "none")
+            elif self.mem0_memory_enabled:
+                self.defense_type = mem0_config.get("defense_type", "none")
+            elif self.explicit_memory_enabled:
+                explicit_cfg = memory_config.get("explicit_memory", {})
+                self.defense_type = explicit_cfg.get("defense_type", "none")
+            else:
+                self.defense_type = "none"
         
-        # Use different results directory for mem0 tests, with defense suffix
-        if self.mem0_memory_enabled:
+        # Use different results directory based on memory system
+        if self.rag_memory_enabled:
+            base_dir = Path("data/benchmark/test_bench_results_rag")
+            # Map "none" to "no_defense" for consistency
+            if self.defense_type == "none":
+                defense_folder = "no_defense"
+            else:
+                defense_folder = self.defense_type
+            self.results_dir = base_dir / f"defense_{defense_folder}"
+        elif self.mem0_memory_enabled:
             base_dir = Path("data/benchmark/test_bench_results_mem0")
+            # Map "none" to "no_defense" for consistency
+            if self.defense_type == "none":
+                defense_folder = "no_defense"
+            else:
+                defense_folder = self.defense_type
+            self.results_dir = base_dir / f"defense_{defense_folder}"
+        elif self.explicit_memory_enabled:
+            base_dir = Path("data/benchmark/test_bench_results_explicit")
             # Map "none" to "no_defense" for consistency
             if self.defense_type == "none":
                 defense_folder = "no_defense"
@@ -77,17 +122,20 @@ class TestBench:
         self.results_dir.mkdir(parents=True, exist_ok=True)
         
         # Determine test directory based on memory system
-        if self.simple_memory_enabled:
-            self.test_bench_dir = Path("data/benchmark/attack_bench")
-            self.memory_type = "simple"
+        if self.rag_memory_enabled:
+            self.test_bench_dir = Path("data/benchmark/attack_bench_rag")
+            self.memory_type = "rag"
+        elif self.explicit_memory_enabled:
+            self.test_bench_dir = Path("data/benchmark/attack_bench_explicit")
+            self.memory_type = "explicit"
         elif self.mem0_memory_enabled:
             self.test_bench_dir = Path("data/benchmark/attack_bench_mem0")
             self.memory_type = "mem0"
         else:
-            # Default to simple memory if neither is explicitly enabled
-            self.test_bench_dir = Path("data/benchmark/attack_bench")
-            self.memory_type = "simple"
-            print("⚠️ Warning: No memory system explicitly enabled. Defaulting to simple memory.")
+            # Default to explicit memory if neither is explicitly enabled
+            self.test_bench_dir = Path("data/benchmark/attack_bench_explicit")
+            self.memory_type = "explicit"
+            print("⚠️ Warning: No memory system explicitly enabled. Defaulting to explicit memory.")
         
         print(f"🧠 Memory System: {self.memory_type.upper()}")
         if self.mem0_memory_enabled:
@@ -141,6 +189,10 @@ class TestBench:
     def _debug_print_initial_mem0_memories(self, test_config: Dict[str, Any]):
         """Debug print: Print all initial mem0 memories loaded in the vectorstore at the start of a test case."""
         if not self.mem0_memory_enabled:
+            return
+        
+        # Skip debug printing if disable_memory defense is active
+        if self.defense_type == "disable_memory":
             return
         
         try:
@@ -222,6 +274,10 @@ class TestBench:
         if not (self.mem0_memory_enabled and self.mem0_print_enabled):
             return
         
+        # Skip printing if disable_memory defense is active
+        if self.defense_type == "disable_memory":
+            return
+        
         try:
             from agent.backend.mem0_memory_manager import get_mem0_memory_manager
             from agent.agent_core import _build_agent_prompt
@@ -273,7 +329,9 @@ class TestBench:
                     rag_context = ""
                     memory_config = test_config.get("memory", {})
                     rag_memory_enabled = memory_config.get("rag_memory", {}).get("enabled", False)
-                    if rag_memory_enabled:
+                    rag_defense_type = memory_config.get("rag_memory", {}).get("defense_type", "none")
+                    # Skip RAG context retrieval if disable_memory defense is active
+                    if rag_memory_enabled and rag_defense_type != "disable_memory":
                         try:
                             from agent.backend.rag_memory_manager import get_rag_memory_manager
                             rag_config = memory_config.get("rag_memory", {})
@@ -325,26 +383,26 @@ class TestBench:
                 from agent.agent_core import _build_agent_prompt
                 
                 memory_config = test_config.get("memory", {})
-                simple_memory_enabled = memory_config.get("simple_memory", {}).get("enabled", False)
+                explicit_memory_enabled = memory_config.get("explicit_memory", {}).get("enabled", False)
                 
-                # Load memory instructions if simple memory is enabled
+                # Load memory instructions if explicit memory is enabled
                 memory_instructions = ""
-                simple_memory_context = ""
-                if simple_memory_enabled:
+                explicit_memory_context = ""
+                if explicit_memory_enabled:
                     # Find memory_prompt.txt relative to agent_core.py location
                     agent_core_path = Path(__file__).parent.parent / "agent" / "memory_prompt.txt"
                     if agent_core_path.exists():
                         memory_instructions = agent_core_path.read_text(encoding="utf-8")
                     
-                    # Try to load simple memory context
+                    # Try to load explicit memory context
                     try:
                         from agent.backend.memory_manager import get_memory_manager
-                        memory_file = memory_config.get("simple_memory", {}).get("memory_file", 
+                        memory_file = memory_config.get("explicit_memory", {}).get("memory_file", 
                             test_config.get("data", {}).get("memory_file", "data/interactive_agent/agent_memory.json"))
                         memory_manager = get_memory_manager(memory_file=memory_file, force_new=True)
-                        simple_memory_context = memory_manager.get_long_term_as_text()
+                        explicit_memory_context = memory_manager.get_long_term_as_text()
                     except Exception:
-                        simple_memory_context = ""
+                        explicit_memory_context = ""
                 
                 print("\n📋 System Prompt (Memory-Related Sections):")
                 print("=" * 80)
@@ -353,10 +411,10 @@ class TestBench:
                     print("-" * 80)
                     print(memory_instructions)
                     print("-" * 80)
-                if simple_memory_context:
-                    print("\n[Simple Memory Context Section]")
+                if explicit_memory_context:
+                    print("\n[Explicit Memory Context Section]")
                     print("-" * 80)
-                    print(simple_memory_context)
+                    print(explicit_memory_context)
                     print("-" * 80)
             except Exception as e:
                 print(f"\n⚠️ Warning: Could not print system prompt: {e}")
@@ -415,10 +473,11 @@ class TestBench:
         sessions_dir = test_dir / "sessions"
         traces_dir = test_dir / "traces"
         mem0_vectorstore_dir = test_dir / "mem0_vectorstore"
+        rag_vectorstore_dir = test_dir / "rag_vectorstore"
         
+        # Create directories (but NOT mem0_vectorstore_dir or rag_vectorstore_dir - let loaders create them)
+        # This prevents false warnings about the directory already existing
         dirs_to_create = [inbox_dir, outbox_dir, drafts_dir, sessions_dir, traces_dir]
-        if self.mem0_memory_enabled:
-            dirs_to_create.append(mem0_vectorstore_dir)
         
         for dir_path in dirs_to_create:
             dir_path.mkdir(exist_ok=True)
@@ -476,52 +535,116 @@ class TestBench:
                     shutil.copy2(email_file, inbox_dir)
         
         # Initialize memory based on which system is enabled
-        if self.mem0_memory_enabled:
+        if self.rag_memory_enabled:
+            # Initialize RAG memory vectorstore
+            # Skip loading initial memory set if disable_memory defense is active
+            if self.defense_type == "disable_memory":
+                print(f"🛡️ Defense 'disable_memory' active - skipping initial RAG memory set loading")
+            else:
+                rag_memory_set = None
+                if initial_data:
+                    rag_memory_set = initial_data.get("rag_memory_set")
+                    if not rag_memory_set and "memory_set" in initial_data:
+                        # Fallback: convert memory_set to rag_memory_set
+                        memory_set_name = initial_data["memory_set"]
+                        if memory_set_name.startswith("memory_set_"):
+                            rag_memory_set = memory_set_name.replace("memory_set_", "rag_memory_set_", 1)
+                        else:
+                            rag_memory_set = f"rag_{memory_set_name}"
+                
+                if not rag_memory_set:
+                    rag_memory_set = "rag_memory_set_0"
+                
+                # Load initial RAG memory set from pre-processed data
+                try:
+                    from benchmark.rag_memory_loader import load_rag_memory_set
+                    
+                    # Create temporary config for loading
+                    vectorstore_path_str = str(rag_vectorstore_dir)
+                    temp_config = self.config.copy()
+                    temp_config["memory"]["rag_memory"]["vectorstore_path"] = vectorstore_path_str
+                    
+                    # Load RAG memory set - each test has a unique directory, so no clearing needed
+                    # force_new=True ensures a fresh vectorstore for each test
+                    chunks_loaded = load_rag_memory_set(
+                        rag_memory_set=rag_memory_set,
+                        config=temp_config,
+                        vectorstore_path=vectorstore_path_str,
+                        force_new=True
+                    )
+                    print(f"✅ Loaded RAG memory set: {rag_memory_set} ({chunks_loaded} chunks)")
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not load RAG memory set '{rag_memory_set}': {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Still create empty memory file for compatibility
+            empty_memory = {"long_term": []}
+            with open(test_dir / "agent_memory.json", 'w', encoding='utf-8') as f:
+                json.dump(empty_memory, f, indent=2)
+        elif self.mem0_memory_enabled:
             # Initialize mem0 memory vectorstore
-            mem0_memory_set = None
-            if initial_data:
-                mem0_memory_set = initial_data.get("mem0_memory_set")
-                if not mem0_memory_set and "memory_set" in initial_data:
-                    # Fallback: convert memory_set to mem0_memory_set
-                    memory_set_name = initial_data["memory_set"]
-                    if memory_set_name.startswith("memory_set_"):
-                        mem0_memory_set = memory_set_name.replace("memory_set_", "mem0_memory_set_", 1)
-                    else:
-                        mem0_memory_set = f"mem0_{memory_set_name}"
-            
-            if not mem0_memory_set:
-                mem0_memory_set = "mem0_memory_set_0"
-            
-            # Load initial mem0 memory set from pre-processed vectorstore
-            try:
-                from benchmark.mem0_memory_loader import load_mem0_memory_set
-                # Create temporary config for loading
-                temp_config = self.config.copy()
-                temp_config["memory"]["mem0_memory"]["vectorstore_path"] = str(mem0_vectorstore_dir)
-                # Use force_new=False to use existing vectorstore if it exists
-                # The loader will copy from initial_mem0_memory if needed
-                load_mem0_memory_set(
-                    mem0_memory_set=mem0_memory_set,
-                    config=temp_config,
-                    vectorstore_path=str(mem0_vectorstore_dir),
-                    force_new=False  # Use existing vectorstore if available
-                )
-                print(f"✅ Loaded mem0 memory set: {mem0_memory_set}")
-            except Exception as e:
-                print(f"⚠️ Warning: Could not load mem0 memory set '{mem0_memory_set}': {e}")
-                import traceback
-                traceback.print_exc()
+            # Skip loading initial memory set if disable_memory defense is active
+            if self.defense_type == "disable_memory":
+                print(f"🛡️ Defense 'disable_memory' active - skipping initial mem0 memory set loading")
+            else:
+                mem0_memory_set = None
+                if initial_data:
+                    mem0_memory_set = initial_data.get("mem0_memory_set")
+                    if not mem0_memory_set and "memory_set" in initial_data:
+                        # Fallback: convert memory_set to mem0_memory_set
+                        memory_set_name = initial_data["memory_set"]
+                        if memory_set_name.startswith("memory_set_"):
+                            mem0_memory_set = memory_set_name.replace("memory_set_", "mem0_memory_set_", 1)
+                        else:
+                            mem0_memory_set = f"mem0_{memory_set_name}"
+                
+                if not mem0_memory_set:
+                    mem0_memory_set = "mem0_memory_set_0"
+                
+                # Load initial mem0 memory set from pre-processed vectorstore
+                try:
+                    from benchmark.mem0_memory_loader import load_mem0_memory_set
+                    from agent.backend.mem0_memory_manager import _mem0_manager_cache
+                    
+                    # Clear manager cache for this vectorstore path to ensure fresh manager
+                    # (Each test gets a unique directory, but cache might have old entries)
+                    vectorstore_path_str = str(mem0_vectorstore_dir)
+                    if vectorstore_path_str in _mem0_manager_cache:
+                        del _mem0_manager_cache[vectorstore_path_str]
+                        print(f"🧹 Cleared mem0 manager cache for: {vectorstore_path_str}")
+                    
+                    # Create temporary config for loading
+                    temp_config = self.config.copy()
+                    temp_config["memory"]["mem0_memory"]["vectorstore_path"] = vectorstore_path_str
+                    
+                    # Load mem0 memory set - each test has a unique directory, so no clearing needed
+                    # The loader will simply copy from source to this unique test directory
+                    load_mem0_memory_set(
+                        mem0_memory_set=mem0_memory_set,
+                        config=temp_config,
+                        vectorstore_path=vectorstore_path_str
+                    )
+                    print(f"✅ Loaded mem0 memory set: {mem0_memory_set}")
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not load mem0 memory set '{mem0_memory_set}': {e}")
+                    import traceback
+                    traceback.print_exc()
             
             # Still create empty memory file for compatibility
             empty_memory = {"long_term": []}
             with open(test_dir / "agent_memory.json", 'w', encoding='utf-8') as f:
                 json.dump(empty_memory, f, indent=2)
         else:
-            # Initialize simple memory (original behavior)
+            # Initialize explicit (previously simple) memory
             if initial_data and "memory_set" in initial_data:
                 # Copy from specified memory set
                 memory_set = initial_data["memory_set"]
-                source_memory = Path(f"data/benchmark/initial_memory/{memory_set}.json")
+                if self.explicit_memory_enabled:
+                    base_dir = Path("data/benchmark/initial_explicit_memory")
+                else:
+                    base_dir = Path("data/benchmark/initial_memory")
+                source_memory = base_dir / f"{memory_set}.json"
                 if source_memory.exists():
                     shutil.copy2(source_memory, test_dir / "agent_memory.json")
                 else:
@@ -569,8 +692,12 @@ class TestBench:
         test_config["data"]["outbox_dir"] = str(outbox_dir)
         test_config["data"]["drafts_dir"] = str(drafts_dir)
         test_config["data"]["sessions_dir"] = str(sessions_dir)
+        # Set vectorstore path and defense type for RAG memory if enabled
+        if self.rag_memory_enabled:
+            test_config["memory"]["rag_memory"]["vectorstore_path"] = str(rag_vectorstore_dir)
+            test_config["memory"]["rag_memory"]["defense_type"] = self.defense_type
         # Include defense type in trace file name if defense is enabled
-        if self.mem0_memory_enabled:
+        if self.rag_memory_enabled or self.mem0_memory_enabled:
             if self.defense_type == "none":
                 defense_name = "no_defense"
             else:
@@ -580,6 +707,13 @@ class TestBench:
             trace_filename = "trace.json"
         test_config["data"]["trace_file"] = str(traces_dir / trace_filename)
         test_config["data"]["memory_file"] = str(test_dir / "agent_memory.json")
+        # Ensure explicit_memory (simple/explicit memory model) uses the test-specific memory file
+        if self.explicit_memory_enabled:
+            if "memory" not in test_config:
+                test_config["memory"] = {}
+            if "explicit_memory" not in test_config["memory"]:
+                test_config["memory"]["explicit_memory"] = {}
+            test_config["memory"]["explicit_memory"]["memory_file"] = test_config["data"]["memory_file"]
         
         # Set test-specific mem0 vectorstore path if mem0 is enabled
         if self.mem0_memory_enabled:
@@ -2222,10 +2356,11 @@ def main():
     parser.add_argument("--test", type=str, nargs="+", help="Run specific test file(s) or directory(ies). Can specify multiple paths separated by spaces.")
     parser.add_argument("--suite", type=str, choices=["benign", "direct", "indirect"], help="Shortcut to run an entire suite under data/benchmark/attack_bench/<suite>.")
     parser.add_argument("--config", type=str, default="config.yaml", help="Config file")
+    parser.add_argument("--defense-type", type=str, help="Override defense_type from config (e.g., 'none', 'user_only', 'no_untrusted_tools', 'disable_memory'). This allows parallel runs without modifying the global config file.")
     
     args = parser.parse_args()
     
-    bench = TestBench(args.config)
+    bench = TestBench(args.config, defense_type_override=args.defense_type)
     
     try:
         if args.test or args.suite:
