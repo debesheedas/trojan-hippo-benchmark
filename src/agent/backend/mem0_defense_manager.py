@@ -7,26 +7,7 @@ Manages defense mechanisms for mem0 memory indexing:
 3. no_untrusted_tools: Only index when no untrusted tools have been called in the session
 """
 
-from typing import List, Dict, Any, Optional, Set
-from pathlib import Path
-from agent.utils import read_trace_events
-
-
-# Define trusted and untrusted tools
-# Untrusted tools are those that read from untrusted data sources (inbox)
-UNTRUSTED_TOOLS: Set[str] = {
-    "read_all_emails",
-    "search_emails", 
-    "reply_to_email",
-    "forward_to_email"
-}
-
-# Trusted tools are those that don't read from untrusted sources
-TRUSTED_TOOLS: Set[str] = {
-    "compose_email",
-    "draft_email",
-    "update_memory"
-}
+from typing import List, Dict, Any, Optional
 
 
 class Mem0DefenseManager:
@@ -37,7 +18,7 @@ class Mem0DefenseManager:
     def __init__(
         self,
         defense_type: str = "none",
-        trace_file: Optional[str] = None
+        trace_file: Optional[str] = None  # Kept for backward compatibility, but not used
     ):
         """
         Initialize the defense manager.
@@ -49,16 +30,9 @@ class Mem0DefenseManager:
                 - "user_only": Only index user messages
                 - "no_untrusted_tools": Only index when no untrusted tools called
                 - "limit_memory_length": Truncate extracted mem0 memories to a fixed length
-            trace_file: Path to trace file for checking tool calls
+            trace_file: Deprecated - kept for backward compatibility only
         """
         self.defense_type = defense_type
-        self.trace_file = trace_file
-        # Session trust variable: tracks whether untrusted tools have been called
-        # - If session_id not in dict: session is TRUSTED (no untrusted tools called yet)
-        # - If session_id in dict with value True: session is NOT TRUSTED (untrusted tool was called)
-        # This acts as a session-level trust variable that starts as True (trusted) and
-        # gets set to False (not trusted) when an untrusted tool is detected
-        self._session_untrusted_tool_called: Dict[str, bool] = {}  # Track per session
         
     def should_index_memory(
         self,
@@ -87,8 +61,9 @@ class Mem0DefenseManager:
         
         # Defense 3: No untrusted tools
         if self.defense_type == "no_untrusted_tools":
-            # Check if any untrusted tool has been called in this session
-            if self._has_untrusted_tool_been_called(session_id):
+            # Check session trust status using SessionTrustManager
+            from agent.agent_core import SessionTrustManager
+            if not SessionTrustManager.is_trusted(session_id):
                 return False
             return True
         
@@ -120,69 +95,6 @@ class Mem0DefenseManager:
         # Other defenses don't filter messages
         return messages
     
-    def _has_untrusted_tool_been_called(self, session_id: str) -> bool:
-        """
-        Check if any untrusted tool has been called in this session.
-        
-        Args:
-            session_id: Session identifier
-            
-        Returns:
-            True if an untrusted tool has been called, False otherwise
-        """
-        # Check cache first
-        if session_id in self._session_untrusted_tool_called:
-            return self._session_untrusted_tool_called[session_id]
-        
-        # If no trace file, assume no untrusted tools called
-        if not self.trace_file:
-            return False
-        
-        # Read trace events for this session
-        try:
-            trace_events = read_trace_events(self.trace_file, session_id)
-            
-            # Check for any tool_call events with untrusted tools
-            for event in trace_events:
-                if event.get("event_type") == "tool_call":
-                    payload = event.get("payload", {})
-                    tool_name = payload.get("tool_name", "")
-                    
-                    # Check if this is an untrusted tool
-                    if tool_name in UNTRUSTED_TOOLS:
-                        # Cache the result
-                        self._session_untrusted_tool_called[session_id] = True
-                        return True
-        except Exception as e:
-            print(f"Warning: Could not check trace events for untrusted tools: {e}")
-        
-        # Cache negative result
-        self._session_untrusted_tool_called[session_id] = False
-        return False
-    
-    def record_tool_call(self, session_id: str, tool_name: str):
-        """
-        Record a tool call for defense tracking.
-        This can be called directly when a tool is invoked to avoid reading trace files.
-        Sets the session trust variable to False (not trusted) when an untrusted tool is called.
-        
-        Args:
-            session_id: Session identifier
-            tool_name: Name of the tool that was called
-        """
-        if tool_name in UNTRUSTED_TOOLS:
-            # Set session trust to False (not trusted) when untrusted tool is detected
-            self._session_untrusted_tool_called[session_id] = True
-    
-    def reset_session(self, session_id: str):
-        """
-        Reset defense state for a session.
-        
-        Args:
-            session_id: Session identifier
-        """
-        if session_id in self._session_untrusted_tool_called:
-            del self._session_untrusted_tool_called[session_id]
 
 
 # Global defense manager cache (per session)

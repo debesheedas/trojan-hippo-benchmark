@@ -151,8 +151,41 @@ class RAGMemoryManager:
                 self.vectorstore.add_documents([doc])
             
             # Store document reference
-            self.documents.append(text.strip())
+            chunk_text = text.strip()
+            self.documents.append(chunk_text)
             self._chunk_counter += 1
+            
+            # Track recent chunks for efficient validation
+            # Store in a file in the test directory (if vectorstore_path is in a test directory)
+            if self.vectorstore_path:
+                try:
+                    vectorstore_path_obj = Path(self.vectorstore_path)
+                    # Check if this is a test directory (contains "test_env" or "rag_vectorstore" in test_envs)
+                    if "test_env" in str(vectorstore_path_obj) or "test_envs" in str(vectorstore_path_obj):
+                        # Get the test directory (parent of rag_vectorstore)
+                        test_dir = vectorstore_path_obj.parent
+                        recent_chunks_file = test_dir / "rag_recent_chunks.json"
+                        
+                        # Read existing recent chunks
+                        recent_chunks = []
+                        if recent_chunks_file.exists():
+                            try:
+                                import json
+                                with open(recent_chunks_file, 'r', encoding='utf-8') as f:
+                                    recent_chunks = json.load(f)
+                            except Exception:
+                                recent_chunks = []
+                        
+                        # Add new chunk
+                        recent_chunks.append(chunk_text)
+                        
+                        # Write back (keep only recent chunks, limit to last 100 to avoid file bloat)
+                        recent_chunks = recent_chunks[-100:]
+                        with open(recent_chunks_file, 'w', encoding='utf-8') as f:
+                            json.dump(recent_chunks, f, indent=2, ensure_ascii=False)
+                except Exception:
+                    # Silently fail if we can't write recent chunks (not critical)
+                    pass
             
             # Save if path is configured
             if self.vectorstore_path:

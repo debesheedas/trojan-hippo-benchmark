@@ -35,13 +35,41 @@ from agent.agent_core import invoke_agent, clear_session_agent, clear_agent_cach
 from agent.utils import read_trace_events, load_config, ensure_data_directories, set_global_seeds
 from benchmark.test_validators import create_validator, CompositeValidator
 from agent.colored_trace_printer import get_colored_printer
+from benchmark.memory_backend import get_memory_backend_registry
+from benchmark.defense_backend import get_defense_backend_registry
+from benchmark.benchmark_utils import (
+    get_memory_backend_from_config,
+    get_unified_defense_from_config,
+    get_result_path,
+    should_skip_test,
+    create_isolated_test_dir
+)
 
 
 class TestBench:
     """Pure-Python test bench for email agent."""
     
-    def __init__(self, config_path: str = "config.yaml", defense_type_override: Optional[str] = None):
-        self.config = load_config(config_path)
+    def __init__(self, config_path: Optional[str] = None, config: Optional[Dict[str, Any]] = None, defense_type_override: Optional[str] = None, force: bool = False):
+        """
+        Initialize TestBench.
+        
+        Args:
+            config_path: Path to config YAML file (mutually exclusive with config)
+            config: Config dictionary (mutually exclusive with config_path)
+            defense_type_override: Override defense type from config
+            force: Force overwrite existing results
+        """
+        if config_path is not None and config is not None:
+            raise ValueError("Cannot specify both config_path and config")
+        if config_path is None and config is None:
+            config_path = "config.yaml"  # Default to config.yaml
+        
+        if config is not None:
+            self.config = config
+        elif config_path is not None:
+            self.config = load_config(config_path)
+        else:
+            raise ValueError("Must specify either config_path or config")
         
         # Set global seed for reproducibility
         global_seed = self.config.get("seed", 42)
@@ -52,99 +80,86 @@ class TestBench:
         if not self.model_name:
             raise ValueError("Config missing agent.target_model_name. Please set it in config.yaml.")
         self.test_dirs = []  # Track test directories for cleanup
+        self.force = force  # Force overwrite existing results
         
-        # Determine which memory system is enabled
+        # Get memory backend from config
+        memory_config = self.config.get("memory", {})
+        backend_from_config = memory_config.get("backend")
+        
+        # Handle no memory backend: if backend is "none"
+        if backend_from_config == "none":
+            self.memory_backend_name = "none"
+            self.memory_backend = None  # No backend when memory is disabled
+            self.unified_defense = "none"  # No memory = no defense
+            # Disable all memory backends
+            for backend_name in ["explicit", "mem0", "rag"]:
+                if backend_name not in memory_config:
+                    memory_config[backend_name] = {}
+                memory_config[backend_name]["enabled"] = False
+        else:
+            # Get memory backend from config
+            self.memory_backend_name = get_memory_backend_from_config(self.config)
+            memory_registry = get_memory_backend_registry()
+            self.memory_backend = memory_registry.create(self.memory_backend_name, self.config)
+            
+            # Get unified defense type
+            if defense_type_override is not None:
+                self.unified_defense = defense_type_override
+                # Update config with override
+                memory_config = self.config.get("memory", {})
+                if self.memory_backend_name == "explicit":
+                    if "explicit_memory" not in memory_config:
+                        memory_config["explicit_memory"] = {}
+                    memory_config["explicit_memory"]["defense_type"] = defense_type_override
+                elif self.memory_backend_name == "mem0":
+                    if "mem0_memory" not in memory_config:
+                        memory_config["mem0_memory"] = {}
+                    memory_config["mem0_memory"]["defense_type"] = defense_type_override
+                elif self.memory_backend_name == "rag":
+                    if "rag_memory" not in memory_config:
+                        memory_config["rag_memory"] = {}
+                    memory_config["rag_memory"]["defense_type"] = defense_type_override
+            else:
+                self.unified_defense = get_unified_defense_from_config(self.config, self.memory_backend_name)
+        
+        # Map unified defense to backend-specific defense
+        if self.memory_backend_name == "none":
+            # No memory backend = no defense
+            self.backend_defense = "none"
+        else:
+            defense_registry = get_defense_backend_registry()
+            self.backend_defense = defense_registry.map_defense(self.memory_backend_name, self.unified_defense)
+        
+        # For backward compatibility, maintain old flags
         memory_config = self.config.get("memory", {})
         self.explicit_memory_enabled = memory_config.get("explicit_memory", {}).get("enabled", False)
         mem0_config = memory_config.get("mem0_memory", {})
         self.mem0_memory_enabled = mem0_config.get("enabled", False)
         self.mem0_print_enabled = mem0_config.get("mem0_print", False)
-        rag_config = memory_config.get("rag_memory", {})
-        self.rag_memory_enabled = rag_config.get("enabled", False)
+        self.rag_memory_enabled = memory_config.get("rag_memory", {}).get("enabled", False)
+        self.defense_type = self.backend_defense  # For backward compatibility
         
-        # Get defense type from config, or use override if provided
-        if defense_type_override is not None:
-            self.defense_type = defense_type_override
-            # Also update the config in memory so it's used throughout
-            if "memory" not in self.config:
-                self.config["memory"] = {}
-            if self.rag_memory_enabled:
-                if "rag_memory" not in self.config["memory"]:
-                    self.config["memory"]["rag_memory"] = {}
-                self.config["memory"]["rag_memory"]["defense_type"] = defense_type_override
-            elif self.mem0_memory_enabled:
-                if "mem0_memory" not in self.config["memory"]:
-                    self.config["memory"]["mem0_memory"] = {}
-                self.config["memory"]["mem0_memory"]["defense_type"] = defense_type_override
-            elif self.explicit_memory_enabled:
-                if "explicit_memory" not in self.config["memory"]:
-                    self.config["memory"]["explicit_memory"] = {}
-                self.config["memory"]["explicit_memory"]["defense_type"] = defense_type_override
-        else:
-            # Get defense type from appropriate memory config
-            if self.rag_memory_enabled:
-                self.defense_type = rag_config.get("defense_type", "none")
-            elif self.mem0_memory_enabled:
-                self.defense_type = mem0_config.get("defense_type", "none")
-            elif self.explicit_memory_enabled:
-                explicit_cfg = memory_config.get("explicit_memory", {})
-                self.defense_type = explicit_cfg.get("defense_type", "none")
-            else:
-                self.defense_type = "none"
+        # Unified results directory structure
+        # Note: results_dir is set by run_benchmark.py from command line args
+        # If not set, use hardcoded default (not from config to avoid conflicts)
+        benchmark_config = self.config.get("benchmark", {})
+        results_base_dir = Path(benchmark_config.get("results_dir", "data/benchmark/results"))
+        self.results_base_dir = results_base_dir
+        self.results_base_dir.mkdir(parents=True, exist_ok=True)
         
-        # Use different results directory based on memory system
-        if self.rag_memory_enabled:
-            base_dir = Path("data/benchmark/test_bench_results_rag")
-            # Map "none" to "no_defense" for consistency
-            if self.defense_type == "none":
-                defense_folder = "no_defense"
-            else:
-                defense_folder = self.defense_type
-            self.results_dir = base_dir / f"defense_{defense_folder}"
-        elif self.mem0_memory_enabled:
-            base_dir = Path("data/benchmark/test_bench_results_mem0")
-            # Map "none" to "no_defense" for consistency
-            if self.defense_type == "none":
-                defense_folder = "no_defense"
-            else:
-                defense_folder = self.defense_type
-            self.results_dir = base_dir / f"defense_{defense_folder}"
-        elif self.explicit_memory_enabled:
-            base_dir = Path("data/benchmark/test_bench_results_explicit")
-            # Map "none" to "no_defense" for consistency
-            if self.defense_type == "none":
-                defense_folder = "no_defense"
-            else:
-                defense_folder = self.defense_type
-            self.results_dir = base_dir / f"defense_{defense_folder}"
-        else:
-            self.results_dir = Path("data/benchmark/test_bench_results")
-        self.results_dir.mkdir(parents=True, exist_ok=True)
+        # Unified test directory
+        test_dir = benchmark_config.get("test_dir", "data/benchmark/tests")
+        self.test_bench_dir = Path(test_dir)
         
-        # Determine test directory based on memory system
-        if self.rag_memory_enabled:
-            self.test_bench_dir = Path("data/benchmark/attack_bench_rag")
-            self.memory_type = "rag"
-        elif self.explicit_memory_enabled:
-            self.test_bench_dir = Path("data/benchmark/attack_bench_explicit")
-            self.memory_type = "explicit"
-        elif self.mem0_memory_enabled:
-            self.test_bench_dir = Path("data/benchmark/attack_bench_mem0")
-            self.memory_type = "mem0"
-        else:
-            # Default to explicit memory if neither is explicitly enabled
-            self.test_bench_dir = Path("data/benchmark/attack_bench_explicit")
-            self.memory_type = "explicit"
-            print("⚠️ Warning: No memory system explicitly enabled. Defaulting to explicit memory.")
+        # For backward compatibility (used by some old code paths)
+        self.memory_type = self.memory_backend_name
         
-        print(f"🧠 Memory System: {self.memory_type.upper()}")
-        if self.mem0_memory_enabled:
-            if self.defense_type == "none":
-                print(f"🛡️ Defense: no_defense")
-            else:
-                print(f"🛡️ Defense: {self.defense_type}")
+        print(f"🧠 Memory Backend: {self.memory_backend_name.upper()}")
+        print(f"🛡️ Defense: {self.unified_defense} (backend: {self.backend_defense})")
         print(f"📁 Test Directory: {self.test_bench_dir}")
-        print(f"📊 Results Directory: {self.results_dir}")
+        print(f"📊 Results Directory: {self.results_base_dir}")
+        if self.force:
+            print(f"⚡ Force mode: Will overwrite existing results")
         
         # Check if adaptive benchmark is enabled
         self.adaptive_enabled = self.config.get("benchmark", {}).get("enable_adaptive_benchmark", False)
@@ -191,8 +206,8 @@ class TestBench:
         if not self.mem0_memory_enabled:
             return
         
-        # Skip debug printing if disable_memory defense is active
-        if self.defense_type == "disable_memory":
+        # Skip debug printing if no memory backend is enabled
+        if self.memory_backend_name == "none":
             return
         
         try:
@@ -274,8 +289,8 @@ class TestBench:
         if not (self.mem0_memory_enabled and self.mem0_print_enabled):
             return
         
-        # Skip printing if disable_memory defense is active
-        if self.defense_type == "disable_memory":
+        # Skip printing if no memory backend is enabled
+        if self.memory_backend_name == "none":
             return
         
         try:
@@ -330,8 +345,8 @@ class TestBench:
                     memory_config = test_config.get("memory", {})
                     rag_memory_enabled = memory_config.get("rag_memory", {}).get("enabled", False)
                     rag_defense_type = memory_config.get("rag_memory", {}).get("defense_type", "none")
-                    # Skip RAG context retrieval if disable_memory defense is active
-                    if rag_memory_enabled and rag_defense_type != "disable_memory":
+                    # Skip RAG context retrieval if no memory backend is enabled
+                    if rag_memory_enabled and self.memory_backend_name != "none" and rag_defense_type != "disable_memory":
                         try:
                             from agent.backend.rag_memory_manager import get_rag_memory_manager
                             rag_config = memory_config.get("rag_memory", {})
@@ -453,17 +468,17 @@ class TestBench:
         """
         Create an isolated test environment with specified initial data.
         
+        Uses memory backend for unified memory initialization.
+        
         Args:
             test_name: Name of the test (for logging)
-            initial_data: Dict with keys 'inbox_set', 'outbox_set', 'drafts_set', 'memory_set', 'session_set'
+            initial_data: Dict with keys 'inbox_set', 'outbox_set', 'drafts_set', 'memory' (unified format), 'session_set'
         
         Returns:
             Config dict with test-specific paths.
         """
-        # Create unique test directory
-        test_id = str(uuid.uuid4())[:8]
-        test_dir = Path(f"test_env_{test_id}")
-        test_dir.mkdir(exist_ok=True)
+        # Create isolated test directory with unique name (PID + timestamp for parallel execution)
+        test_dir = create_isolated_test_dir(test_name)
         self.test_dirs.append(test_dir)
         
         # Create subdirectories
@@ -487,7 +502,7 @@ class TestBench:
             # Copy inbox data
             if "inbox_set" in initial_data:
                 inbox_set = initial_data["inbox_set"]
-                source_inbox = Path(f"data/benchmark/initial_inbox/{inbox_set}")
+                source_inbox = Path(f"data/benchmark/initial_environment/initial_inbox/{inbox_set}")
                 if source_inbox.exists():
                     for email_file in source_inbox.glob("*.json"):
                         shutil.copy2(email_file, inbox_dir)
@@ -497,7 +512,7 @@ class TestBench:
             # Copy outbox data
             if "outbox_set" in initial_data:
                 outbox_set = initial_data["outbox_set"]
-                source_outbox = Path(f"data/benchmark/initial_outbox/{outbox_set}")
+                source_outbox = Path(f"data/benchmark/initial_environment/initial_outbox/{outbox_set}")
                 if source_outbox.exists():
                     for email_file in source_outbox.glob("*.json"):
                         shutil.copy2(email_file, outbox_dir)
@@ -507,7 +522,7 @@ class TestBench:
             # Copy drafts data
             if "drafts_set" in initial_data:
                 drafts_set = initial_data["drafts_set"]
-                source_drafts = Path(f"data/benchmark/initial_drafts/{drafts_set}")
+                source_drafts = Path(f"data/benchmark/initial_environment/initial_drafts/{drafts_set}")
                 if source_drafts.exists():
                     for email_file in source_drafts.glob("*.json"):
                         shutil.copy2(email_file, drafts_dir)
@@ -534,144 +549,59 @@ class TestBench:
                 for email_file in original_mailbox.glob("*.json"):
                     shutil.copy2(email_file, inbox_dir)
         
-        # Initialize memory based on which system is enabled
-        if self.rag_memory_enabled:
-            # Initialize RAG memory vectorstore
-            # Skip loading initial memory set if disable_memory defense is active
-            if self.defense_type == "disable_memory":
-                print(f"🛡️ Defense 'disable_memory' active - skipping initial RAG memory set loading")
-            else:
-                rag_memory_set = None
-                if initial_data:
-                    rag_memory_set = initial_data.get("rag_memory_set")
-                    if not rag_memory_set and "memory_set" in initial_data:
-                        # Fallback: convert memory_set to rag_memory_set
-                        memory_set_name = initial_data["memory_set"]
-                        if memory_set_name.startswith("memory_set_"):
-                            rag_memory_set = memory_set_name.replace("memory_set_", "rag_memory_set_", 1)
-                        else:
-                            rag_memory_set = f"rag_{memory_set_name}"
-                
-                if not rag_memory_set:
-                    rag_memory_set = "rag_memory_set_0"
-                
-                # Load initial RAG memory set from pre-processed data
-                try:
-                    from benchmark.rag_memory_loader import load_rag_memory_set
-                    
-                    # Create temporary config for loading
-                    vectorstore_path_str = str(rag_vectorstore_dir)
-                    temp_config = self.config.copy()
-                    temp_config["memory"]["rag_memory"]["vectorstore_path"] = vectorstore_path_str
-                    
-                    # Load RAG memory set - each test has a unique directory, so no clearing needed
-                    # force_new=True ensures a fresh vectorstore for each test
-                    chunks_loaded = load_rag_memory_set(
-                        rag_memory_set=rag_memory_set,
-                        config=temp_config,
-                        vectorstore_path=vectorstore_path_str,
-                        force_new=True
-                    )
-                    print(f"✅ Loaded RAG memory set: {rag_memory_set} ({chunks_loaded} chunks)")
-                except Exception as e:
-                    print(f"⚠️ Warning: Could not load RAG memory set '{rag_memory_set}': {e}")
-                    import traceback
-                    traceback.print_exc()
-            
+        # Initialize memory using unified backend
+        # Skip loading initial memory set if no backend enabled
+        if self.memory_backend_name == "none":
+            print(f"🛡️ No memory backend enabled (memory_backend: none) - skipping initial memory set loading")
             # Still create empty memory file for compatibility
-            empty_memory = {"long_term": []}
-            with open(test_dir / "agent_memory.json", 'w', encoding='utf-8') as f:
-                json.dump(empty_memory, f, indent=2)
-        elif self.mem0_memory_enabled:
-            # Initialize mem0 memory vectorstore
-            # Skip loading initial memory set if disable_memory defense is active
-            if self.defense_type == "disable_memory":
-                print(f"🛡️ Defense 'disable_memory' active - skipping initial mem0 memory set loading")
-            else:
-                mem0_memory_set = None
-                if initial_data:
-                    mem0_memory_set = initial_data.get("mem0_memory_set")
-                    if not mem0_memory_set and "memory_set" in initial_data:
-                        # Fallback: convert memory_set to mem0_memory_set
-                        memory_set_name = initial_data["memory_set"]
-                        if memory_set_name.startswith("memory_set_"):
-                            mem0_memory_set = memory_set_name.replace("memory_set_", "mem0_memory_set_", 1)
-                        else:
-                            mem0_memory_set = f"mem0_{memory_set_name}"
-                
-                if not mem0_memory_set:
-                    mem0_memory_set = "mem0_memory_set_0"
-                
-                # Load initial mem0 memory set from pre-processed vectorstore
-                try:
-                    from benchmark.mem0_memory_loader import load_mem0_memory_set
-                    from agent.backend.mem0_memory_manager import _mem0_manager_cache
-                    
-                    # Clear manager cache for this vectorstore path to ensure fresh manager
-                    # (Each test gets a unique directory, but cache might have old entries)
-                    vectorstore_path_str = str(mem0_vectorstore_dir)
-                    if vectorstore_path_str in _mem0_manager_cache:
-                        del _mem0_manager_cache[vectorstore_path_str]
-                        print(f"🧹 Cleared mem0 manager cache for: {vectorstore_path_str}")
-                    
-                    # Create temporary config for loading
-                    temp_config = self.config.copy()
-                    temp_config["memory"]["mem0_memory"]["vectorstore_path"] = vectorstore_path_str
-                    
-                    # Load mem0 memory set - each test has a unique directory, so no clearing needed
-                    # The loader will simply copy from source to this unique test directory
-                    load_mem0_memory_set(
-                        mem0_memory_set=mem0_memory_set,
-                        config=temp_config,
-                        vectorstore_path=vectorstore_path_str
-                    )
-                    print(f"✅ Loaded mem0 memory set: {mem0_memory_set}")
-                except Exception as e:
-                    print(f"⚠️ Warning: Could not load mem0 memory set '{mem0_memory_set}': {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # Still create empty memory file for compatibility
-            empty_memory = {"long_term": []}
-            with open(test_dir / "agent_memory.json", 'w', encoding='utf-8') as f:
-                json.dump(empty_memory, f, indent=2)
+            memory_file = test_dir / "agent_memory.json"
+            if not memory_file.exists():
+                empty_memory = {"long_term": []}
+                with open(memory_file, 'w', encoding='utf-8') as f:
+                    json.dump(empty_memory, f, indent=2)
         else:
-            # Initialize explicit (previously simple) memory
-            if initial_data and "memory_set" in initial_data:
-                # Copy from specified memory set
-                memory_set = initial_data["memory_set"]
-                if self.explicit_memory_enabled:
-                    base_dir = Path("data/benchmark/initial_explicit_memory")
+            # Get memory set from initial_data (unified format)
+            memory_set = None
+            if initial_data:
+                # Check for unified format first
+                if "memory" in initial_data and isinstance(initial_data["memory"], dict):
+                    memory_set = initial_data["memory"].get("set")
+                # Check for simple memory_set format (e.g., "memory_set": "0")
+                elif "memory_set" in initial_data:
+                    memory_set = initial_data["memory_set"]
+                # Fallback: check for old backend-specific formats (for backward compatibility)
+                elif "mem0_memory_set" in initial_data:
+                    memory_set = initial_data["mem0_memory_set"]
+                elif "rag_memory_set" in initial_data:
+                    memory_set = initial_data["rag_memory_set"]
+            
+            if memory_set:
+                # Normalize memory_set to extract just the number
+                # Handles formats like: "0", "1", "memory_set_3", "mem0_memory_set_1", etc.
+                import re
+                match = re.search(r'(\d+)$', str(memory_set))
+                if match:
+                    normalized_memory_set = match.group(1)  # Just the number
                 else:
-                    base_dir = Path("data/benchmark/initial_memory")
-                source_memory = base_dir / f"{memory_set}.json"
-                if source_memory.exists():
-                    shutil.copy2(source_memory, test_dir / "agent_memory.json")
-                else:
-                    print(f"Warning: Memory set '{memory_set}' not found at {source_memory}")
-                    # Create empty memory file as fallback
-                    empty_memory = {
-                        "long_term": []
-                    }
-                    with open(test_dir / "agent_memory.json", 'w', encoding='utf-8') as f:
-                        json.dump(empty_memory, f, indent=2)
-            else:
-                # Fallback to original behavior
-                original_memory = Path("data/interactive_agent/agent_memory.json")
-                if original_memory.exists():
-                    shutil.copy2(original_memory, test_dir / "agent_memory.json")
-                else:
-                    # Create empty memory file if it doesn't exist
-                    empty_memory = {
-                        "long_term": []
-                    }
-                    with open(test_dir / "agent_memory.json", 'w', encoding='utf-8') as f:
+                    normalized_memory_set = str(memory_set)  # Fallback to original
+                
+                # Use memory backend to initialize with normalized set number
+                # This must succeed - if it fails, the test cannot proceed
+                self.memory_backend.initialize(normalized_memory_set, test_dir, self.config)
+                print(f"✅ Loaded {self.memory_backend_name} memory set: {normalized_memory_set}")
+            
+            # Still create empty memory file for compatibility (for explicit backend)
+            if self.memory_backend_name == "explicit":
+                memory_file = test_dir / "agent_memory.json"
+                if not memory_file.exists():
+                    empty_memory = {"long_term": []}
+                    with open(memory_file, 'w', encoding='utf-8') as f:
                         json.dump(empty_memory, f, indent=2)
         
         # Copy initial session data to test environment
         if initial_data and "session_set" in initial_data:
             session_set = initial_data["session_set"]
-            source_sessions = Path(f"data/benchmark/initial_sessions/{session_set}.json")
+            source_sessions = Path(f"data/benchmark/initial_environment/initial_sessions/{session_set}.json")
             if source_sessions.exists():
                 shutil.copy2(source_sessions, sessions_dir / "session_index.json")
             else:
@@ -692,40 +622,52 @@ class TestBench:
         test_config["data"]["outbox_dir"] = str(outbox_dir)
         test_config["data"]["drafts_dir"] = str(drafts_dir)
         test_config["data"]["sessions_dir"] = str(sessions_dir)
-        # Set vectorstore path and defense type for RAG memory if enabled
-        if self.rag_memory_enabled:
-            test_config["memory"]["rag_memory"]["vectorstore_path"] = str(rag_vectorstore_dir)
-            test_config["memory"]["rag_memory"]["defense_type"] = self.defense_type
-        # Include defense type in trace file name if defense is enabled
-        if self.rag_memory_enabled or self.mem0_memory_enabled:
-            if self.defense_type == "none":
-                defense_name = "no_defense"
-            else:
-                defense_name = self.defense_type
-            trace_filename = f"trace_defense_{defense_name}.json"
-        else:
-            trace_filename = "trace.json"
-        test_config["data"]["trace_file"] = str(traces_dir / trace_filename)
-        test_config["data"]["memory_file"] = str(test_dir / "agent_memory.json")
-        # Ensure explicit_memory (simple/explicit memory model) uses the test-specific memory file
-        if self.explicit_memory_enabled:
-            if "memory" not in test_config:
-                test_config["memory"] = {}
-            if "explicit_memory" not in test_config["memory"]:
-                test_config["memory"]["explicit_memory"] = {}
-            test_config["memory"]["explicit_memory"]["memory_file"] = test_config["data"]["memory_file"]
         
-        # Set test-specific mem0 vectorstore path if mem0 is enabled
-        if self.mem0_memory_enabled:
-            # Initialize memory section if it doesn't exist
-            if "memory" not in test_config:
-                test_config["memory"] = {}
+        # Set memory backend info for validators
+        if "memory" not in test_config:
+            test_config["memory"] = {}
+        test_config["memory"]["backend"] = self.memory_backend_name
+        
+        # Set backend-specific paths and defense types (only if backend is enabled)
+        if self.memory_backend_name == "none":
+            # No memory backend enabled
+            # Explicitly set backend to "none" and disable all backends
+            test_config["memory"]["backend"] = "none"
+            for backend_name in ["explicit", "mem0", "rag"]:
+                if backend_name not in test_config["memory"]:
+                    test_config["memory"][backend_name] = {}
+                test_config["memory"][backend_name]["enabled"] = False
+            # Also disable backend-specific configs
+            for backend_config_key in ["explicit_memory", "mem0_memory", "rag_memory"]:
+                if backend_config_key not in test_config["memory"]:
+                    test_config["memory"][backend_config_key] = {}
+                test_config["memory"][backend_config_key]["enabled"] = False
+        elif self.memory_backend_name == "rag":
+            if "rag_memory" not in test_config["memory"]:
+                test_config["memory"]["rag_memory"] = {}
+            test_config["memory"]["rag_memory"]["vectorstore_path"] = str(test_dir / "rag_vectorstore")
+            test_config["memory"]["rag_memory"]["defense_type"] = self.backend_defense
+        elif self.memory_backend_name == "mem0":
             if "mem0_memory" not in test_config["memory"]:
                 test_config["memory"]["mem0_memory"] = {}
-            test_config["memory"]["mem0_memory"]["vectorstore_path"] = str(mem0_vectorstore_dir)
-            # Ensure defense_type is set in test_config
-            if self.defense_type != "none":
-                test_config["memory"]["mem0_memory"]["defense_type"] = self.defense_type
+            test_config["memory"]["mem0_memory"]["vectorstore_path"] = str(test_dir / "mem0_vectorstore")
+            test_config["memory"]["mem0_memory"]["defense_type"] = self.backend_defense
+        elif self.memory_backend_name == "explicit":
+            if "explicit_memory" not in test_config["memory"]:
+                test_config["memory"]["explicit_memory"] = {}
+            test_config["memory"]["explicit_memory"]["memory_file"] = str(test_dir / "agent_memory.json")
+            test_config["memory"]["explicit_memory"]["defense_type"] = self.backend_defense
+        
+        # Include defense type in trace file name if defense is enabled
+        if self.memory_backend_name in ("rag", "mem0"):
+            if self.backend_defense == "none" or self.backend_defense == "no_defense":
+                trace_filename = "trace.jsonl"
+            else:
+                trace_filename = f"trace_{self.backend_defense}.jsonl"
+        else:
+            trace_filename = "trace.jsonl"
+        test_config["data"]["trace_file"] = str(traces_dir / trace_filename)
+        test_config["data"]["memory_file"] = str(test_dir / "agent_memory.json")
         
         print(f"Created test environment: {test_dir}")
         return test_config
@@ -768,11 +710,42 @@ class TestBench:
         with open(test_file, 'r', encoding='utf-8') as f:
             test_def = json.load(f)
         
+        # All test cases are now in normalized format - no normalization needed
         test_name = test_def["name"]
         description = test_def["description"]
         steps = test_def["steps"]
         initial_data = test_def.get("initial_data", {})
-        attack_type = test_def.get("attack_type", "unknown")
+        attack_type = test_def.get("attack_type", "benign")
+        
+        # Check if result already exists (result caching)
+        if should_skip_test(
+            self.memory_backend_name,
+            self.unified_defense,
+            self.model_name,
+            attack_type,
+            test_file,
+            self.force,
+            self.results_base_dir
+        ):
+            result_path = get_result_path(
+                self.memory_backend_name,
+                self.unified_defense,
+                self.model_name,
+                attack_type,
+                test_file,
+                self.results_base_dir
+            )
+            print(f"⏭️  Skipping {test_file.name} - result already exists at {result_path}")
+            print(f"   Use --force to overwrite")
+            
+            # Load and return existing result
+            try:
+                with open(result_path, 'r', encoding='utf-8') as f:
+                    existing_result = json.load(f)
+                return existing_result
+            except Exception as e:
+                print(f"⚠️  Warning: Could not load existing result: {e}")
+                # Continue to run the test
         
         print(f"Test: {test_name}")
         print(f"Description: {description}")
@@ -838,6 +811,10 @@ class TestBench:
                     # Clear the agent cache for the old session to ensure clean state
                     clear_session_agent(old_session_id)
                     
+                    # Initialize new session as trusted (for no_untrusted_tools defense)
+                    from agent.agent_core import SessionTrustManager
+                    SessionTrustManager.initialize_session(session_id)
+                    
                     # Log session change event
                     from agent.utils import append_trace_event, get_timestamp, generate_id
                     append_trace_event(
@@ -852,15 +829,14 @@ class TestBench:
                         }
                     )
                     
-                    # Record this as a successful step
+                    # Record this step (no success_check, so no "passed" attribute)
                     step_results.append({
                         "step": i,
                         "step_type": "start_new_session",
                         "description": step.get('description', 'Starting new session'),
                         "old_session_id": old_session_id,
                         "new_session_id": session_id,
-                        "duration_s": 0.0,
-                        "passed": True
+                        "duration_s": 0.0
                     })
                     continue
                 
@@ -877,7 +853,6 @@ class TestBench:
                             "step_type": "insert_attack_email",
                             "description": step.get('description', 'Inserting attack email'),
                             "duration_s": 0.0,
-                            "passed": False,
                             "error": "Missing attack_email field"
                         })
                         continue
@@ -897,15 +872,14 @@ class TestBench:
                         
                         print(f"✅ Added attack email: {attack_email.get('subject', 'No subject')} from {attack_email.get('from', 'Unknown sender')}")
                         
-                        # Record this as a successful step
+                        # Record this step (no success_check, so no "passed" attribute)
                         step_results.append({
                             "step": i,
                             "step_type": "insert_attack_email",
                             "description": step.get('description', 'Inserting attack email'),
                             "email_subject": attack_email.get('subject', 'No subject'),
                             "email_from": attack_email.get('from', 'Unknown sender'),
-                            "duration_s": 0.0,
-                            "passed": True
+                            "duration_s": 0.0
                         })
                     except Exception as e:
                         print(f"❌ Error inserting attack email: {e}")
@@ -914,7 +888,6 @@ class TestBench:
                             "step_type": "insert_attack_email",
                             "description": step.get('description', 'Inserting attack email'),
                             "duration_s": 0.0,
-                            "passed": False,
                             "error": str(e)
                         })
                     continue
@@ -932,7 +905,6 @@ class TestBench:
                             "step_type": "insert_benign_email",
                             "description": step.get('description', 'Inserting benign email'),
                             "duration_s": 0.0,
-                            "passed": False,
                             "error": "Missing benign_email field"
                         })
                         continue
@@ -952,15 +924,14 @@ class TestBench:
                         
                         print(f"✅ Added benign email: {benign_email.get('subject', 'No subject')} from {benign_email.get('from', 'Unknown sender')}")
                         
-                        # Record this as a successful step
+                        # Record this step (no success_check, so no "passed" attribute)
                         step_results.append({
                             "step": i,
                             "step_type": "insert_benign_email",
                             "description": step.get('description', 'Inserting benign email'),
                             "email_subject": benign_email.get('subject', 'No subject'),
                             "email_from": benign_email.get('from', 'Unknown sender'),
-                            "duration_s": 0.0,
-                            "passed": True
+                            "duration_s": 0.0
                         })
                     except Exception as e:
                         print(f"❌ Error inserting benign email: {e}")
@@ -969,7 +940,6 @@ class TestBench:
                             "step_type": "insert_benign_email",
                             "description": step.get('description', 'Inserting benign email'),
                             "duration_s": 0.0,
-                            "passed": False,
                             "error": str(e)
                         })
                     continue
@@ -1208,9 +1178,16 @@ class TestBench:
                         "user_message": step['user_message'],
                         "expected_behavior": step['expected_behavior'],
                         "agent_response": response,
-                        "duration_s": round(duration, 3),
-                        "passed": step_passed
+                        "duration_s": round(duration, 3)
                     }
+                    
+                    # Only include "passed" if this step has a success_check
+                    has_success_check = (
+                        ("success_check" in step and step["success_check"]) or
+                        (is_attack_bench and ("user_goal" in step or "attack_goal" in step))
+                    )
+                    if has_success_check:
+                        step_result["passed"] = step_passed
                     
                     # Add dual evaluation results if available
                     if is_attack_bench and ("user_goal" in step or "attack_goal" in step):
@@ -1232,13 +1209,20 @@ class TestBench:
                 except Exception as e:
                     print(f"Error: {e}")
                     all_passed = False
-                    step_results.append({
+                    # Only include "passed" if this step has a success_check
+                    step_result = {
                         "step": i,
                         "user_message": step['user_message'],
                         "expected_behavior": step['expected_behavior'],
-                        "error": str(e),
-                        "passed": False
-                    })
+                        "error": str(e)
+                    }
+                    has_success_check = (
+                        ("success_check" in step and step.get("success_check")) or
+                        (is_attack_bench and ("user_goal" in step or "attack_goal" in step))
+                    )
+                    if has_success_check:
+                        step_result["passed"] = False
+                    step_results.append(step_result)
         
             # Add final session to session history (if there are any remaining steps after the last session change)
             try:
@@ -1288,23 +1272,59 @@ class TestBench:
                 else:
                     test_result["defense_type"] = self.defense_type
             
-            # Save detailed result into model_name/attack_type/ structure
-            model_name = self.model_name
-            target_dir = self.results_dir / model_name / attack_type
-            target_dir.mkdir(parents=True, exist_ok=True)
-            result_file = target_dir / f"{test_file.stem}.json"
-            with open(result_file, 'w', encoding='utf-8') as f:
+            # Save result using unified structure
+            result_path = get_result_path(
+                self.memory_backend_name,
+                self.unified_defense,
+                self.model_name,
+                attack_type,
+                test_file,
+                self.results_base_dir
+            )
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Add metadata to result
+            test_result["memory_backend"] = self.memory_backend_name
+            test_result["defense_type"] = self.unified_defense
+            test_result["backend_defense"] = self.backend_defense
+            test_result["model_name"] = self.model_name
+            test_result["attack_type"] = attack_type
+            
+            # Calculate total_user_steps and total_successful_user_steps
+            # Count steps that have a success_check (either direct success_check or user_goal/attack_goal)
+            total_user_steps = 0
+            total_successful_user_steps = 0
+            
+            for step_result in step_results:
+                # Check if step has a success_check
+                has_success_check = (
+                    step_result.get("success_check") is not None or
+                    step_result.get("user_goal") is not None or
+                    step_result.get("attack_goal") is not None
+                )
+                
+                if has_success_check:
+                    total_user_steps += 1
+                    # Check if step passed (only present if success_check exists)
+                    if step_result.get("passed") is True:
+                        total_successful_user_steps += 1
+            
+            test_result["total_user_steps"] = total_user_steps
+            test_result["total_successful_user_steps"] = total_successful_user_steps
+            
+            with open(result_path, 'w', encoding='utf-8') as f:
                 json.dump(test_result, f, indent=2, ensure_ascii=False)
             
-            # Calculate step statistics
-            total_steps = len(step_results)
-            passed_steps = sum(1 for s in step_results if s.get("passed") is True)
-            failed_steps = total_steps - passed_steps
+            result_file = result_path  # Use unified path for reporting
+            
+            # Calculate step statistics (only count steps with success_check)
+            # Use total_user_steps and total_successful_user_steps which already filter correctly
+            failed_user_steps = total_user_steps - total_successful_user_steps
             
             print(f"\nTest Result: {'✓ PASSED' if all_passed else '✗ FAILED'}")
-            print(f"Steps Summary: {passed_steps}/{total_steps} steps passed")
-            if failed_steps > 0:
-                print(f"  - {passed_steps} passed, {failed_steps} failed")
+            print(f"Steps Summary: {total_successful_user_steps}/{total_user_steps} steps passed")
+            if failed_user_steps > 0:
+                print(f"  - {total_successful_user_steps} passed, {failed_user_steps} failed")
             print(f"Result saved to: {result_file}")
             
             return test_result
@@ -1353,15 +1373,55 @@ class TestBench:
         # Run test with adaptive optimization
         result = self._run_test_with_optimization(test_def, test_file)
         
-        # Save detailed result into model_name/attack_type/ structure (match static behavior)
+        # Save detailed result using unified structure (match static behavior)
         try:
-            model_name = self.model_name
-            target_dir = self.results_dir / model_name / attack_type
-            target_dir.mkdir(parents=True, exist_ok=True)
-            result_file = target_dir / f"{test_file.stem}.json"
-            with open(result_file, 'w', encoding='utf-8') as f:
+            attack_type = test_def.get("attack_type", "unknown")
+            result_path = get_result_path(
+                self.memory_backend_name if self.memory_backend_name != "none" else "none",
+                self.unified_defense,
+                self.model_name,
+                attack_type,
+                test_file,
+                self.results_base_dir
+            )
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Add metadata to result (if not already present)
+            if "memory_backend" not in result:
+                result["memory_backend"] = self.memory_backend_name if self.memory_backend_name != "none" else "none"
+            if "defense_type" not in result:
+                result["defense_type"] = self.unified_defense
+            if "model_name" not in result:
+                result["model_name"] = self.model_name
+            if "attack_type" not in result:
+                result["attack_type"] = attack_type
+            
+            # Ensure total_user_steps and total_successful_user_steps are calculated
+            if "total_user_steps" not in result or "total_successful_user_steps" not in result:
+                step_results = result.get("steps", [])
+                total_user_steps = 0
+                total_successful_user_steps = 0
+                
+                for step_result in step_results:
+                    # Check if step has a success_check
+                    has_success_check = (
+                        step_result.get("success_check") is not None or
+                        step_result.get("user_goal") is not None or
+                        step_result.get("attack_goal") is not None
+                    )
+                    
+                    if has_success_check:
+                        total_user_steps += 1
+                        # Check if step passed (only present if success_check exists)
+                        if step_result.get("passed") is True:
+                            total_successful_user_steps += 1
+                
+                result["total_user_steps"] = total_user_steps
+                result["total_successful_user_steps"] = total_successful_user_steps
+            
+            with open(result_path, 'w', encoding='utf-8') as f:
                 json.dump(result, f, indent=2, ensure_ascii=False)
-            print(f"Result saved to: {result_file}")
+            print(f"Result saved to: {result_path}")
         except Exception as e:
             print(f"Warning: Failed to save adaptive test result: {e}")
         
@@ -1397,6 +1457,10 @@ class TestBench:
         try:
             session_id = f"adaptive_{int(time.time()*1000)}"
             print(f"Session ID: {session_id}")
+            
+            # Initialize session as trusted (for no_untrusted_tools defense)
+            from agent.agent_core import SessionTrustManager
+            SessionTrustManager.initialize_session(session_id)
             
             step_results = []
             all_passed = True
@@ -1442,6 +1506,10 @@ class TestBench:
                     session_id = f"adaptive_{int(time.time()*1000)}"
                     print(f"New session: {session_id} (was {old_session_id})")
                     clear_session_agent(old_session_id)
+                    
+                    # Initialize new session as trusted (for no_untrusted_tools defense)
+                    from agent.agent_core import SessionTrustManager
+                    SessionTrustManager.initialize_session(session_id)
                     # Log session change event
                     try:
                         from agent.utils import append_trace_event, get_timestamp, generate_id
@@ -1458,15 +1526,14 @@ class TestBench:
                         )
                     except Exception as e:
                         print(f"Warning: Could not log session change event: {e}")
-                    # Record this as a successful step and continue
+                    # Record this step (no success_check, so no "passed" attribute)
                     step_results.append({
                         "step": i,
                         "step_type": "start_new_session",
                         "description": step.get('description', 'Starting new session'),
                         "old_session_id": old_session_id,
                         "new_session_id": session_id,
-                        "duration_s": 0.0,
-                        "passed": True
+                        "duration_s": 0.0
                     })
                     continue
                 
@@ -1483,7 +1550,6 @@ class TestBench:
                             "step_type": "insert_attack_email",
                             "description": step.get('description', 'Inserting attack email'),
                             "duration_s": 0.0,
-                            "passed": False,
                             "error": "Missing attack_email field"
                         })
                         continue
@@ -1512,15 +1578,14 @@ class TestBench:
                         except Exception as e:
                             print(f"Warning: Could not update state manager with new email: {e}")
                         
-                        # Record this as a successful step and continue
+                        # Record this step (no success_check, so no "passed" attribute)
                         step_results.append({
                             "step": i,
                             "step_type": "insert_attack_email",
                             "description": step.get('description', 'Inserting attack email'),
                             "email_subject": attack_email.get('subject', 'No subject'),
                             "email_from": attack_email.get('from', 'Unknown sender'),
-                            "duration_s": 0.0,
-                            "passed": True
+                            "duration_s": 0.0
                         })
                     except Exception as e:
                         print(f"❌ Error inserting attack email: {e}")
@@ -1529,7 +1594,6 @@ class TestBench:
                             "step_type": "insert_attack_email",
                             "description": step.get('description', 'Inserting attack email'),
                             "duration_s": 0.0,
-                            "passed": False,
                             "error": str(e)
                         })
                     continue
@@ -1547,7 +1611,6 @@ class TestBench:
                             "step_type": "insert_benign_email",
                             "description": step.get('description', 'Inserting benign email'),
                             "duration_s": 0.0,
-                            "passed": False,
                             "error": "Missing benign_email field"
                         })
                         continue
@@ -1576,15 +1639,14 @@ class TestBench:
                         except Exception as e:
                             print(f"Warning: Could not update state manager with new email: {e}")
                         
-                        # Record this as a successful step and continue
+                        # Record this step (no success_check, so no "passed" attribute)
                         step_results.append({
                             "step": i,
                             "step_type": "insert_benign_email",
                             "description": step.get('description', 'Inserting benign email'),
                             "email_subject": benign_email.get('subject', 'No subject'),
                             "email_from": benign_email.get('from', 'Unknown sender'),
-                            "duration_s": 0.0,
-                            "passed": True
+                            "duration_s": 0.0
                         })
                     except Exception as e:
                         print(f"❌ Error inserting benign email: {e}")
@@ -1593,7 +1655,6 @@ class TestBench:
                             "step_type": "insert_benign_email",
                             "description": step.get('description', 'Inserting benign email'),
                             "duration_s": 0.0,
-                            "passed": False,
                             "error": str(e)
                         })
                     continue
@@ -1799,6 +1860,25 @@ class TestBench:
             passed_steps = sum(1 for s in step_results if s.get("passed") is True)
             failed_steps = total_steps - passed_steps
             
+            # Calculate total_user_steps and total_successful_user_steps
+            # Count steps that have a success_check (either direct success_check or user_goal/attack_goal)
+            total_user_steps = 0
+            total_successful_user_steps = 0
+            
+            for step_result in step_results:
+                # Check if step has a success_check
+                has_success_check = (
+                    step_result.get("success_check") is not None or
+                    step_result.get("user_goal") is not None or
+                    step_result.get("attack_goal") is not None
+                )
+                
+                if has_success_check:
+                    total_user_steps += 1
+                    # Check if step passed (only present if success_check exists)
+                    if step_result.get("passed") is True:
+                        total_successful_user_steps += 1
+            
             # Compile result
             result = {
                 "test_name": test_name,
@@ -1811,13 +1891,18 @@ class TestBench:
                 "session_history": session_history,
                 "test_environment": str(test_dir),
                 "optimization_used": optimization_used,
+                "total_user_steps": total_user_steps,
+                "total_successful_user_steps": total_successful_user_steps,
                 "adaptive_benchmark": True,
             }
             
+            # Calculate step statistics (only count steps with success_check)
+            failed_user_steps = total_user_steps - total_successful_user_steps
+            
             print(f"\nAdaptive Test Result: {'✓ PASSED' if all_passed else '✗ FAILED'}")
-            print(f"Steps Summary: {passed_steps}/{total_steps} steps passed")
-            if failed_steps > 0:
-                print(f"  - {passed_steps} passed, {failed_steps} failed")
+            print(f"Steps Summary: {total_successful_user_steps}/{total_user_steps} steps passed")
+            if failed_user_steps > 0:
+                print(f"  - {total_successful_user_steps} passed, {failed_user_steps} failed")
             
             return result
             
@@ -1829,6 +1914,25 @@ class TestBench:
                                   session_id: str, test_config: Dict[str, Any],
                                   optimized_attack_email: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Run a step and check if attack succeeds."""
+        # Clear recent memory files at start of step (so we only check memories added this step)
+        test_dir = Path(test_config.get("data", {}).get("mailbox_dir", "")).parent if test_config.get("data", {}).get("mailbox_dir") else None
+        if test_dir:
+            # Clear RAG recent chunks
+            recent_chunks_file = test_dir / "rag_recent_chunks.json"
+            if recent_chunks_file.exists():
+                try:
+                    recent_chunks_file.unlink()
+                except Exception:
+                    pass  # Silently fail if we can't delete
+            
+            # Clear mem0 recent memories
+            recent_memories_file = test_dir / "mem0_recent_memories.json"
+            if recent_memories_file.exists():
+                try:
+                    recent_memories_file.unlink()
+                except Exception:
+                    pass  # Silently fail if we can't delete
+        
         # If we have an optimized attack email, we need to update the test environment
         if optimized_attack_email:
             self._inject_optimized_attack_email(test_config, optimized_attack_email)
@@ -1894,13 +1998,12 @@ class TestBench:
             # Overall step success (user goal success, attack goal failure is good)
             step_passed = user_goal_passed if user_goal_passed is not None else True
             
-            return {
+            result = {
                 "step": step_num,
                 "user_message": step['user_message'],
                 "expected_behavior": step['expected_behavior'],
                 "agent_response": response,
                 "duration_s": round(duration, 3),
-                "passed": step_passed,
                 "step_traces": step_traces,  # Include traces in result for state update
                 "user_goal": {
                     "description": step.get("user_goal", {}).get("description", ""),
@@ -1913,19 +2016,49 @@ class TestBench:
                 }
             }
             
+            # Only include "passed" if this step has a success_check (user_goal or attack_goal)
+            has_success_check = ("user_goal" in step and step["user_goal"]) or ("attack_goal" in step and step["attack_goal"])
+            if has_success_check:
+                result["passed"] = step_passed
+            
+            return result
+            
         except Exception as e:
             print(f"Error in step {step_num}: {e}")
-            return {
+            result = {
                 "step": step_num,
                 "user_message": step['user_message'],
                 "expected_behavior": step['expected_behavior'],
-                "error": str(e),
-                "passed": False
+                "error": str(e)
             }
+            # Only include "passed" if this step has a success_check
+            has_success_check = ("user_goal" in step and step.get("user_goal")) or ("attack_goal" in step and step.get("attack_goal"))
+            if has_success_check:
+                result["passed"] = False
+            return result
     
     def _run_regular_step(self, step: Dict[str, Any], step_num: int, 
                          session_id: str, test_config: Dict[str, Any]) -> Dict[str, Any]:
         """Run a regular step without attack goals."""
+        # Clear recent memory files at start of step (so we only check memories added this step)
+        test_dir = Path(test_config.get("data", {}).get("mailbox_dir", "")).parent if test_config.get("data", {}).get("mailbox_dir") else None
+        if test_dir:
+            # Clear RAG recent chunks
+            recent_chunks_file = test_dir / "rag_recent_chunks.json"
+            if recent_chunks_file.exists():
+                try:
+                    recent_chunks_file.unlink()
+                except Exception:
+                    pass  # Silently fail if we can't delete
+            
+            # Clear mem0 recent memories
+            recent_memories_file = test_dir / "mem0_recent_memories.json"
+            if recent_memories_file.exists():
+                try:
+                    recent_memories_file.unlink()
+                except Exception:
+                    pass  # Silently fail if we can't delete
+        
         start_time = time.time()
         try:
             result = invoke_agent(
@@ -1948,25 +2081,46 @@ class TestBench:
             # Print mem0 memories if enabled
             self._print_mem0_memories(test_config, user_message=step['user_message'])
             
-            return {
+            result = {
                 "step": step_num,
                 "user_message": step['user_message'],
                 "expected_behavior": step['expected_behavior'],
                 "agent_response": response,
                 "duration_s": round(duration, 3),
-                "passed": True,
                 "step_traces": step_traces  # Include traces in result for state update
             }
             
+            # Only include "passed" if this step has a success_check
+            has_success_check = "success_check" in step and step.get("success_check")
+            if has_success_check:
+                # For regular steps, we need to evaluate the success_check
+                try:
+                    from benchmark.test_validators import create_validator
+                    validator = create_validator(step["success_check"], test_config)
+                    step_passed = validator.validate(response, session_id, step_traces)
+                    result["passed"] = step_passed
+                except Exception as e:
+                    print(f"Warning: Could not evaluate success_check: {e}")
+                    result["passed"] = False
+            else:
+                # No success_check, so no "passed" attribute
+                pass
+            
+            return result
+            
         except Exception as e:
             print(f"Error in regular step {step_num}: {e}")
-            return {
+            result = {
                 "step": step_num,
                 "user_message": step['user_message'],
                 "expected_behavior": step['expected_behavior'],
-                "error": str(e),
-                "passed": False
+                "error": str(e)
             }
+            # Only include "passed" if this step has a success_check
+            has_success_check = "success_check" in step and step.get("success_check")
+            if has_success_check:
+                result["passed"] = False
+            return result
     
     def _find_attack_email_from_steps(self, test_def: Dict[str, Any], 
                                       current_step_num: int) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
@@ -2156,15 +2310,21 @@ class TestBench:
         """
         Intelligently discover test files from a path.
         If path is a file, return it. If path is a directory, find all JSON files recursively.
+        
+        Uses unified test directory structure: data/benchmark/tests/{suite}/
         """
-        # Map suite keywords to directories under the appropriate test_bench_dir
+        # Map suite keywords to directories under unified test directory
         if test_path in {"benign", "direct", "indirect"}:
             test_path_obj = self.test_bench_dir / test_path
         else:
             test_path_obj = Path(test_path)
         
+        # Check if path exists
         if not test_path_obj.exists():
-            print(f"Test path not found: {test_path}")
+            print(f"⚠️  Test path not found: {test_path}")
+            if test_path in {"benign", "direct", "indirect"}:
+                print(f"   Expected location: {test_path_obj}")
+                print(f"   Unified test directory: {self.test_bench_dir}")
             return []
         
         if test_path_obj.is_file():
@@ -2246,15 +2406,38 @@ class TestBench:
         passed_tests = sum(1 for r in results if r["overall_success"])
         failed_tests = total_tests - passed_tests
         
-        # Calculate step statistics from individual step results
-        all_steps = []
-        for r in results:
-            if "steps" in r:
-                all_steps.extend(r["steps"])
+        # Calculate step statistics - only count steps with success_check
+        # Use total_user_steps and total_successful_user_steps from each test result
+        total_user_steps = 0
+        total_successful_user_steps = 0
         
-        total_steps = len(all_steps)
-        passed_steps = sum(1 for s in all_steps if s.get("passed") is True)
-        failed_steps = sum(1 for s in all_steps if s.get("passed") is False)
+        for r in results:
+            # Use the pre-calculated values from each test result
+            total_user_steps += r.get("total_user_steps", 0)
+            total_successful_user_steps += r.get("total_successful_user_steps", 0)
+        
+        # Fallback: if total_user_steps is 0, calculate from step results (backward compatibility)
+        if total_user_steps == 0:
+            all_steps = []
+            for r in results:
+                if "steps" in r:
+                    all_steps.extend(r["steps"])
+            
+            # Count only steps with success_check
+            for step in all_steps:
+                has_success_check = (
+                    step.get("success_check") is not None or
+                    step.get("user_goal") is not None or
+                    step.get("attack_goal") is not None
+                )
+                if has_success_check:
+                    total_user_steps += 1
+                    if step.get("passed") is True:
+                        total_successful_user_steps += 1
+        
+        total_steps = total_user_steps  # Use total_user_steps for display
+        passed_steps = total_successful_user_steps  # Use total_successful_user_steps for display
+        failed_steps = total_user_steps - total_successful_user_steps
         
         # Group results by attack_type
         attack_type_groups = {"benign": [], "direct": [], "indirect": []}
@@ -2357,10 +2540,11 @@ def main():
     parser.add_argument("--suite", type=str, choices=["benign", "direct", "indirect"], help="Shortcut to run an entire suite under data/benchmark/attack_bench/<suite>.")
     parser.add_argument("--config", type=str, default="config.yaml", help="Config file")
     parser.add_argument("--defense-type", type=str, help="Override defense_type from config (e.g., 'none', 'user_only', 'no_untrusted_tools', 'disable_memory'). This allows parallel runs without modifying the global config file.")
+    parser.add_argument("--force", action="store_true", help="Force overwrite existing results")
     
     args = parser.parse_args()
     
-    bench = TestBench(args.config, defense_type_override=args.defense_type)
+    bench = TestBench(args.config, defense_type_override=args.defense_type, force=args.force)
     
     try:
         if args.test or args.suite:

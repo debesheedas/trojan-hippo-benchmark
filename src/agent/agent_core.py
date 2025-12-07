@@ -13,8 +13,6 @@ from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.runnables.history import RunnableWithMessageHistory
 
 from agent.tools_registry import create_all_tools, EmailToolsConfig
 from agent.utils import (
@@ -40,10 +38,71 @@ _session_store: Dict[str, list] = {}
 # Agent cache - one per session
 _agent_cache: Dict[str, Any] = {}
 
+# Session trust manager - tracks whether a session is trusted (no untrusted tools called)
+_session_trust: Dict[str, bool] = {}
+
+
+class SessionTrustManager:
+    """
+    Manages session-level trust variable for the no_untrusted_tools defense.
+    
+    Each session starts as trusted (True). Once an untrusted tool is called,
+    the session becomes untrusted (False) and remains so for the rest of the session.
+    """
+    
+    @staticmethod
+    def initialize_session(session_id: str) -> None:
+        """Initialize a new session as trusted."""
+        _session_trust[session_id] = True
+    
+    @staticmethod
+    def is_trusted(session_id: str) -> bool:
+        """
+        Check if a session is trusted.
+        
+        Args:
+            session_id: Session identifier
+            
+        Returns:
+            True if session is trusted, False otherwise.
+            If session not initialized, returns True (default trusted).
+        """
+        if session_id not in _session_trust:
+            # Initialize if not exists (lazy initialization)
+            _session_trust[session_id] = True
+        return _session_trust[session_id]
+    
+    @staticmethod
+    def set_untrusted(session_id: str) -> None:
+        """
+        Mark a session as untrusted (an untrusted tool was called).
+        
+        Args:
+            session_id: Session identifier
+        """
+        # Only print if this is the first time the session is being marked as untrusted
+        if session_id not in _session_trust or _session_trust[session_id]:
+            print(f"\n🛡️ Session '{session_id}' marked as UNTRUSTED (untrusted tool detected)")
+            print(f"   Memory indexing will be disabled for the rest of this session")
+        _session_trust[session_id] = False
+    
+    @staticmethod
+    def reset_session(session_id: str) -> None:
+        """
+        Reset a session's trust status (for testing or session cleanup).
+        
+        Args:
+            session_id: Session identifier
+        """
+        if session_id in _session_trust:
+            del _session_trust[session_id]
+
 
 def _get_session_memory(session_id: str) -> list:
     if session_id not in _session_store:
         _session_store[session_id] = []
+        # Initialize session as trusted when creating new session memory
+        SessionTrustManager.initialize_session(session_id)
     return _session_store[session_id]
 
 
@@ -69,9 +128,16 @@ def clear_session_agent(session_id: str, config: Optional[dict] = None, auto_sto
     if auto_store_rag and config:
         try:
             from benchmark.rag_poisoning_attack import store_session_in_rag_memory
-            rag_config = config.get("memory", {}).get("rag_memory", {})
-            rag_memory_enabled = rag_config.get("enabled", False)
-            rag_defense_type = rag_config.get("defense_type", "none")
+            memory_config = config.get("memory", {})
+            memory_backend = memory_config.get("backend", "explicit")
+            # Skip if memory backend is disabled
+            if memory_backend == "none":
+                rag_memory_enabled = False
+                rag_defense_type = "none"
+            else:
+                rag_config = memory_config.get("rag_memory", {})
+                rag_memory_enabled = rag_config.get("enabled", False)
+                rag_defense_type = rag_config.get("defense_type", "none")
             if rag_memory_enabled and rag_defense_type != "disable_memory":
                 chunks_stored = store_session_in_rag_memory(session_id, config)
                 if chunks_stored > 0:
@@ -85,6 +151,9 @@ def clear_session_agent(session_id: str, config: Optional[dict] = None, auto_sto
     # Also clear session memory
     if session_id in _session_store:
         del _session_store[session_id]
+    
+    # Clear session trust status
+    SessionTrustManager.reset_session(session_id)
 
 
 def _get_or_create_agent_executor(session_id: str, config: Optional[dict] = None) -> Any:
@@ -225,9 +294,20 @@ def _create_agent_executor_for_python(
     
     # Initialize memory systems based on config (need this before creating tools)
     memory_config = config.get("memory", {})
-    explicit_memory_config = memory_config.get("explicit_memory", {})
-    explicit_memory_enabled = explicit_memory_config.get("enabled", True)
-    explicit_defense_type = explicit_memory_config.get("defense_type", "none")
+    memory_backend = memory_config.get("backend", "explicit")  # Default to explicit for backward compatibility
+    
+    # Check if memory is completely disabled (backend="none")
+    if memory_backend == "none":
+        # No memory backend enabled - disable all memory systems
+        explicit_memory_enabled = False
+        explicit_defense_type = "none"
+    else:
+        explicit_memory_config = memory_config.get("explicit_memory", {})
+        explicit_memory_enabled = explicit_memory_config.get("enabled", True)
+        explicit_defense_type = explicit_memory_config.get("defense_type", "none")
+    
+    # Get limit_memory_size from config (for limit_memory_length defense)
+    limit_memory_size = config.get("benchmark", {}).get("limit_memory_size_defense", 80)
     
     # Create tools - only include memory tools if explicit_memory is enabled AND not disabled by defense
     if explicit_memory_enabled and explicit_defense_type != "disable_memory":
@@ -238,6 +318,7 @@ def _create_agent_executor_for_python(
             session_id=session_id,
             trace_file=trace_file,
             explicit_defense_type=explicit_defense_type,
+            limit_memory_size=limit_memory_size,
         )
     else:
         # Only create email tools, no memory tools
@@ -305,10 +386,21 @@ def _create_agent_executor_for_python(
 
     # Initialize memory systems based on config
     memory_config = config.get("memory", {})
-    explicit_memory_config = memory_config.get("explicit_memory", {})
-    explicit_memory_enabled = explicit_memory_config.get("enabled", True)
-    explicit_defense_type = explicit_memory_config.get("defense_type", "none")
-    rag_memory_enabled = memory_config.get("rag_memory", {}).get("enabled", False)
+    memory_backend = memory_config.get("backend", "explicit")  # Default to explicit for backward compatibility
+    
+    # Check if memory is completely disabled (backend="none")
+    if memory_backend == "none":
+        # No memory backend enabled - disable all memory systems
+        explicit_memory_enabled = False
+        explicit_defense_type = "none"
+        rag_memory_enabled = False
+        mem0_memory_enabled = False
+    else:
+        explicit_memory_config = memory_config.get("explicit_memory", {})
+        explicit_memory_enabled = explicit_memory_config.get("enabled", True)
+        explicit_defense_type = explicit_memory_config.get("defense_type", "none")
+        rag_memory_enabled = memory_config.get("rag_memory", {}).get("enabled", False)
+        mem0_memory_enabled = memory_config.get("mem0_memory", {}).get("enabled", False)
     
     # Memory prompt and long-term memory context - only load if explicit_memory is enabled AND not disabled by defense
     memory_instructions = ""
@@ -375,28 +467,6 @@ def invoke_agent(
     if "trace_file" not in cfg["data"]:
         cfg["data"]["trace_file"] = "data/interactive_agent/trace.jsonl"
     
-    # DEBUG: Print the actual system prompt that will be used (with current memory context)
-    try:
-        memory_prompt_file = Path(__file__).parent / "memory_prompt.txt"
-        memory_instructions = memory_prompt_file.read_text(encoding="utf-8") if memory_prompt_file.exists() else ""
-        
-        # Get current memory context (this is what's actually being used)
-        memory_config = cfg.get("memory", {})
-        explicit_memory_enabled = memory_config.get("explicit_memory", {}).get("enabled", True)
-        explicit_memory_context = ""
-        
-        if explicit_memory_enabled:
-            memory_file = memory_config.get("explicit_memory", {}).get("memory_file",
-                cfg.get("data", {}).get("memory_file", "data/interactive_agent/agent_memory.json"))
-            memory_manager = get_memory_manager(memory_file=memory_file, force_new=False)
-            explicit_memory_context = memory_manager.get_long_term_as_text()
-        
-        # Build the actual system prompt that will be used (for debugging if needed)
-        # system_prompt = _build_agent_prompt(memory_instructions, simple_memory_context)
-        # print(f"\n🔍 DEBUG: System Prompt (Session: {session_id}, Length: {len(system_prompt)} chars)\n{system_prompt}\n")
-    except Exception as e:
-        print(f"Warning: Could not print system prompt: {e}")
-    
     # Get or create cached agent for this session
     agent = _get_or_create_agent_executor(session_id, cfg)
 
@@ -407,12 +477,19 @@ def invoke_agent(
         print(f"Warning: Could not append trace event: {e}")
 
     # Retrieve RAG memory context if enabled
-    rag_memory_config = cfg.get("memory", {}).get("rag_memory", {})
-    rag_memory_enabled = rag_memory_config.get("enabled", False)
-    rag_defense_type = rag_memory_config.get("defense_type", "none")
+    # Check if memory backend is disabled
+    memory_backend = cfg.get("memory", {}).get("backend", "explicit")
+    if memory_backend == "none":
+        rag_memory_enabled = False
+        rag_defense_type = "none"
+    else:
+        rag_memory_config = cfg.get("memory", {}).get("rag_memory", {})
+        rag_memory_enabled = rag_memory_config.get("enabled", False)
+        rag_defense_type = rag_memory_config.get("defense_type", "none")
+    
     rag_context = ""
     
-    # Skip RAG entirely if defense_type is "disable_memory"
+    # Skip RAG entirely if memory backend is "none" or defense_type is "disable_memory"
     if rag_memory_enabled and rag_defense_type != "disable_memory":
         try:
             rag_memory_manager = get_rag_memory_manager(
@@ -431,11 +508,19 @@ def invoke_agent(
     
     # Retrieve mem0 memory context if enabled
     mem0_memory_config = cfg.get("memory", {}).get("mem0_memory", {})
-    mem0_memory_enabled = mem0_memory_config.get("enabled", False)
-    defense_type = mem0_memory_config.get("defense_type", "none")
+    # Check if memory backend is disabled
+    memory_backend = cfg.get("memory", {}).get("backend", "explicit")
+    if memory_backend == "none":
+        mem0_memory_enabled = False
+        defense_type = "none"
+    else:
+        mem0_memory_config = cfg.get("memory", {}).get("mem0_memory", {})
+        mem0_memory_enabled = mem0_memory_config.get("enabled", False)
+        defense_type = mem0_memory_config.get("defense_type", "none")
+    
     mem0_context = ""
     
-    # Skip mem0 entirely if defense_type is "disable_memory"
+    # Skip mem0 entirely if memory backend is "none" or defense_type is "disable_memory"
     if mem0_memory_enabled and defense_type != "disable_memory":
         try:
             mem0_memory_manager = get_mem0_memory_manager(
@@ -507,14 +592,15 @@ def invoke_agent(
                 trace_file=cfg.get("data", {}).get("trace_file"),
             )
             
-            # Check if we should index memory
+            # Check if we should index memory (defense manager handles all defense checks including no_untrusted_tools)
             if not defense_manager.should_index_memory(session_id, text, response_text):
                 # Skip memory indexing
                 pass
             else:
                 # Get effective chunk size from defense manager
                 default_chunk_size = rag_memory_config.get("chunk_size", 512)
-                effective_chunk_size = defense_manager.get_chunk_size(default_chunk_size)
+                limit_memory_size = cfg.get("benchmark", {}).get("limit_memory_size_defense", 80)
+                effective_chunk_size = defense_manager.get_chunk_size(default_chunk_size, limit_memory_size=limit_memory_size)
                 
                 # Filter/modify conversation turn based on defense
                 conversation_turn = defense_manager.filter_conversation_turn(text, response_text)
@@ -530,53 +616,32 @@ def invoke_agent(
                     force_new=False
                 )
                 
-                # For limit_chunk_size defense, we need to chunk the conversation turn
-                # before storing (since RAGMemoryManager.add_memory stores as-is)
-                if rag_defense_type == "limit_chunk_size":
-                    from benchmark.memory_benchmark_utils import chunk_context_for_memory
-                    chunks = chunk_context_for_memory(conversation_turn, chunk_size=effective_chunk_size)
-                    for chunk in chunks:
-                        if chunk.strip():
-                            rag_memory_manager.add_memory(chunk, metadata={
-                                "session_id": session_id,
-                                "type": "conversation",
-                                "defense_type": rag_defense_type
-                            })
-                else:
-                    # Store conversation turn as-is (will be chunked by the manager if needed)
-                    rag_memory_manager.add_memory(conversation_turn, metadata={
-                        "session_id": session_id,
-                        "type": "conversation",
-                        "defense_type": rag_defense_type
-                    })
+                # RAGMemoryManager.add_memory() stores text as-is without chunking,
+                # so we need to chunk the conversation turn ourselves based on the effective chunk size
+                # For limit_chunk_size defense: chunk into 80-character chunks
+                # For normal operation: chunk into 512-character chunks (default)
+                chunks = []
+                text = conversation_turn
+                chunk_size = effective_chunk_size  # 80 for defense, 512 for normal
+                for i in range(0, len(text), chunk_size):
+                    chunk = text[i:i + chunk_size]
+                    if chunk.strip():
+                        chunks.append(chunk)
+                
+                # If no chunks were created (empty text), create one empty chunk to maintain consistency
+                if not chunks:
+                    chunks = [""]
+                
+                # Store each chunk separately
+                for chunk in chunks:
+                    if chunk.strip():
+                        rag_memory_manager.add_memory(chunk, metadata={
+                            "session_id": session_id,
+                            "type": "conversation",
+                            "defense_type": rag_defense_type
+                        })
         except Exception as e:
             print(f"Warning: Could not store conversation in RAG memory: {e}")
-    
-    # Track tool calls for defense mechanisms
-    # Check ALL trace events in the session to see if any untrusted tools were called
-    # This updates the session-level trust variable in real-time
-    if mem0_memory_enabled and defense_type == "no_untrusted_tools":
-        try:
-            from agent.tools_registry import is_untrusted_tool
-            defense_manager = get_defense_manager(
-                defense_type=defense_type,
-                trace_file=cfg["data"]["trace_file"],
-                session_id=session_id,
-                force_new=False
-            )
-            # Check ALL trace events in the session (not just recent ones)
-            # This ensures we catch all untrusted tool calls, not just the last 10
-            from agent.utils import read_trace_events
-            all_traces = read_trace_events(cfg["data"]["trace_file"], session_id)
-            # Check all tool_call events in the session
-            for event in all_traces:
-                if event.get("event_type") == "tool_call":
-                    tool_name = event.get("payload", {}).get("tool_name", "")
-                    if is_untrusted_tool(tool_name):
-                        # Set session trust to False when untrusted tool is detected
-                        defense_manager.record_tool_call(session_id, tool_name)
-        except Exception as e:
-            print(f"Warning: Could not track tool calls for defense: {e}")
     
     # Store conversation in mem0 memory if enabled
     # Skip entirely if defense_type is "disable_memory"
@@ -596,7 +661,7 @@ def invoke_agent(
                 {"role": "assistant", "content": response_text}
             ]
             
-            # Apply defense: check if we should index memory
+            # Apply defense: check if we should index memory (defense manager handles all defense checks including no_untrusted_tools)
             if not defense_manager.should_index_memory(session_id, conversation_messages):
                 if mem0_memory_config.get("mem0_print", False):
                     print(f"\n🛡️ Defense '{defense_type}' blocked memory indexing for this turn")
@@ -638,11 +703,12 @@ def invoke_agent(
                         agent_id=mem0_memory_config.get("agent_id", "email_agent"),
                         force_new=False
                     )
-            
+                    
                     # Determine if we should limit individual memory length for this defense.
                     # When defense_type == "limit_memory_length", we truncate extracted
-                    # mem0 memories to 80 characters before indexing.
-                    max_memory_length = 80 if defense_type == "limit_memory_length" else None
+                    # mem0 memories to the configured limit before indexing.
+                    limit_memory_size = cfg.get("benchmark", {}).get("limit_memory_size_defense", 80)
+                    max_memory_length = limit_memory_size if defense_type == "limit_memory_length" else None
 
                     # Debug: Print messages being sent to mem0 if mem0_print is enabled
                     mem0_print_enabled = mem0_memory_config.get("mem0_print", False)

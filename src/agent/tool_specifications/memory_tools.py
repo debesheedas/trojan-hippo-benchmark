@@ -4,22 +4,11 @@ Provides tools for the agent to update memory.
 """
 
 from langchain.tools import BaseTool
-from typing import Optional, Set
+from typing import Optional
 from pydantic import BaseModel, Field
 
 from agent.backend.memory_manager import get_memory_manager
-from agent.utils import append_trace_event, generate_id, read_trace_events
-
-
-# Untrusted tools are those that read from untrusted data sources (inbox)
-# We duplicate this set here (also defined in mem0_defense_manager and tools_registry)
-# to avoid circular imports.
-UNTRUSTED_TOOLS: Set[str] = {
-    "read_all_emails",
-    "search_emails",
-    "reply_to_email",
-    "forward_to_email",
-}
+from agent.utils import append_trace_event, generate_id
 
 
 class UpdateMemoryInput(BaseModel):
@@ -55,27 +44,8 @@ class UpdateMemoryTool(BaseTool):
     session_id: Optional[str] = None
     trace_file: str = "data/interactive_agent/trace.jsonl"
     explicit_defense_type: str = "none"
+    limit_memory_size: int = 80  # Default limit from config
 
-    def _has_untrusted_tool_been_called(self) -> bool:
-        """
-        Check if any untrusted tool has been called in this session.
-        Mirrors the behavior of the mem0 'no_untrusted_tools' defense.
-        """
-        if not self.session_id or not self.trace_file:
-            return False
-
-        try:
-            trace_events = read_trace_events(self.trace_file, self.session_id)
-            for event in trace_events:
-                if event.get("event_type") == "tool_call":
-                    payload = event.get("payload", {})
-                    tool_name = payload.get("tool_name", "")
-                    if tool_name in UNTRUSTED_TOOLS:
-                        return True
-        except Exception as e:
-            print(f"Warning: Could not check trace events for explicit memory defense: {e}")
-
-        return False
 
     def _run(self, memory_text: str) -> str:
         """Execute the memory update."""
@@ -113,10 +83,10 @@ class UpdateMemoryTool(BaseTool):
             return result
 
         # Apply explicit memory defenses that operate at the tool level
-        # Defense: limit_memory_length – truncate memory_text to 80 characters
+        # Defense: limit_memory_length – truncate memory_text to configured limit
         if self.explicit_defense_type == "limit_memory_length" and isinstance(memory_text, str):
-            if len(memory_text) > 80:
-                memory_text = memory_text[:80]
+            if len(memory_text) > self.limit_memory_size:
+                memory_text = memory_text[:self.limit_memory_size]
 
         # Log tool call
         if self.session_id:
@@ -131,10 +101,12 @@ class UpdateMemoryTool(BaseTool):
                 },
             )
 
-        # Defense: no_untrusted_tools – once any untrusted tool is used in this
-        # session, disable explicit memory indexing for the rest of the session.
+        # Defense: no_untrusted_tools – check if session is trusted
+        # If an untrusted tool was called, the session is marked as untrusted
+        # and memory indexing is blocked for the rest of the session.
         if self.explicit_defense_type == "no_untrusted_tools":
-            if self._has_untrusted_tool_been_called():
+            from agent.agent_core import SessionTrustManager
+            if self.session_id and not SessionTrustManager.is_trusted(self.session_id):
                 result = (
                     "🛡️ Memory indexing disabled for this session because an untrusted tool was used. "
                     "This turn's memory update was not stored."
@@ -227,6 +199,7 @@ def create_memory_tools(
     session_id: Optional[str] = None,
     trace_file: str = "data/interactive_agent/trace.jsonl",
     explicit_defense_type: str = "none",
+    limit_memory_size: int = 80,
 ):
     """Create and return memory tools."""
     tool = UpdateMemoryTool()
@@ -234,5 +207,6 @@ def create_memory_tools(
     tool.session_id = session_id
     tool.trace_file = trace_file
     tool.explicit_defense_type = explicit_defense_type
+    tool.limit_memory_size = limit_memory_size
     return [tool]
 

@@ -178,17 +178,155 @@ class Mem0MemoryManager:
                 # We want user memory extraction, so we don't include agent_id in metadata
                 # Note: We can still use agent_id for filtering in search operations via filters parameter
                 
-                # When max_memory_length is provided (e.g., by a defense), it is passed
-                # through to mem0 so that extracted fact strings can be truncated
-                # before they are embedded and written into the vector store.
+                # Defense: limit_memory_length - truncate message content BEFORE extraction
+                # This ensures only truncated memories are stored, avoiding duplicates
+                messages_to_use = messages
+                if max_memory_length and max_memory_length > 0:
+                    # Truncate each message's content to max_memory_length before passing to mem0
+                    # This way, mem0 will extract from truncated content and store only truncated memories
+                    messages_to_use = []
+                    for msg in messages:
+                        if isinstance(msg, dict) and "content" in msg:
+                            content = str(msg["content"])
+                            if len(content) > max_memory_length:
+                                # Truncate at character boundary (simple truncation)
+                                truncated_content = content[:max_memory_length]
+                                messages_to_use.append({
+                                    **msg,
+                                    "content": truncated_content
+                                })
+                            else:
+                                messages_to_use.append(msg)
+                        else:
+                            messages_to_use.append(msg)
+                
+                # Extract memories using mem0 (with potentially truncated messages)
                 result = self.memory.add(
-                    messages=messages,
+                    messages=messages_to_use,
                     user_id=user_id,
                     agent_id=None,  # Don't pass agent_id to force USER_MEMORY_EXTRACTION_PROMPT
                     metadata=combined_metadata,  # Don't include agent_id here
                     infer=True,  # Use LLM to extract facts
-                    max_memory_length=max_memory_length,
                 )
+                
+                # Post-process: Ensure extracted memories are also truncated (defense in depth)
+                # Even though we truncated input, mem0 might combine or rephrase, so we check again
+                if max_memory_length and max_memory_length > 0:
+                    # Extract memory texts and verify/truncate if needed
+                    processed_memories = []
+                    if isinstance(result, dict) and "results" in result:
+                        for memory_item in result["results"]:
+                            if isinstance(memory_item, dict):
+                                memory_text = (
+                                    memory_item.get("memory") or
+                                    memory_item.get("memories") or
+                                    memory_item.get("text") or
+                                    memory_item.get("content") or
+                                    memory_item.get("fact") or
+                                    ""
+                                )
+                                if memory_text:
+                                    memory_text_str = str(memory_text)
+                                    # Truncate if still too long (defense in depth)
+                                    if len(memory_text_str) > max_memory_length:
+                                        memory_text_str = memory_text_str[:max_memory_length]
+                                    # Update the memory item with truncated text
+                                    # Find which key was used and update it
+                                    for key in ["memory", "memories", "text", "content", "fact"]:
+                                        if key in memory_item:
+                                            memory_item[key] = memory_text_str
+                                            break
+                                    processed_memories.append(memory_item)
+                    elif isinstance(result, list):
+                        for memory_item in result:
+                            if isinstance(memory_item, dict):
+                                memory_text = (
+                                    memory_item.get("memory") or
+                                    memory_item.get("memories") or
+                                    memory_item.get("text") or
+                                    memory_item.get("content") or
+                                    memory_item.get("fact") or
+                                    ""
+                                )
+                                if memory_text:
+                                    memory_text_str = str(memory_text)
+                                    # Truncate if still too long (defense in depth)
+                                    if len(memory_text_str) > max_memory_length:
+                                        memory_text_str = memory_text_str[:max_memory_length]
+                                    # Update the memory item with truncated text
+                                    for key in ["memory", "memories", "text", "content", "fact"]:
+                                        if key in memory_item:
+                                            memory_item[key] = memory_text_str
+                                            break
+                                    processed_memories.append(memory_item)
+                    
+                    # Note: We don't re-add here because we already truncated the input messages.
+                    # The memories stored by mem0 should already be truncated. The post-processing
+                    # above just ensures the result object reflects truncated values for consistency.
+                
+                # Track recent memories for efficient validation
+                # Extract memory texts from result and save to file in test directory
+                if self.vectorstore_path:
+                    try:
+                        vectorstore_path_obj = Path(self.vectorstore_path)
+                        # Check if this is a test directory (contains "test_env" or "mem0_vectorstore" in test_envs)
+                        if "test_env" in str(vectorstore_path_obj) or "test_envs" in str(vectorstore_path_obj):
+                            # Get the test directory (parent of mem0_vectorstore)
+                            test_dir = vectorstore_path_obj.parent
+                            recent_memories_file = test_dir / "mem0_recent_memories.json"
+                            
+                            # Extract memory texts from result (already truncated if defense was active)
+                            memory_texts = []
+                            if isinstance(result, dict) and "results" in result:
+                                for memory_item in result["results"]:
+                                    if isinstance(memory_item, dict):
+                                        memory_text = (
+                                            memory_item.get("memory") or
+                                            memory_item.get("memories") or
+                                            memory_item.get("text") or
+                                            memory_item.get("content") or
+                                            memory_item.get("fact") or
+                                            ""
+                                        )
+                                        if memory_text:
+                                            memory_texts.append(str(memory_text))
+                            elif isinstance(result, list):
+                                for memory_item in result:
+                                    if isinstance(memory_item, dict):
+                                        memory_text = (
+                                            memory_item.get("memory") or
+                                            memory_item.get("memories") or
+                                            memory_item.get("text") or
+                                            memory_item.get("content") or
+                                            memory_item.get("fact") or
+                                            ""
+                                        )
+                                        if memory_text:
+                                            memory_texts.append(str(memory_text))
+                            
+                            # Read existing recent memories
+                            recent_memories = []
+                            if recent_memories_file.exists():
+                                try:
+                                    import json
+                                    with open(recent_memories_file, 'r', encoding='utf-8') as f:
+                                        recent_memories = json.load(f)
+                                except Exception:
+                                    recent_memories = []
+                            
+                            # Add new memories
+                            recent_memories.extend(memory_texts)
+                            
+                            # Write back (keep only recent memories, limit to last 100 to avoid file bloat)
+                            recent_memories = recent_memories[-100:]
+                            if recent_memories:
+                                import json
+                                with open(recent_memories_file, 'w', encoding='utf-8') as f:
+                                    json.dump(recent_memories, f, indent=2, ensure_ascii=False)
+                    except Exception:
+                        # Silently fail if we can't write recent memories (not critical)
+                        pass
+                
                 return result
             except Exception as e:
                 print(f"Warning: Could not add memory to mem0: {e}")
@@ -459,9 +597,6 @@ class Mem0MemoryManager:
 # Cache managers by vectorstore_path to support multiple test environments
 _mem0_manager_cache: Dict[str, Mem0MemoryManager] = {}
 
-
-# Cache managers by vectorstore_path to support multiple test environments
-_mem0_manager_cache: Dict[str, Mem0MemoryManager] = {}
 
 def get_mem0_memory_manager(
     llm_provider: str = "openai",

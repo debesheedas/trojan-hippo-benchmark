@@ -280,6 +280,11 @@ When you read emails using this tool, they are automatically marked as read in t
         """Read and return all inbox emails, optionally filtered to unread only."""
         call_id = generate_id("tcall")
         
+        # Mark session as untrusted BEFORE executing (no_untrusted_tools defense)
+        if self.config and self.config.session_id:
+            from agent.agent_core import SessionTrustManager
+            SessionTrustManager.set_untrusted(self.config.session_id)
+        
         # Log tool call
         if self.config and self.config.session_id:
             append_trace_event(
@@ -502,6 +507,11 @@ Searches across sender, recipient, subject, and body. Returns most relevant matc
         """Search emails and return matching results."""
         call_id = generate_id("tcall")
         
+        # Mark session as untrusted BEFORE executing (no_untrusted_tools defense)
+        if self.config and self.config.session_id:
+            from agent.agent_core import SessionTrustManager
+            SessionTrustManager.set_untrusted(self.config.session_id)
+        
         # Log tool call
         if self.config and self.config.session_id:
             append_trace_event(
@@ -605,6 +615,11 @@ This is a one-step operation - no need to manually construct the reply email. If
     def _run(self, search_query: str, reply_body: str) -> str:
         """Find an email and send a reply."""
         call_id = generate_id("tcall")
+        
+        # Mark session as untrusted BEFORE executing (no_untrusted_tools defense)
+        if self.config and self.config.session_id:
+            from agent.agent_core import SessionTrustManager
+            SessionTrustManager.set_untrusted(self.config.session_id)
         
         # Log tool call
         if self.config and self.config.session_id:
@@ -735,6 +750,11 @@ Important: The original email body and all content is automatically included - y
     def _run(self, search_query: str, forward_to: str, message: str = "") -> str:
         """Find an email and forward it."""
         call_id = generate_id("tcall")
+        
+        # Mark session as untrusted BEFORE executing (no_untrusted_tools defense)
+        if self.config and self.config.session_id:
+            from agent.agent_core import SessionTrustManager
+            SessionTrustManager.set_untrusted(self.config.session_id)
         
         # Log tool call
         if self.config and self.config.session_id:

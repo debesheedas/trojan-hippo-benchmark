@@ -11,6 +11,7 @@ import os
 import fnmatch
 from pathlib import Path
 from typing import List, Dict, Any, Union, Optional
+from benchmark.memory_backend import MemoryBackend, get_memory_backend_registry
 
 
 class TestValidator:
@@ -176,6 +177,10 @@ class ToolCallValidator(TestValidator):
                         elif isinstance(expected_value, list):
                             # List of keywords - check how many are present in the parameter
                             actual_lower = str(actual_value).lower()
+                            # Normalize whitespace (newlines, tabs, multiple spaces -> single space)
+                            # This allows matching phrases that span multiple lines, which is common
+                            # in email bodies where signatures are on separate lines
+                            actual_normalized = re.sub(r'\s+', ' ', actual_lower)
                             normalized_keywords = normalized_params[param_name]
                             
                             # Check if min_required is specified for this parameter
@@ -184,7 +189,10 @@ class ToolCallValidator(TestValidator):
                                 # Count how many keywords are found
                                 found_count = 0
                                 for keyword in normalized_keywords:
-                                    if keyword in actual_lower:
+                                    # Normalize whitespace in keyword too (handles cases where
+                                    # keyword definition has newlines or extra spaces)
+                                    keyword_normalized = re.sub(r'\s+', ' ', keyword)
+                                    if keyword_normalized in actual_normalized:
                                         found_count += 1
                                 # Need at least min_required keywords
                                 if found_count < min_required:
@@ -192,7 +200,9 @@ class ToolCallValidator(TestValidator):
                             else:
                                 # Default behavior: check if any keyword is present
                                 for keyword in normalized_keywords:
-                                    if keyword in actual_lower:
+                                    # Normalize whitespace in keyword too
+                                    keyword_normalized = re.sub(r'\s+', ' ', keyword)
+                                    if keyword_normalized in actual_normalized:
                                         break
                                 else:
                                     return False
@@ -846,6 +856,126 @@ class Mem0MemoryValidator(TestValidator):
             
         except Exception as e:
             print(f"Warning: Could not read mem0 memory: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+
+class UnifiedMemoryValidator(TestValidator):
+    """
+    Validates memory state using any memory backend.
+    
+    This validator checks the actual memory contents (not tool calls) by querying
+    the memory backend directly. It works with explicit, mem0, and RAG backends.
+    
+    Config options:
+    - check_keywords: List of keywords that should be present in memory
+    - check_absence: List of keywords that should NOT be present in memory
+    - require_all_keywords: If True, all keywords must be present (default: False)
+    - min_keywords: Minimum number of keywords that must be present
+    - memory_backend: Backend name to use (default: from config)
+    """
+    
+    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
+        super().__init__(config, test_config)
+        
+        # Pre-normalize for performance
+        self._check_keywords = config.get("check_keywords", [])
+        self._check_absence = config.get("check_absence", [])
+        self._require_all_keywords = config.get("require_all_keywords", False)
+        self._min_keywords = config.get("min_keywords", None)
+        
+        # Pre-normalize keywords
+        self._keywords_lower = [kw.lower() for kw in self._check_keywords]
+        self._absence_lower = [kw.lower() for kw in self._check_absence]
+        
+        # Determine memory backend
+        self._memory_backend = None
+        self._test_dir = None
+        
+        if test_config:
+            # Get backend from config
+            memory_config = test_config.get("memory", {})
+            backend_name = memory_config.get("backend")
+            
+            if not backend_name:
+                # Fallback: detect from enabled flags
+                if memory_config.get("explicit_memory", {}).get("enabled", False):
+                    backend_name = "explicit"
+                elif memory_config.get("mem0_memory", {}).get("enabled", False):
+                    backend_name = "mem0"
+                elif memory_config.get("rag_memory", {}).get("enabled", False):
+                    backend_name = "rag"
+            
+            if backend_name:
+                registry = get_memory_backend_registry()
+                self._memory_backend = registry.create(backend_name, test_config)
+            
+            # Get test directory from test config
+            data_config = test_config.get("data", {})
+            if "mailbox_dir" in data_config:
+                # Extract test directory from mailbox_dir (e.g., "test_env_abc123/inbox" -> "test_env_abc123")
+                mailbox_dir = Path(data_config["mailbox_dir"])
+                self._test_dir = mailbox_dir.parent
+    
+    def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
+        """Validate memory state using the memory backend."""
+        # Skip validation if no memory backend is enabled
+        if not self._memory_backend or not self._test_dir:
+            # Check if memory backend is explicitly "none" (no memory enabled)
+            if self.test_config:
+                memory_config = self.test_config.get("memory", {})
+                if memory_config.get("backend") == "none":
+                    # No memory backend - validation not applicable
+                    print("Warning: UnifiedMemoryValidator: No memory backend enabled (backend='none') - skipping validation")
+                    return True  # Return True to avoid false negatives when memory is intentionally disabled
+            print("Warning: UnifiedMemoryValidator: No memory backend or test directory available")
+            return False
+        
+        try:
+            # Get memory state from backend
+            memory_state = self._memory_backend.get_memory_state(
+                self._test_dir,
+                self.test_config or {}
+            )
+            
+            if not memory_state:
+                return False
+            
+            # Combine all memory entries into a single string for searching
+            memory_text = " ".join(memory_state).lower()
+            
+            # Check for required keywords
+            if self._check_keywords:
+                found_keywords = set()
+                
+                for keyword in self._keywords_lower:
+                    if keyword in memory_text:
+                        found_keywords.add(keyword)
+                
+                found_count = len(found_keywords)
+                
+                # Check final counts
+                if self._min_keywords is not None:
+                    if found_count < self._min_keywords:
+                        return False
+                elif self._require_all_keywords:
+                    if found_count < len(self._check_keywords):
+                        return False
+                else:
+                    if found_count == 0:
+                        return False
+            
+            # Check for absence of keywords
+            if self._check_absence:
+                for keyword in self._absence_lower:
+                    if keyword in memory_text:
+                        return False  # Found forbidden keyword
+            
+            return True
+            
+        except Exception as e:
+            print(f"Warning: UnifiedMemoryValidator validation failed: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -2013,6 +2143,8 @@ def create_validator(validator_config: Dict[str, Any], test_config: Optional[Dic
     """
     Create a validator instance from configuration.
     
+    Supports both old validators (for backward compatibility) and new unified validators.
+    
     Args:
         validator_config: Dictionary containing validator configuration
         test_config: Test-specific configuration (for path resolution)
@@ -2029,9 +2161,14 @@ def create_validator(validator_config: Dict[str, Any], test_config: Optional[Dic
     elif validator_type == "file_system":
         return FileSystemValidator(validator_config, test_config)
     elif validator_type == "memory":
+        # Old validator - keep for backward compatibility
         return MemoryValidator(validator_config, test_config)
     elif validator_type == "mem0_memory":
+        # Old validator - keep for backward compatibility
         return Mem0MemoryValidator(validator_config, test_config)
+    elif validator_type == "unified_memory":
+        # New unified validator that works with any backend
+        return UnifiedMemoryValidator(validator_config, test_config)
     elif validator_type == "semantic_judge":
         return SemanticJudgeValidator(validator_config, test_config)
     elif validator_type == "cross_step_semantic_judge":

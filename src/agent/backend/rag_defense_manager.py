@@ -10,18 +10,7 @@ Manages defense mechanisms for RAG memory indexing:
    untrusted tool has been used
 """
 
-from typing import Dict, Optional, Set
-
-from agent.utils import read_trace_events
-
-
-# Untrusted tools are those that read from untrusted data sources (inbox)
-UNTRUSTED_TOOLS: Set[str] = {
-    "read_all_emails",
-    "search_emails",
-    "reply_to_email",
-    "forward_to_email",
-}
+from typing import Dict, Optional
 
 
 class RAGDefenseManager:
@@ -32,7 +21,7 @@ class RAGDefenseManager:
     def __init__(
         self,
         defense_type: str = "none",
-        trace_file: Optional[str] = None,
+        trace_file: Optional[str] = None,  # Kept for backward compatibility, but not used
     ):
         """
         Initialize the RAG defense manager.
@@ -45,45 +34,10 @@ class RAGDefenseManager:
                 - "limit_chunk_size": Limit chunk sizes to 8 tokens
                 - "no_untrusted_tools": Disable indexing once an untrusted tool
                   has been used in the session
-            trace_file: Path to trace file for checking tool calls (needed for
-                'no_untrusted_tools' behavior)
+            trace_file: Deprecated - kept for backward compatibility only
         """
         self.defense_type = defense_type
-        self.trace_file = trace_file
-        # Cache of whether an untrusted tool has been seen per session
-        self._session_untrusted_tool_called: Dict[str, bool] = {}
 
-    def _has_untrusted_tool_been_called(self, session_id: str) -> bool:
-        """
-        Check if any untrusted tool has been called in this session.
-
-        This mirrors the mem0 'no_untrusted_tools' behavior: once an untrusted
-        tool is detected in the trace for a session, we treat the rest of the
-        session as untrusted and block RAG indexing.
-        """
-        # Check cache first
-        if session_id in self._session_untrusted_tool_called:
-            return self._session_untrusted_tool_called[session_id]
-
-        # If no trace file, assume no untrusted tools called
-        if not self.trace_file:
-            self._session_untrusted_tool_called[session_id] = False
-            return False
-
-        try:
-            trace_events = read_trace_events(self.trace_file, session_id)
-            for event in trace_events:
-                if event.get("event_type") == "tool_call":
-                    payload = event.get("payload", {})
-                    tool_name = payload.get("tool_name", "")
-                    if tool_name in UNTRUSTED_TOOLS:
-                        self._session_untrusted_tool_called[session_id] = True
-                        return True
-        except Exception as e:
-            print(f"Warning: Could not check trace events for RAG defense: {e}")
-
-        self._session_untrusted_tool_called[session_id] = False
-        return False
 
     def should_index_memory(
         self,
@@ -109,7 +63,9 @@ class RAGDefenseManager:
         # Defense 5: No untrusted tools – once any untrusted tool is used in
         # the session, disable RAG indexing for the rest of the session.
         if self.defense_type == "no_untrusted_tools":
-            if self._has_untrusted_tool_been_called(session_id):
+            # Check session trust status using SessionTrustManager
+            from agent.agent_core import SessionTrustManager
+            if not SessionTrustManager.is_trusted(session_id):
                 return False
 
         # Other defenses allow indexing (they filter/modify instead)
@@ -141,19 +97,21 @@ class RAGDefenseManager:
     def get_chunk_size(
         self,
         default_chunk_size: int = 512,
+        limit_memory_size: int = 80,
     ) -> int:
         """
         Get the chunk size to use based on defense type.
 
         Args:
             default_chunk_size: Default chunk size from config
+            limit_memory_size: Maximum characters for limit_memory_length defense (from config)
 
         Returns:
-            Chunk size to use
+            Chunk size to use (in characters)
         """
-        # Defense 4: Limit chunk size to 8 tokens
+        # Defense: limit_chunk_size - Limit chunk size to configured limit
         if self.defense_type == "limit_chunk_size":
-            return 8
+            return limit_memory_size
 
         # Other defenses use default chunk size
         return default_chunk_size
