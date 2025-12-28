@@ -84,22 +84,51 @@ class ExplicitMemoryBackend:
         """
         memory_file = test_dir / "agent_memory.json"
         
-        # New unified structure: initial_memory/{set_number}/explicit.json
-        # Try new structure first
+        # Get defense type from config
+        explicit_memory_config = config.get("memory", {}).get("explicit_memory", {})
+        defense_type = explicit_memory_config.get("defense_type", "none")
+        
+        # Unified structure: initial_memory/{set_number}/{backend}/{defense}/explicit.json
         base_dir = Path("data/benchmark/initial_environment/initial_memory")
-        source_memory = base_dir / memory_set / "explicit.json"
-        
-        # Fallback to old structure for backward compatibility
-        if not source_memory.exists():
-            # Old structure: initial_explicit_memory/{memory_set}.json
-            old_base_dir = Path("data/benchmark/initial_environment/initial_explicit_memory")
-            source_memory = old_base_dir / f"{memory_set}.json"
-        
-        # Another fallback: old initial_memory/{memory_set}.json
-        if not source_memory.exists():
-            source_memory = base_dir / f"{memory_set}.json"
+        source_memory = base_dir / memory_set / "explicit" / defense_type / "explicit.json"
         
         if source_memory.exists():
+            # Validate labels for provable_policy defense
+            is_provable_policy = defense_type == "provable_policy"
+            if is_provable_policy:
+                try:
+                    with open(source_memory, 'r', encoding='utf-8') as f:
+                        memory_data = json.load(f)
+                    
+                    long_term_memory = memory_data.get("long_term", [])
+                    for mem_idx, mem_entry in enumerate(long_term_memory):
+                        # Handle both string and dict formats
+                        if isinstance(mem_entry, str):
+                            # Old format: string without label - error for provable_policy
+                            raise ValueError(
+                                f"Initial explicit memory entry {mem_idx} is missing required 'label' metadata. "
+                                f"All initial memories must have 'label' set to 'T' (Trusted) or 'U' (Untrusted) "
+                                f"when using provable_policy defense. "
+                                f"Memory set: {memory_set}, Entry text preview: {mem_entry[:50]}..."
+                            )
+                        elif isinstance(mem_entry, dict):
+                            if "label" not in mem_entry:
+                                raise ValueError(
+                                    f"Initial explicit memory entry {mem_idx} is missing required 'label' metadata. "
+                                    f"All initial memories must have 'label' set to 'T' (Trusted) or 'U' (Untrusted) "
+                                    f"when using provable_policy defense. "
+                                    f"Memory set: {memory_set}, Entry text preview: {mem_entry.get('text', '')[:50]}..."
+                                )
+                            label = mem_entry.get("label")
+                            if label not in ["T", "U"]:
+                                raise ValueError(
+                                    f"Initial explicit memory entry {mem_idx} has invalid label '{label}'. "
+                                    f"Label must be 'T' (Trusted) or 'U' (Untrusted). "
+                                    f"Memory set: {memory_set}, Entry text preview: {mem_entry.get('text', '')[:50]}..."
+                                )
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Invalid JSON in explicit memory file {source_memory}: {e}")
+            
             shutil.copy2(source_memory, memory_file)
             print(f"✅ Loaded explicit memory set: {memory_set}")
             
@@ -115,7 +144,9 @@ class ExplicitMemoryBackend:
                 if num_memories > 0:
                     print(f"   Sample memories:")
                     for i, mem in enumerate(long_term_memory[:3], 1):
-                        mem_str = str(mem)
+                        # Extract text from dict or use string directly
+                        mem_text = mem.get("text", mem) if isinstance(mem, dict) else mem
+                        mem_str = str(mem_text)
                         if len(mem_str) > 100:
                             mem_str = mem_str[:100] + "..."
                         print(f"     {i}. {mem_str}")
@@ -179,15 +210,12 @@ class Mem0MemoryBackend:
         # Use test-specific vectorstore path
         vectorstore_path = str(test_dir / "mem0_vectorstore")
         
-        # New unified structure: initial_memory/{set_number}/mem0/
-        base_dir = Path("data/benchmark/initial_environment/initial_memory")
-        source_vectorstore = base_dir / memory_set / "mem0"
+        # Get defense type from config
+        defense_type = mem0_config.get("defense_type", "none")
         
-        # Fallback to old structure for backward compatibility
-        if not source_vectorstore.exists() or not source_vectorstore.is_dir():
-            # Old structure: initial_mem0_memory/{memory_set}/
-            old_base_dir = Path("data/benchmark/initial_environment/initial_mem0_memory")
-            source_vectorstore = old_base_dir / memory_set
+        # Unified structure: initial_memory/{set_number}/{backend}/{defense}/mem0/
+        base_dir = Path("data/benchmark/initial_environment/initial_memory")
+        source_vectorstore = base_dir / memory_set / "mem0" / defense_type / "mem0"
         
         # Clear if exists (shouldn't happen with unique test dirs, but safety check)
         vectorstore_path_obj = Path(vectorstore_path)
@@ -217,8 +245,40 @@ class Mem0MemoryBackend:
             top_k=mem0_config.get("top_k", 3),
             user_id=mem0_config.get("user_id", "vince"),
             agent_id=mem0_config.get("agent_id", None),
-            force_new=False  # Use the copied vectorstore
+  # Use the copied vectorstore
         )
+        
+        # Validate labels for provable_policy defense
+        is_provable_policy = defense_type == "provable_policy"
+        if is_provable_policy and source_vectorstore.exists() and source_vectorstore.is_dir():
+            try:
+                user_id = mem0_config.get("user_id", "vince")
+                agent_id = mem0_config.get("agent_id", None)
+                memories = mem0_manager.get_all_memories(user_id=user_id, agent_id=agent_id, limit=1000)
+                for mem_idx, memory_item in enumerate(memories):
+                    if isinstance(memory_item, dict):
+                        metadata = memory_item.get("metadata", {})
+                        label = metadata.get("label", None)
+                        if label is None:
+                            memory_text = memory_item.get("memory", "")[:50]
+                            raise ValueError(
+                                f"Initial mem0 memory entry {mem_idx} is missing required 'label' metadata. "
+                                f"All initial memories must have 'label' set to 'T' (Trusted) or 'U' (Untrusted) "
+                                f"when using provable_policy defense. "
+                                f"Memory set: {memory_set}, Memory text preview: {memory_text}..."
+                            )
+                        if label not in ["T", "U"]:
+                            memory_text = memory_item.get("memory", "")[:50]
+                            raise ValueError(
+                                f"Initial mem0 memory entry {mem_idx} has invalid label '{label}'. "
+                                f"Label must be 'T' (Trusted) or 'U' (Untrusted). "
+                                f"Memory set: {memory_set}, Memory text preview: {memory_text}..."
+                            )
+            except Exception as e:
+                if isinstance(e, ValueError):
+                    raise  # Re-raise validation errors
+                # For other errors (e.g., vectorstore not accessible), just warn
+                print(f"⚠️ Could not validate mem0 memory labels: {e}")
         
         # Verify memories are accessible and print contents
         try:
@@ -293,7 +353,6 @@ class Mem0MemoryBackend:
                 top_k=mem0_config.get("top_k", 3),
                 user_id=user_id,
                 agent_id=agent_id,
-                force_new=False
             )
             
             memories = mem0_manager.get_all_memories(user_id=user_id, agent_id=agent_id, limit=1000)
@@ -357,15 +416,16 @@ class RAGMemoryBackend:
         vectorstore_path = test_dir / "rag_vectorstore"
         vectorstore_path_str = str(vectorstore_path)
         
-        # New unified structure: initial_memory/{set_number}/
+        # Get defense type from config
+        defense_type = rag_config.get("defense_type", "none")
+        
+        # Unified structure: initial_memory/{set_number}/{backend}/{defense}/rag_vectorstore/
         base_dir = Path("data/benchmark/initial_environment/initial_memory")
-        old_base_dir = Path("data/benchmark/initial_environment/initial_rag_memory")
         
         # Check for pre-computed vectorstore first (fast path - no API calls!)
-        source_vectorstore = base_dir / memory_set / "rag_vectorstore"
-        old_source_vectorstore = old_base_dir / f"{memory_set}_vectorstore"
+        source_vectorstore = base_dir / memory_set / "rag" / defense_type / "rag_vectorstore"
         
-        # Try new unified structure first
+        # Try unified structure
         if source_vectorstore.exists() and (source_vectorstore / "index.faiss").exists():
             print(f"📦 Loading pre-computed RAG vectorstore from: {source_vectorstore}")
             # Copy pre-computed vectorstore (instant, no API calls)
@@ -380,7 +440,7 @@ class RAGMemoryBackend:
                 top_k=rag_config.get("top_k", 3),
                 chunk_size=rag_config.get("chunk_size", 512),
                 vectorstore_path=vectorstore_path_str,
-                force_new=False  # Load existing vectorstore
+  # Load existing vectorstore
             )
             
             # Verify and print stats
@@ -400,23 +460,6 @@ class RAGMemoryBackend:
             
             return  # Successfully loaded from pre-computed vectorstore
         
-        # Fallback: Try old structure
-        if old_source_vectorstore.exists() and (old_source_vectorstore / "index.faiss").exists():
-            print(f"📦 Loading pre-computed RAG vectorstore from: {old_source_vectorstore}")
-            if vectorstore_path.exists():
-                shutil.rmtree(vectorstore_path)
-            shutil.copytree(old_source_vectorstore, vectorstore_path)
-            print(f"✅ Copied RAG vectorstore to: {vectorstore_path}")
-            
-            rag_memory_manager = get_rag_memory_manager(
-                embedding_model=rag_config.get("embedding_model", "text-embedding-3-small"),
-                top_k=rag_config.get("top_k", 3),
-                chunk_size=rag_config.get("chunk_size", 512),
-                vectorstore_path=vectorstore_path_str,
-                force_new=False
-            )
-            return
-        
         # No pre-computed vectorstore found - generate from JSON (slower, but works)
         print(f"⚠️ No pre-computed vectorstore found. Generating from JSON (this may take a while)...")
         
@@ -426,17 +469,13 @@ class RAGMemoryBackend:
             top_k=rag_config.get("top_k", 3),
             chunk_size=rag_config.get("chunk_size", 512),
             vectorstore_path=vectorstore_path_str,
-            force_new=True  # Create new vectorstore for test isolation
+  # Create new vectorstore for test isolation
         )
         
         chunks_loaded = 0
         
-        # Try new unified structure first
-        json_file = base_dir / memory_set / "rag.json"
-        
-        # Fallback to old structure for backward compatibility
-        if not json_file.exists():
-            json_file = old_base_dir / f"{memory_set}.json"
+        # Unified structure: initial_memory/{set_number}/{backend}/{defense}/rag.json
+        json_file = base_dir / memory_set / "rag" / defense_type / "rag.json"
         
         if json_file.exists():
             print(f"Loading RAG memory set from JSON: {json_file}")
@@ -444,16 +483,28 @@ class RAGMemoryBackend:
                 data = json.load(f)
             
             chunks = data.get("chunks", [])
+            
+            # Check if provable_policy defense is active
+            rag_defense_type = config.get("memory", {}).get("rag_memory", {}).get("defense_type", "none")
+            is_provable_policy = rag_defense_type == "provable_policy"
+            
             if not chunks:
                 # Fallback: if "chunks" key doesn't exist, treat whole file as single chunk
-                text_content = data.get("text", "") or json.dumps(data, indent=2)
-                chunks = [{"text": text_content}]
+                # BUT: Skip this fallback for provable_policy defense (empty memory sets are allowed)
+                if is_provable_policy:
+                    # Empty memory set is valid for provable_policy - just skip chunk creation
+                    chunks = []
+                else:
+                    # For other defenses, use fallback for backward compatibility
+                    text_content = data.get("text", "") or json.dumps(data, indent=2)
+                    chunks = [{"text": text_content}]
             
             # Prepare all documents at once for batch processing (much faster!)
             if not LANGCHAIN_AVAILABLE:
                 raise ImportError("langchain packages required for RAG memory")
             
             documents = []
+            
             for chunk_idx, chunk_data in enumerate(chunks):
                 if isinstance(chunk_data, str):
                     text = chunk_data
@@ -470,6 +521,24 @@ class RAGMemoryBackend:
                     doc_metadata = metadata.copy()
                     doc_metadata["chunk_id"] = chunk_idx
                     doc_metadata["timestamp"] = datetime.now(timezone.utc).isoformat()
+                    
+                    # Validate label for provable_policy defense
+                    if is_provable_policy:
+                        if "label" not in doc_metadata:
+                            raise ValueError(
+                                f"Initial memory chunk {chunk_idx} is missing required 'label' metadata. "
+                                f"All initial memories must have 'label' set to 'T' (Trusted) or 'U' (Untrusted) "
+                                f"when using provable_policy defense. "
+                                f"Memory set: {memory_set}, Chunk text preview: {text[:50]}..."
+                            )
+                        label = doc_metadata["label"]
+                        if label not in ["T", "U"]:
+                            raise ValueError(
+                                f"Initial memory chunk {chunk_idx} has invalid label '{label}'. "
+                                f"Label must be 'T' (Trusted) or 'U' (Untrusted). "
+                                f"Memory set: {memory_set}, Chunk text preview: {text[:50]}..."
+                            )
+                    
                     doc = Document(page_content=text.strip(), metadata=doc_metadata)
                     documents.append(doc)
                     chunks_loaded += 1
@@ -513,81 +582,6 @@ class RAGMemoryBackend:
                     print(f"     ... and {chunks_loaded - 3} more")
             return
         
-        # Try raw text file (auto-chunk) - old structure only
-        txt_file = old_base_dir / f"{memory_set}.txt"
-        if txt_file.exists():
-            print(f"Loading RAG memory set from text file: {txt_file}")
-            with open(txt_file, 'r', encoding='utf-8') as f:
-                text_content = f.read()
-            
-            # Chunk the text
-            from benchmark.memory_benchmark_utils import chunk_context_for_memory
-            chunk_size = rag_config.get("chunk_size", 512)
-            chunks = chunk_context_for_memory(text_content, chunk_size=chunk_size)
-            
-            for chunk_idx, chunk_text in enumerate(chunks):
-                metadata = {
-                    "source": memory_set,
-                    "type": "initial_memory",
-                    "chunk_index": chunk_idx,
-                    "auto_chunked": True
-                }
-                rag_memory_manager.add_memory(chunk_text, metadata=metadata)
-                chunks_loaded += 1
-            
-            print(f"✅ Loaded and chunked {chunks_loaded} chunks from text file")
-            print(f"   📝 Total chunks: {chunks_loaded}")
-            
-            # Print sample chunks
-            if chunks_loaded > 0:
-                print(f"   Sample chunks:")
-                for i, chunk_text in enumerate(chunks[:3], 1):
-                    display_text = chunk_text
-                    if len(display_text) > 100:
-                        display_text = display_text[:100] + "..."
-                    print(f"     {i}. {display_text}")
-                if chunks_loaded > 3:
-                    print(f"     ... and {chunks_loaded - 3} more")
-            return
-        
-        # Try directory format (each file = one chunk) - old structure only
-        dir_path = old_base_dir / memory_set
-        if dir_path.exists() and dir_path.is_dir():
-            print(f"Loading RAG memory set from directory: {dir_path}")
-            text_files = sorted(dir_path.glob("*.txt"))
-            
-            for file_idx, text_file in enumerate(text_files):
-                with open(text_file, 'r', encoding='utf-8') as f:
-                    text_content = f.read()
-                
-                if text_content.strip():
-                    metadata = {
-                        "source": memory_set,
-                        "type": "initial_memory",
-                        "file_name": text_file.name,
-                        "file_index": file_idx
-                    }
-                    rag_memory_manager.add_memory(text_content, metadata=metadata)
-                    chunks_loaded += 1
-            
-            print(f"✅ Loaded {chunks_loaded} chunks from directory")
-            print(f"   📝 Total chunks: {chunks_loaded}")
-            
-            # Print sample chunks
-            if chunks_loaded > 0:
-                print(f"   Sample chunks:")
-                sample_files = text_files[:3]
-                for i, text_file in enumerate(sample_files, 1):
-                    with open(text_file, 'r', encoding='utf-8') as f:
-                        chunk_text = f.read()
-                    display_text = chunk_text
-                    if len(display_text) > 100:
-                        display_text = display_text[:100] + "..."
-                    print(f"     {i}. {display_text}")
-                if chunks_loaded > 3:
-                    print(f"     ... and {chunks_loaded - 3} more")
-            return
-        
         # Not found
         print(f"⚠️ RAG memory set '{memory_set}' not found, created empty vectorstore")
         print(f"   📝 Total chunks: 0")
@@ -626,7 +620,6 @@ class RAGMemoryBackend:
                 top_k=rag_config.get("top_k", 3),
                 chunk_size=rag_config.get("chunk_size", 512),
                 vectorstore_path=vectorstore_path,
-                force_new=False
             )
             
             # Get all memory chunks from the documents list
@@ -678,14 +671,15 @@ class RAGMemoryBackend:
             rag_config["enabled"] = True
         
         base_dir = Path("data/benchmark/initial_environment/initial_memory")
-        old_base_dir = Path("data/benchmark/initial_environment/initial_rag_memory")
         
-        # Determine source JSON file
-        json_file = base_dir / memory_set / "rag.json"
+        # Determine source JSON file (unified structure)
+        # Try with defense type "none" first (most common)
+        defense_type = rag_config.get("defense_type", "none")
+        json_file = base_dir / memory_set / "rag" / defense_type / "rag.json"
+        
+        # If not found, try without defense type (for backward compatibility with unified structure)
         if not json_file.exists():
-            json_file = old_base_dir / f"{memory_set}.json"
-            if not json_file.exists():
-                json_file = old_base_dir / f"rag_memory_set_{memory_set}.json"
+            json_file = base_dir / memory_set / "rag.json"
         
         if not json_file.exists():
             print(f"❌ JSON file not found for memory set '{memory_set}'")
@@ -753,7 +747,6 @@ class RAGMemoryBackend:
             top_k=rag_config.get("top_k", 3),
             chunk_size=rag_config.get("chunk_size", 512),
             vectorstore_path=vectorstore_path_str,
-            force_new=True
         )
         
         # Generate embeddings and create vectorstore (batch mode)
@@ -788,29 +781,208 @@ class RAGMemoryBackend:
     def find_rag_memory_sets() -> List[str]:
         """Find all available RAG memory sets."""
         base_dir = Path("data/benchmark/initial_environment/initial_memory")
-        old_base_dir = Path("data/benchmark/initial_environment/initial_rag_memory")
         
         memory_sets = set()
         
-        # Check new unified structure
+        # Check unified structure
         if base_dir.exists():
             for memory_set_dir in base_dir.iterdir():
                 if memory_set_dir.is_dir():
-                    json_file = memory_set_dir / "rag.json"
-                    if json_file.exists():
-                        memory_sets.add(memory_set_dir.name)
-        
-        # Check old structure
-        if old_base_dir.exists():
-            for json_file in old_base_dir.glob("*.json"):
-                # Extract memory set name (e.g., "rag_memory_set_1.json" -> "1")
-                name = json_file.stem
-                if name.startswith("rag_memory_set_"):
-                    memory_sets.add(name.replace("rag_memory_set_", ""))
-                else:
-                    memory_sets.add(name)
+                    # Check for rag.json in unified structure: {set}/{backend}/{defense}/rag.json
+                    rag_dir = memory_set_dir / "rag"
+                    if rag_dir.exists() and rag_dir.is_dir():
+                        # Check any defense type subdirectory
+                        for defense_dir in rag_dir.iterdir():
+                            if defense_dir.is_dir():
+                                json_file = defense_dir / "rag.json"
+                                if json_file.exists():
+                                    memory_sets.add(memory_set_dir.name)
+                                    break
+                        # Also check for rag.json directly under rag/ (unified without defense)
+                        json_file = rag_dir / "rag.json"
+                        if json_file.exists():
+                            memory_sets.add(memory_set_dir.name)
         
         return sorted(memory_sets)
+
+
+class ContextMemoryBackend:
+    """Backend for context (simple list-based) memory."""
+    
+    @property
+    def name(self) -> str:
+        return "context"
+    
+    def initialize(self, memory_set: str, test_dir: Path, config: Dict[str, Any]) -> None:
+        """Initialize context memory from a memory set.
+        
+        Args:
+            memory_set: Memory set number (e.g., "0", "1", "2") or old format name
+        """
+        from agent.backend.context_memory_manager import get_context_memory_manager
+        
+        context_config = config.get("memory", {}).get("context_memory", {})
+        if not context_config.get("enabled", False):
+            raise ValueError("context_memory must be enabled in config")
+        
+        # Use test-specific context path
+        context_path = test_dir / "context_memory.json"
+        context_path_str = str(context_path)
+        
+        # Get defense type from config
+        defense_type = context_config.get("defense_type", "none")
+        
+        # Unified structure: initial_memory/{set_number}/{backend}/{defense}/context.json
+        base_dir = Path("data/benchmark/initial_environment/initial_memory")
+        source_context = base_dir / memory_set / "context" / defense_type / "context.json"
+        
+        # Clear if exists (shouldn't happen with unique test dirs, but safety check)
+        if context_path.exists():
+            context_path.unlink()
+        
+        # Copy from source if it exists
+        if source_context.exists():
+            print(f"📦 Loading context memory set '{memory_set}' from {source_context}...")
+            
+            # Validate labels for provable_policy defense
+            is_provable_policy = defense_type == "provable_policy"
+            if is_provable_policy:
+                try:
+                    with open(source_context, 'r', encoding='utf-8') as f:
+                        context_data = json.load(f)
+                    
+                    history = context_data.get("history", [])
+                    for entry_idx, entry in enumerate(history):
+                        # Handle both string and dict formats
+                        if isinstance(entry, str):
+                            # Old format: string without label - error for provable_policy
+                            raise ValueError(
+                                f"Initial context memory entry {entry_idx} is missing required 'label' metadata. "
+                                f"All initial memories must have 'label' set to 'T' (Trusted) or 'U' (Untrusted) "
+                                f"when using provable_policy defense. "
+                                f"Memory set: {memory_set}, Entry text preview: {entry[:50]}..."
+                            )
+                        elif isinstance(entry, dict):
+                            if "label" not in entry:
+                                raise ValueError(
+                                    f"Initial context memory entry {entry_idx} is missing required 'label' metadata. "
+                                    f"All initial memories must have 'label' set to 'T' (Trusted) or 'U' (Untrusted) "
+                                    f"when using provable_policy defense. "
+                                    f"Memory set: {memory_set}, Entry text preview: {entry.get('text', '')[:50]}..."
+                                )
+                            label = entry.get("label")
+                            if label not in ["T", "U"]:
+                                raise ValueError(
+                                    f"Initial context memory entry {entry_idx} has invalid label '{label}'. "
+                                    f"Label must be 'T' (Trusted) or 'U' (Untrusted). "
+                                    f"Memory set: {memory_set}, Entry text preview: {entry.get('text', '')[:50]}..."
+                                )
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Invalid JSON in context memory file {source_context}: {e}")
+            
+            shutil.copy2(source_context, context_path)
+            print(f"✅ Copied context memory set to: {context_path}")
+        else:
+            # No source context - create empty one
+            print(f"⚠️ Source context not found: {source_context}")
+            print(f"   Creating empty context at: {context_path}")
+            empty_context = {"history": []}
+            with open(context_path, 'w', encoding='utf-8') as f:
+                json.dump(empty_context, f, indent=2)
+        
+        # Initialize manager with the context path
+        # Get max_context_length from config if specified
+        max_context_length = context_config.get("max_context_length")
+        model_name = config.get("agent", {}).get("target_model_name", "gpt-5-mini")
+        
+        context_manager = get_context_memory_manager(
+            context_path=context_path_str,
+            max_context_length=max_context_length,
+            model_name=model_name,
+        )
+        
+        # Verify and print stats
+        try:
+            history = context_manager.history
+            num_entries = len(history)
+            print(f"✅ Loaded {num_entries} context entries from {memory_set}")
+            print(f"   📝 Total entries: {num_entries}")
+            
+            if num_entries > 0:
+                print(f"   Sample entries:")
+                for i, entry in enumerate(history[:3], 1):
+                    # Extract text from dict or use string directly
+                    entry_text = entry.get("text", entry) if isinstance(entry, dict) else entry
+                    entry_str = str(entry_text)
+                    if len(entry_str) > 100:
+                        entry_str = entry_str[:100] + "..."
+                    print(f"     {i}. {entry_str}")
+                if num_entries > 3:
+                    print(f"     ... and {num_entries - 3} more")
+            else:
+                print(f"⚠️ Empty context (no source context found)")
+                print(f"   📝 Total entries: 0")
+        except Exception as e:
+            print(f"⚠️ Could not verify context contents: {e}")
+    
+    def get_memory_state(self, test_dir: Path, config: Dict[str, Any]) -> List[str]:
+        """Get context memory contents.
+        
+        For efficiency, this method first checks for recent entries added in the current step.
+        If no recent entries file exists, it falls back to checking all history.
+        """
+        import json
+        
+        # First, try to get recent entries (much faster - only checks what was added this step)
+        recent_entries_file = test_dir / "context_recent_chunks.json"
+        if recent_entries_file.exists():
+            try:
+                with open(recent_entries_file, 'r', encoding='utf-8') as f:
+                    recent_entries = json.load(f)
+                if recent_entries:
+                    # Return recent entries - these are what were added in the current turn
+                    return recent_entries
+            except Exception:
+                # If we can't read recent entries, fall back to full retrieval
+                pass
+        
+        # Fallback: Get all memory entries from the context file
+        # This is slower but ensures we check everything if recent entries aren't available
+        from agent.backend.context_memory_manager import get_context_memory_manager
+        
+        context_config = config.get("memory", {}).get("context_memory", {})
+        context_path = str(test_dir / "context_memory.json")
+        
+        try:
+            # Get max_context_length from config if specified
+            max_context_length = context_config.get("max_context_length")
+            model_name = config.get("agent", {}).get("target_model_name", "gpt-5-mini")
+            
+            context_manager = get_context_memory_manager(
+                context_path=context_path,
+                max_context_length=max_context_length,
+                model_name=model_name,
+            )
+            
+            # Get all history entries
+            if hasattr(context_manager, 'history') and context_manager.history:
+                return list(context_manager.history)
+            
+            return []
+        except Exception as e:
+            print(f"Warning: Could not read context memory: {e}")
+            return []
+    
+    def clear_memory(self, test_dir: Path) -> None:
+        """Clear context memory."""
+        context_path = test_dir / "context_memory.json"
+        if context_path.exists():
+            context_path.unlink()
+        
+        # Also clear recent chunks file if it exists
+        recent_chunks_file = test_dir / "context_recent_chunks.json"
+        if recent_chunks_file.exists():
+            recent_chunks_file.unlink()
 
 
 class MemoryBackendRegistry:
@@ -825,6 +997,7 @@ class MemoryBackendRegistry:
         self.register("explicit", ExplicitMemoryBackend)
         self.register("mem0", Mem0MemoryBackend)
         self.register("rag", RAGMemoryBackend)
+        self.register("context", ContextMemoryBackend)
     
     def register(self, name: str, backend_class: Type[MemoryBackend]) -> None:
         """

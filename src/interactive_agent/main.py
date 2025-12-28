@@ -248,6 +248,9 @@ def create_agent_executor():
     # Get long-term memory context
     try:
         memory_manager = get_memory_manager()
+        # Note: For provable_policy defense, session_id and defense_type should be passed
+        # but in interactive_agent context, we don't have them here, so pass None
+        # The defense will still work when memories are retrieved in agent_core
         memory_context = memory_manager.get_long_term_as_text()
         print(f"Loaded memory context: {len(memory_context)} characters")
         if memory_context:

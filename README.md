@@ -37,7 +37,7 @@ python scripts/run_benchmark.py --memory-backend explicit --defense-type none --
 python scripts/run_benchmark.py --memory-backend mem0 --all-defenses --suite benign
 
 # Run a specific test file with RAG memory
-python scripts/run_benchmark.py --memory-backend rag --defense-type user_only --test data/benchmark/tests/benign/00_email_tools.json
+python scripts/run_benchmark.py --memory-backend rag --defense-type user_prompt_only --test data/benchmark/tests/benign/00_email_tools.json
 ```
 
 #### Memory Backends
@@ -73,10 +73,10 @@ Unified defense types work consistently across all backends:
   - No memory entries are created
   - Useful for baseline comparison without memory
 
-- **`user_only`**: Only index user messages
+- **`user_prompt_only`**: Only index user messages
   - Filters out agent responses
   - Prevents agent-generated content from being stored
-  - **Backend mapping**: `user_prompt_only` for explicit, `user_only` for mem0/rag
+  - **Backend mapping**: Unified name `user_prompt_only` maps to `user_prompt_only` (explicit) or `user_prompt_only` (mem0/rag/context) internally
 
 - **`no_untrusted_tools`**: Block memory indexing after untrusted tools
   - Memory indexing stops once an untrusted tool is called
@@ -96,7 +96,7 @@ Test suites are organized by attack type:
 python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite benign
 
 # Run direct attack tests
-python scripts/run_benchmark.py --memory-backend mem0 --defense-type user_only --suite direct
+python scripts/run_benchmark.py --memory-backend mem0 --defense-type user_prompt_only --suite direct
 
 # Run indirect attack tests
 python scripts/run_benchmark.py --memory-backend rag --defense-type none --suite indirect
@@ -109,7 +109,7 @@ python scripts/run_benchmark.py --memory-backend rag --defense-type none --suite
 python scripts/run_benchmark.py --memory-backend explicit --defense-type none --test data/benchmark/tests/benign/00_email_tools.json
 
 # Run all tests in a directory
-python scripts/run_benchmark.py --memory-backend mem0 --defense-type user_only --test data/benchmark/tests/benign/
+python scripts/run_benchmark.py --memory-backend mem0 --defense-type user_prompt_only --test data/benchmark/tests/benign/
 ```
 
 #### Running All Defenses
@@ -120,7 +120,7 @@ Run all defense types for a backend in one command:
 # Run all defenses for explicit memory
 python scripts/run_benchmark.py --memory-backend explicit --all-defenses --suite benign
 
-# This runs: disable_memory, none, user_only, no_untrusted_tools, limit_memory_length
+# This runs: disable_memory, none, user_prompt_only, no_untrusted_tools, limit_memory_length
 ```
 
 #### Result Caching
@@ -146,7 +146,7 @@ python scripts/run_benchmark.py --memory-backend explicit --defense-type none --
 
 ```bash
 # Use custom config file
-python scripts/run_benchmark.py --memory-backend mem0 --defense-type user_only --suite benign --config my_config.yaml
+python scripts/run_benchmark.py --memory-backend mem0 --defense-type user_prompt_only --suite benign --config my_config.yaml
 
 # Use custom results directory
 python scripts/run_benchmark.py --memory-backend rag --defense-type none --suite benign --results-dir data/custom_results
@@ -154,7 +154,7 @@ python scripts/run_benchmark.py --memory-backend rag --defense-type none --suite
 # Combine options
 python scripts/run_benchmark.py \
   --memory-backend explicit \
-  --defense-type user_only \
+  --defense-type user_prompt_only \
   --suite benign \
   --config config.yaml \
   --force \
@@ -174,7 +174,7 @@ python scripts/run_benchmark.py --help
 --test TEST                           # Specific test file or directory
 
 # Defense selection (one required):
---defense-type {disable_memory,none,user_only,no_untrusted_tools,limit_memory_length}
+--defense-type {disable_memory,none,user_prompt_only,no_untrusted_tools,limit_memory_length}
 --all-defenses                        # Run all defense types
 
 # Optional:
@@ -190,7 +190,7 @@ Test results are saved in a unified structure:
 ```
 data/benchmark/results/
   {memory_backend}/           # explicit, mem0, or rag
-    {defense_type}/           # none, disable_memory, user_only, etc.
+    {defense_type}/           # none, disable_memory, user_prompt_only, etc.
       {model_name}/           # gpt-5-mini, gpt-4o, etc.
         {attack_type}/        # benign, direct, or indirect
           {test_file}.json    # Individual test results
@@ -371,7 +371,7 @@ memory:
   # Explicit memory configuration
   explicit_memory:
     enabled: true      # Set to true to use explicit memory
-    defense_type: "none"  # Unified defense type: none, disable_memory, user_only, etc.
+    defense_type: "none"  # Unified defense type: none, disable_memory, user_prompt_only, etc.
     memory_file: "data/interactive_agent/agent_memory.json"
   
   # Mem0 memory configuration
@@ -403,10 +403,10 @@ memory:
 **Important Notes**:
 - **Only enable one backend**: Set `enabled: true` for the backend you want to use, and `enabled: false` for others
 - **CLI overrides config**: The `--memory-backend` argument in `run_benchmark.py` automatically enables the specified backend and disables others
-- **Unified defense types**: Use the same defense type names across all backends (e.g., `"none"`, `"user_only"`). The system automatically maps them to backend-specific implementations
+- **Unified defense types**: Use the same defense type names across all backends (e.g., `"none"`, `"user_prompt_only"`). The system automatically maps them to backend-specific implementations
 - **Defense mapping**: 
   - `"none"` → `"none"` (explicit/rag) or `"no_defense"` (mem0)
-  - `"user_only"` → `"user_prompt_only"` (explicit) or `"user_only"` (mem0/rag)
+  - `"user_prompt_only"` → `"user_prompt_only"` (explicit) or `"user_prompt_only"` (mem0/rag/context) internally
   - `"limit_memory_length"` → `"limit_memory_length"` (explicit/mem0) or `"limit_chunk_size"` (rag)
 
 ### Benchmark Configuration
@@ -517,7 +517,7 @@ The agent supports three memory backends, each with different characteristics:
 All memory backends support unified defense types:
 - **`none`**: No defense (baseline behavior)
 - **`disable_memory`**: Completely disable memory indexing
-- **`user_only`**: Only index user messages (filter agent responses)
+- **`user_prompt_only`**: Only index user messages (filter agent responses)
 - **`no_untrusted_tools`**: Block memory indexing after untrusted tools are called
 - **`limit_memory_length`**: Limit memory entry length (backend-specific implementation)
 
@@ -692,7 +692,7 @@ python scripts/consolidate_results.py --output-dir data/consolidated
 ```
 
 The script generates comprehensive CSV tables with:
-- **Rows**: Defense types (disable_memory, none, user_only, no_untrusted_tools, limit_memory_length)
+- **Rows**: Defense types (disable_memory, none, user_prompt_only, no_untrusted_tools, limit_memory_length)
 - **Columns**: Memory backends (disable_memory, explicit, mem0, rag) with steps passed/total and percentage
 - **Output**: Separate CSV files for each model and attack type: `{model_name}_{attack_type}_consolidated.csv`
 
@@ -712,14 +712,14 @@ Test results are saved in a **unified directory structure**:
 data/benchmark/results/
   {model_name}/               # gpt-5-mini, gpt-4o, etc.
     {memory_backend}/         # explicit, mem0, rag, or none (for disable_memory)
-      {defense_type}/         # none, disable_memory, user_only, etc.
+      {defense_type}/         # none, disable_memory, user_prompt_only, etc.
         {attack_type}/        # benign, direct, or indirect
           {test_file}.json
 ```
 
 **Example paths**:
 - `data/benchmark/results/gpt-5-mini/explicit/none/benign/00_email_tools.json`
-- `data/benchmark/results/gpt-5-mini/mem0/user_only/direct/01_attack_test.json`
+- `data/benchmark/results/gpt-5-mini/mem0/user_prompt_only/direct/01_attack_test.json`
 - `data/benchmark/results/gpt-4o/rag/no_untrusted_tools/indirect/02_poisoning_test.json`
 - `data/benchmark/results/gpt-5-mini/none/disable_memory/benign/00_email_tools.json` (no memory enabled)
 
@@ -821,7 +821,7 @@ The caching key is: `{memory_backend}/{defense_type}/{model_name}/{attack_type}/
 - Ensure test suite directory exists (benign, direct, or indirect)
 
 **Defense type not working:**
-- Verify defense type is one of: `none`, `disable_memory`, `user_only`, `no_untrusted_tools`, `limit_memory_length`
+- Verify defense type is one of: `none`, `disable_memory`, `user_prompt_only`, `no_untrusted_tools`, `limit_memory_length`
 - Check that defense type is correctly mapped for your backend (see Memory Configuration section)
 - For mem0: `none` maps to `no_defense` internally (this is automatic)
 
@@ -847,7 +847,7 @@ python scripts/run_benchmark.py --memory-backend explicit --defense-type none --
 python scripts/run_benchmark.py --memory-backend mem0 --all-defenses --suite benign
 
 # Run specific test with force overwrite
-python scripts/run_benchmark.py --memory-backend rag --defense-type user_only --test data/benchmark/tests/benign/00_email_tools.json --force
+python scripts/run_benchmark.py --memory-backend rag --defense-type user_prompt_only --test data/benchmark/tests/benign/00_email_tools.json --force
 
 # Consolidate all results (generates comprehensive CSV tables)
 python scripts/consolidate_results.py
@@ -867,7 +867,7 @@ python scripts/consolidate_results.py
 |---------|-------------|-----------------|
 | `none` | No defense (baseline) | `none` (explicit/rag), `no_defense` (mem0) |
 | `disable_memory` | Disable all indexing | `disable_memory` (all) |
-| `user_only` | Only index user messages | `user_prompt_only` (explicit), `user_only` (mem0/rag) |
+| `user_prompt_only` | Only index user messages | `user_prompt_only` (explicit), `user_prompt_only` (mem0/rag/context) internally |
 | `no_untrusted_tools` | Block after untrusted tools | `no_untrusted_tools` (all) |
 | `limit_memory_length` | Limit entry length | `limit_memory_length` (explicit/mem0), `limit_chunk_size` (rag) |
 
@@ -885,7 +885,7 @@ data/benchmark/tests/
 ```
 data/benchmark/results/
   {memory_backend}/        # explicit, mem0, or rag
-    {defense_type}/        # none, disable_memory, user_only, etc.
+    {defense_type}/        # none, disable_memory, user_prompt_only, etc.
       {model_name}/        # gpt-5-mini, gpt-4o, etc.
         {attack_type}/     # benign, direct, or indirect
           {test_file}.json # Individual test results

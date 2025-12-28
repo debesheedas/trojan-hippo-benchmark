@@ -11,7 +11,13 @@ This script runs benchmarks for any memory backend with any defense type.
 Uses unified abstractions and result structure.
 """
 
+import os
 import sys
+
+# Fix OpenMP initialization error on macOS
+# This MUST be set before ANY imports that might use OpenMP (e.g., FAISS, numpy)
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import argparse
 import json
 from pathlib import Path
@@ -27,7 +33,10 @@ from benchmark.benchmark_utils import (
     get_result_path,
     should_skip_test,
     get_memory_backend_from_config,
-    get_unified_defense_from_config
+    get_unified_defense_from_config,
+    determine_attack_type,
+    cleanup_old_test_environments,
+    discover_test_files
 )
 from benchmark.test_bench import TestBench
 
@@ -36,6 +45,9 @@ def get_all_test_files(test_path: str, test_dir: Path) -> List[Path]:
     """
     Get all test files from a path.
     
+    This is a wrapper around the shared discover_test_files utility.
+    Kept for backward compatibility.
+    
     Args:
         test_path: Path string (file, directory, or suite name)
         test_dir: Base test directory
@@ -43,33 +55,11 @@ def get_all_test_files(test_path: str, test_dir: Path) -> List[Path]:
     Returns:
         List of test file paths
     """
-    # Handle suite keywords
-    if test_path in {"benign", "direct", "indirect"}:
-        test_path_obj = test_dir / test_path
-    else:
-        test_path_obj = Path(test_path)
-    
-    # Fallback to old structure if not found
-    if not test_path_obj.exists():
-        if test_path in {"benign", "direct", "indirect"}:
-            old_paths = [
-                Path(f"data/benchmark/attack_bench_explicit/{test_path}"),
-                Path(f"data/benchmark/attack_bench_mem0/{test_path}"),
-                Path(f"data/benchmark/attack_bench_rag/{test_path}"),
-            ]
-            for old_path in old_paths:
-                if old_path.exists():
-                    test_path_obj = old_path
-                    break
-    
-    if not test_path_obj.exists():
-        return []
-    
-    if test_path_obj.is_file():
-        return [test_path_obj] if test_path_obj.suffix.lower() == '.json' else []
-    
-    # Directory - find all JSON files recursively
-    return sorted(test_path_obj.rglob("*.json"))
+    return discover_test_files(
+        test_path=test_path,
+        test_dir=test_dir,
+        verbose=False
+    )
 
 
 def check_results_exist(
@@ -91,13 +81,13 @@ def check_results_exist(
     
     missing = []
     for test_file in test_files:
-        # Get attack type from test file
+        # Get attack type from test file (handles memory_only tests)
         try:
             with open(test_file, 'r', encoding='utf-8') as f:
                 test_data = json.load(f)
-            attack_type = test_data.get("attack_type", "benign")
+            attack_type = determine_attack_type(test_file, test_data)
         except Exception:
-            attack_type = "benign"
+            attack_type = determine_attack_type(test_file, None)
         
         if not should_skip_test(
             memory_backend,
@@ -126,8 +116,8 @@ def run_benchmark(
     Run benchmark for a specific memory backend and defense type.
     
     Args:
-        memory_backend: Memory backend name ("explicit", "mem0", "rag", or "none" for disable_memory)
-        unified_defense: Unified defense name (e.g., "none", "user_only")
+        memory_backend: Memory backend name ("explicit", "mem0", "rag", "context", or "none" for disable_memory)
+        unified_defense: Unified defense name (e.g., "none", "user_prompt_only")
         test_path: Path to test file, directory, or suite name
         config_path: Path to config file
         force: Force overwrite existing results
@@ -160,7 +150,7 @@ def run_benchmark(
         if "memory" not in config:
             config["memory"] = {}
         # Disable all memory backends
-        for backend_name in ["explicit", "mem0", "rag"]:
+        for backend_name in ["explicit", "mem0", "rag", "context"]:
             if backend_name not in config["memory"]:
                 config["memory"][backend_name] = {}
             config["memory"][backend_name]["enabled"] = False
@@ -173,7 +163,7 @@ def run_benchmark(
         config["memory"]["backend"] = memory_backend
         
         # Enable the specified backend and disable others
-        for backend_name in ["explicit", "mem0", "rag"]:
+        for backend_name in ["explicit", "mem0", "rag", "context"]:
             # Ensure nested structure exists
             if backend_name not in config["memory"]:
                 config["memory"][backend_name] = {}
@@ -188,6 +178,8 @@ def run_benchmark(
                 backend_config_key = "mem0_memory"
             elif backend_name == "rag":
                 backend_config_key = "rag_memory"
+            elif backend_name == "context":
+                backend_config_key = "context_memory"
             
             # Ensure backend-specific config exists and is a dict (not None)
             if backend_config_key not in config["memory"]:
@@ -264,24 +256,33 @@ def run_benchmark(
     # Initialize TestBench with config dict directly (no temp file needed)
     bench = TestBench(config=config, defense_type_override=unified_defense, force=force)
     
-    # Run tests - TestBench.run_all_tests expects a path string
-    # It will handle file/directory/suite discovery internally
-    results = bench.run_all_tests(test_path)
-    
-    # Calculate summary
-    total_tests = len(results)
-    passed_tests = sum(1 for r in results if r.get("overall_success", False))
-    failed_tests = total_tests - passed_tests
-    
-    return {
-        "success": True,
-        "memory_backend": memory_backend,
-        "defense_type": unified_defense,
-        "tests_run": total_tests,
-        "tests_passed": passed_tests,
-        "tests_failed": failed_tests,
-        "results": results
-    }
+    try:
+        # Run tests - TestBench.run_all_tests expects a path string
+        # It will handle file/directory/suite discovery internally
+        results = bench.run_all_tests(test_path)
+        
+        # Calculate summary
+        total_tests = len(results)
+        passed_tests = sum(1 for r in results if r.get("overall_success", False))
+        failed_tests = total_tests - passed_tests
+        
+        return {
+            "success": True,
+            "memory_backend": memory_backend,
+            "defense_type": unified_defense,
+            "tests_run": total_tests,
+            "tests_passed": passed_tests,
+            "tests_failed": failed_tests,
+            "results": results
+        }
+    finally:
+        # Ensure cleanup happens even if there was an error
+        bench.cleanup_all_test_environments()
+        
+        # Also clean up any old test environments that might have been left behind
+        # (e.g., from crashed processes or interrupted runs)
+        # Only clean up environments older than 1 hour to avoid deleting active ones
+        cleanup_old_test_environments(max_age_hours=1)
 
 
 def run_all_defenses(
@@ -382,8 +383,11 @@ Examples:
   # Run mem0 with all defenses
   python scripts/run_benchmark.py --memory-backend mem0 --all-defenses --suite benign
   
+  # Run memory_only test suite
+  python scripts/run_benchmark.py --memory-backend rag --defense-type none --suite memory_only --model gpt-5-mini
+  
   # Run specific test file with custom model
-  python scripts/run_benchmark.py --memory-backend rag --defense-type user_only --test data/benchmark/tests/benign/00_email_tools.json --model gpt-5-mini
+  python scripts/run_benchmark.py --memory-backend rag --defense-type user_prompt_only --test data/benchmark/tests/benign/00_email_tools.json --model gpt-5-mini
   
   # Force overwrite existing results
   python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite benign --force --model gpt-5-mini
@@ -393,7 +397,7 @@ Examples:
     parser.add_argument(
         "--memory-backend",
         type=str,
-        choices=["explicit", "mem0", "rag", "none"],
+        choices=["explicit", "mem0", "rag", "context", "none"],
         required=True,
         help="Memory backend to use (use 'none' to disable all memory backends)"
     )
@@ -420,8 +424,8 @@ Examples:
     parser.add_argument(
         "--suite",
         type=str,
-        choices=["benign", "direct", "indirect"],
-        help="Test suite to run (benign, direct, or indirect)"
+        choices=["benign", "direct", "indirect", "memory_only"],
+        help="Test suite to run (benign, direct, indirect, or memory_only)"
     )
     
     parser.add_argument(

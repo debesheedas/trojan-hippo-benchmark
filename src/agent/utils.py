@@ -469,6 +469,7 @@ def call_openai_chat_completion(
     presence_penalty: Optional[float] = None,
     frequency_penalty: Optional[float] = None,
     response_format: Optional[Dict[str, Any]] = None,
+    seed: Optional[int] = None,
 ) -> Any:
     """
     Call OpenAI chat completion API.
@@ -484,6 +485,7 @@ def call_openai_chat_completion(
         presence_penalty: Presence penalty
         frequency_penalty: Frequency penalty
         response_format: Response format (e.g., {"type": "json_object"})
+        seed: Seed parameter for determinism (supported by OpenAI API for some models)
     
     Returns:
         Response object from OpenAI API
@@ -508,12 +510,14 @@ def call_openai_chat_completion(
         params["frequency_penalty"] = frequency_penalty
     if response_format is not None:
         params["response_format"] = response_format
+    # Add seed parameter for determinism (supported by OpenAI API for some models)
+    if seed is not None:
+        params["seed"] = seed
     
     return client.chat.completions.create(**params)
 
 
 def call_gemini_chat_completion(
-    _genai_module,
     model: str,
     messages: list,
     temperature: Optional[float] = None,
@@ -524,7 +528,6 @@ def call_gemini_chat_completion(
     Call Gemini chat completion API.
     
     Args:
-        _genai_module: Google Generative AI module (from get_gemini_client) - unused, genai imported directly
         model: Model name (e.g., "gemini-2.5-pro")
         messages: List of message dicts with "role" and "content"
         temperature: Temperature parameter
@@ -802,6 +805,7 @@ def call_llm_chat_completion(
     frequency_penalty: Optional[float] = None,
     response_format: Optional[Dict[str, Any]] = None,
     client: Optional[Any] = None,
+    seed: Optional[int] = None,
 ) -> Any:
     """
     Unified function to call LLM chat completion for any provider.
@@ -839,6 +843,7 @@ def call_llm_chat_completion(
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
             response_format=response_format,
+            seed=seed,
         )
     elif provider == "gemini":
         # Map max_tokens or max_completion_tokens to max_output_tokens for Gemini
@@ -846,7 +851,6 @@ def call_llm_chat_completion(
             max_output_tokens = max_completion_tokens if max_completion_tokens is not None else max_tokens
         
         return call_gemini_chat_completion(
-            _genai_module=client,
             model=model,
             messages=messages,
             temperature=temperature,

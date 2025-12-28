@@ -123,13 +123,15 @@ class RAGMemoryManager:
             except Exception as e:
                 print(f"Warning: Could not save vector store: {e}")
     
-    def add_memory(self, text: str, metadata: Optional[Dict[str, Any]] = None):
+    def add_memory(self, text: str, metadata: Optional[Dict[str, Any]] = None, session_id: Optional[str] = None, defense_type: Optional[str] = None):
         """
         Add text to the RAG memory system.
         
         Args:
             text: Text content to add to memory
             metadata: Optional metadata dictionary for the document
+            session_id: Optional session ID for provable_policy defense (P3: Memory Labeling)
+            defense_type: Optional defense type to check if provable_policy is active
         """
         with self._lock:
             if not text or not text.strip():
@@ -139,6 +141,20 @@ class RAGMemoryManager:
             doc_metadata = metadata or {}
             doc_metadata["chunk_id"] = self._chunk_counter
             doc_metadata["timestamp"] = datetime.now(timezone.utc).isoformat()
+            
+            # P3: Memory Labeling - inherit session label for provable_policy defense
+            if defense_type == "provable_policy":
+                if session_id:
+                    from agent.agent_core import ProvablePolicyManager
+                    session_label = ProvablePolicyManager.get_session_label(session_id)
+                    doc_metadata["label"] = session_label
+                else:
+                    # Default to T if no session_id provided
+                    doc_metadata["label"] = "T"
+            elif "label" not in doc_metadata:
+                # For non-provable_policy defenses, don't require label
+                # But if label is explicitly provided, keep it
+                pass
             
             doc = Document(page_content=text.strip(), metadata=doc_metadata)
             
@@ -191,13 +207,15 @@ class RAGMemoryManager:
             if self.vectorstore_path:
                 self._save_vectorstore()
     
-    def retrieve(self, query: str, top_k: Optional[int] = None) -> List[str]:
+    def retrieve(self, query: str, top_k: Optional[int] = None, session_id: Optional[str] = None, defense_type: Optional[str] = None) -> List[str]:
         """
         Retrieve relevant memory chunks for a query.
         
         Args:
             query: The search query
             top_k: Number of documents to retrieve (defaults to self.top_k)
+            session_id: Optional session ID for provable_policy defense
+            defense_type: Optional defense type to check if provable_policy is active
             
         Returns:
             List of retrieved document texts
@@ -211,23 +229,43 @@ class RAGMemoryManager:
             try:
                 # Perform similarity search
                 results = self.vectorstore.similarity_search(query, k=k)
+                
+                # P1: Check if any retrieved memory has U label (provable_policy defense)
+                if defense_type == "provable_policy" and session_id:
+                    from agent.agent_core import ProvablePolicyManager
+                    for doc in results:
+                        label = doc.metadata.get("label", None)
+                        if label == "U":
+                            # Upgrade session to U if U-labeled memory is retrieved
+                            ProvablePolicyManager.set_untrusted(session_id)
+                            break
+                        elif label is None:
+                            # Error: memory should have a label
+                            raise ValueError(
+                                f"Memory chunk missing label in provable_policy defense. "
+                                f"Chunk ID: {doc.metadata.get('chunk_id', 'unknown')}, "
+                                f"All memories must have 'label' metadata set to 'T' or 'U'."
+                            )
+                
                 return [doc.page_content for doc in results]
             except Exception as e:
                 print(f"Error during retrieval: {e}")
                 return []
     
-    def get_context(self, query: str, top_k: Optional[int] = None) -> str:
+    def get_context(self, query: str, top_k: Optional[int] = None, session_id: Optional[str] = None, defense_type: Optional[str] = None) -> str:
         """
         Get formatted context string for a query.
         
         Args:
             query: The search query
             top_k: Number of documents to retrieve
+            session_id: Optional session ID for provable_policy defense
+            defense_type: Optional defense type to check if provable_policy is active
             
         Returns:
             Formatted context string with retrieved memories
         """
-        retrieved = self.retrieve(query, top_k)
+        retrieved = self.retrieve(query, top_k, session_id=session_id, defense_type=defense_type)
         
         if not retrieved:
             return ""
@@ -271,37 +309,28 @@ class RAGMemoryManager:
             }
 
 
-# Global RAG memory manager instance
-_rag_memory_manager = None
-
-
 def get_rag_memory_manager(
     embedding_model: str = "text-embedding-3-small",
     top_k: int = 3,
     chunk_size: int = 512,
     vectorstore_path: Optional[str] = None,
-    force_new: bool = False
 ) -> RAGMemoryManager:
     """
-    Get or create the global RAG memory manager instance.
+    Create a new RAG memory manager instance.
     
     Args:
         embedding_model: Name of the embedding model
         top_k: Number of top documents to retrieve
         chunk_size: Size of text chunks
         vectorstore_path: Optional path to persist vector store
-        force_new: If True, create a new instance instead of reusing
     
     Returns:
-        The RAGMemoryManager instance
+        A new RAGMemoryManager instance
     """
-    global _rag_memory_manager
-    if force_new or _rag_memory_manager is None:
-        _rag_memory_manager = RAGMemoryManager(
-            embedding_model=embedding_model,
-            top_k=top_k,
-            chunk_size=chunk_size,
-            vectorstore_path=vectorstore_path
-        )
-    return _rag_memory_manager
+    return RAGMemoryManager(
+        embedding_model=embedding_model,
+        top_k=top_k,
+        chunk_size=chunk_size,
+        vectorstore_path=vectorstore_path
+    )
 

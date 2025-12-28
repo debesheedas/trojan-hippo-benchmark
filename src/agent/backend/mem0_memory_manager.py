@@ -145,6 +145,8 @@ class Mem0MemoryManager:
         user_id: Optional[str] = None,
         agent_id: Optional[str] = None,
         max_memory_length: Optional[int] = None,
+        session_id: Optional[str] = None,
+        defense_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Add memories from conversation messages.
@@ -169,6 +171,20 @@ class Mem0MemoryManager:
             # Combine metadata
             combined_metadata = metadata or {}
             combined_metadata["session_type"] = "conversation"
+            
+            # Note: We pass messages to mem0 as-is. For user_prompt_only defense,
+            # messages are already filtered to only user messages by the defense manager.
+            # mem0 should handle UPDATE operations correctly regardless of message structure.
+            
+            # P3: Memory Labeling - inherit session label for provable_policy defense
+            if defense_type == "provable_policy":
+                if session_id:
+                    from agent.agent_core import ProvablePolicyManager
+                    session_label = ProvablePolicyManager.get_session_label(session_id)
+                    combined_metadata["label"] = session_label
+                else:
+                    # Default to T if no session_id provided
+                    combined_metadata["label"] = "T"
             
             try:
                 # For user memory extraction, we should NOT pass agent_id to memory.add()
@@ -337,7 +353,9 @@ class Mem0MemoryManager:
         query: str,
         user_id: Optional[str] = None,
         agent_id: Optional[str] = None,
-        limit: Optional[int] = None
+        limit: Optional[int] = None,
+        session_id: Optional[str] = None,
+        defense_type: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         Search for relevant memories.
@@ -368,17 +386,41 @@ class Mem0MemoryManager:
                     limit=limit
                 )
                 # Extract results from mem0 response
+                memories = []
                 if isinstance(result, dict) and "results" in result:
-                    return result["results"]
+                    memories = result["results"]
                 elif isinstance(result, list):
-                    return result
+                    memories = result
                 else:
-                    return []
+                    memories = []
+                
+                # P1: Check if any retrieved memory has U label (provable_policy defense)
+                if defense_type == "provable_policy" and session_id:
+                    from agent.agent_core import ProvablePolicyManager
+                    for memory_item in memories:
+                        if isinstance(memory_item, dict):
+                            # Check metadata for label
+                            metadata = memory_item.get("metadata", {})
+                            label = metadata.get("label", None)
+                            if label == "U":
+                                # Upgrade session to U if U-labeled memory is retrieved
+                                ProvablePolicyManager.set_untrusted(session_id)
+                                break
+                            elif label is None:
+                                # Error: memory should have a label
+                                memory_text = memory_item.get("memory", "")[:50]
+                                raise ValueError(
+                                    f"Mem0 memory entry missing label in provable_policy defense. "
+                                    f"All memories must have 'label' metadata set to 'T' or 'U'. "
+                                    f"Memory text preview: {memory_text}..."
+                                )
+                
+                return memories
             except Exception as e:
                 print(f"Warning: Could not search mem0 memory: {e}")
                 return []
     
-    def get_context(self, query: str, user_id: Optional[str] = None, agent_id: Optional[str] = None) -> str:
+    def get_context(self, query: str, user_id: Optional[str] = None, agent_id: Optional[str] = None, session_id: Optional[str] = None, defense_type: Optional[str] = None) -> str:
         """
         Get formatted context string for a query.
         
@@ -386,12 +428,14 @@ class Mem0MemoryManager:
             query: The search query
             user_id: Optional user ID (ignored - always uses "vince")
             agent_id: Optional agent ID
+            session_id: Optional session ID for provable_policy defense
+            defense_type: Optional defense type to check if provable_policy is active
             
         Returns:
             Formatted context string with retrieved memories
         """
         # Always use "vince" as user_id (hardcoded)
-        memories = self.search(query, user_id="vince", agent_id=agent_id)
+        memories = self.search(query, user_id="vince", agent_id=agent_id, session_id=session_id, defense_type=defense_type)
         
         # If no memories found, try a fallback: get some general persona memories
         # This helps when the query is too specific and doesn't match persona details
@@ -593,11 +637,6 @@ class Mem0MemoryManager:
                 return {}
 
 
-# Global mem0 memory manager instance
-# Cache managers by vectorstore_path to support multiple test environments
-_mem0_manager_cache: Dict[str, Mem0MemoryManager] = {}
-
-
 def get_mem0_memory_manager(
     llm_provider: str = "openai",
     llm_model: str = "gpt-5-mini",
@@ -609,11 +648,9 @@ def get_mem0_memory_manager(
     top_k: int = 3,
     user_id: str = "vince",
     agent_id: str = "email_agent",
-    force_new: bool = False
 ) -> Mem0MemoryManager:
     """
-    Get or create a mem0 memory manager instance.
-    Managers are cached by vectorstore_path to support multiple test environments.
+    Create a new mem0 memory manager instance.
     
     Args:
         llm_provider: LLM provider
@@ -622,34 +659,24 @@ def get_mem0_memory_manager(
         embedding_provider: Embedding provider
         embedding_model: Embedding model name
         vector_store_provider: Vector store provider
-        vectorstore_path: Optional path to persist vector store (used as cache key)
+        vectorstore_path: Optional path to persist vector store
         top_k: Number of top memories to retrieve
         user_id: User identifier
         agent_id: Agent identifier
-        force_new: If True, create a new instance instead of reusing cached one
     
     Returns:
-        The Mem0MemoryManager instance
+        A new Mem0MemoryManager instance
     """
-    global _mem0_manager_cache
-    
-    # Use vectorstore_path as cache key (or "default" if None)
-    cache_key = str(vectorstore_path) if vectorstore_path else "default"
-    
-    # Create new instance if force_new or not in cache
-    if force_new or cache_key not in _mem0_manager_cache:
-        _mem0_manager_cache[cache_key] = Mem0MemoryManager(
-            llm_provider=llm_provider,
-            llm_model=llm_model,
-            llm_temperature=llm_temperature,
-            embedding_provider=embedding_provider,
-            embedding_model=embedding_model,
-            vector_store_provider=vector_store_provider,
-            vectorstore_path=vectorstore_path,
-            top_k=top_k,
-            user_id=user_id,
-            agent_id=agent_id
-        )
-    
-    return _mem0_manager_cache[cache_key]
+    return Mem0MemoryManager(
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        llm_temperature=llm_temperature,
+        embedding_provider=embedding_provider,
+        embedding_model=embedding_model,
+        vector_store_provider=vector_store_provider,
+        vectorstore_path=vectorstore_path,
+        top_k=top_k,
+        user_id=user_id,
+        agent_id=agent_id
+    )
 

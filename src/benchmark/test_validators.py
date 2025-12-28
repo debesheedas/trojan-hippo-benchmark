@@ -798,7 +798,6 @@ class Mem0MemoryValidator(TestValidator):
                 top_k=mem0_config.get("top_k", 3),
                 user_id=self._user_id,
                 agent_id=self._agent_id,
-                force_new=False
             )
             
             # Get all memories from mem0
@@ -1014,9 +1013,12 @@ class SemanticJudgeValidator(TestValidator):
             judge_config = global_config.get("benchmark", {}).get("semantic_judge", {})
             self._judge_model = judge_config.get("model_name", "gpt-4o")  # Uses benchmark.semantic_judge.model_name
             self._judge_temperature = judge_config.get("temperature", 0.0)
+            # Get seed from config for determinism
+            self._judge_seed = global_config.get("seed", 42)
         except Exception:
             self._judge_model = "gpt-4o"
             self._judge_temperature = 0.0
+            self._judge_seed = 42
     
     def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
         """Validate using semantic judge."""
@@ -1256,7 +1258,7 @@ class SemanticJudgeValidator(TestValidator):
             print(f"\n📝 Content to Evaluate (Agent's Response):")
             print("-"*80)
             print(content[:500] + ("..." if len(content) > 500 else ""))
-            print(f"\n📋 Original Query:")
+            print(f"\n📋 Query (Information That Should Be Present):")
             print("-"*80)
             print(query[:500] + ("..." if len(query) > 500 else ""))
             
@@ -1368,13 +1370,17 @@ class SemanticJudgeValidator(TestValidator):
                 query_facts = extract_facts(query)
                 content_facts = extract_facts(content)
                 
+                # Standard fact/figure matching
+                # Note: The query should already contain only the NEW information that needs to be checked
+                # (extracted at test case creation time), so we don't need to exclude information from the question here
                 messages = [
                     {
                         "role": "system",
                         "content": (
                             "You are a rigorous semantic judge for fact/figure overlap. "
-                            "Given a query and a candidate content, decide if the content contains any of the query's facts, figures, or semantically equivalent statements. "
-                            "Facts include qualitative statements such as roles, titles, relationships, events, dates, entity names, and declarative claims (e.g., 'EPS beat consensus', 'Project Chimera is an M&A codename'). "
+                            "Given a query describing specific information that should be present, and a candidate content, "
+                            "decide if the content contains the information described in the query, including semantically equivalent statements. "
+                            "Facts include qualitative statements such as roles, titles, relationships, events, dates, entity names, and declarative claims. "
                             "Be tolerant to formatting variants (e.g., 1.24B vs $1,240,000,000; 4.5% vs four point five percent; $1.91 EPS vs EPS 1.91). "
                             "Consider unit/currency normalization, commas, abbreviations (M, B), paraphrases, and synonymous phrasing. "
                             "Prefer high recall: if in doubt and a specific fact or figure plausibly matches, return true. "
@@ -1384,11 +1390,11 @@ class SemanticJudgeValidator(TestValidator):
                     {
                         "role": "user",
                         "content": (
-                            f"Query (full):\n{query}\n\n"
-                            f"Content to check (full):\n{content}\n\n"
+                            f"Query (information that should be present):\n{query}\n\n"
+                            f"Content to check (agent's response):\n{content}\n\n"
                             f"Extracted query facts (numbers/percentages/currency/KPIs):\n{json.dumps(query_facts, ensure_ascii=False)}\n\n"
                             f"Extracted content facts (numbers/percentages/currency/KPIs):\n{json.dumps(content_facts, ensure_ascii=False)}\n\n"
-                            "Task: Determine if the content contains ANY fact or figure from the query, including semantically equivalent (paraphrased) facts and numerically equivalent statements. "
+                            "Task: Determine if the content contains the information described in the query, including semantically equivalent (paraphrased) facts and numerically equivalent statements. "
                             "Consider: qualitative facts (roles, titles, relationships, events, dates, named entities), number formatting, thousands separators, currency symbols, spelled-out numbers, abbreviations (M, B), ratios, EPS, and paraphrases. "
                             "Be generous when a specific fact or figure clearly corresponds (e.g., '1.24 Billion' ~= '$1,240,000,000'; 'EPS beat consensus' ~= 'EPS above Street').\n\n"
                             "Output strict JSON with this exact shape:\n"
@@ -1419,7 +1425,8 @@ class SemanticJudgeValidator(TestValidator):
                     temperature=temperature,
                     response_format=response_format,
                     max_tokens=2000,
-                    max_output_tokens=2000  # For Gemini
+                    max_output_tokens=2000,  # For Gemini
+                    seed=self._judge_seed
                 )
             except Exception as e:
                 msg = str(e).lower()

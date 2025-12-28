@@ -285,6 +285,11 @@ When you read emails using this tool, they are automatically marked as read in t
             from agent.agent_core import SessionTrustManager
             SessionTrustManager.set_untrusted(self.config.session_id)
         
+        # P1: Mark session as U for provable_policy defense (taint tool)
+        if self.config and self.config.session_id:
+            from agent.agent_core import ProvablePolicyManager
+            ProvablePolicyManager.set_untrusted(self.config.session_id)
+        
         # Log tool call
         if self.config and self.config.session_id:
             append_trace_event(
@@ -621,6 +626,53 @@ This is a one-step operation - no need to manually construct the reply email. If
             from agent.agent_core import SessionTrustManager
             SessionTrustManager.set_untrusted(self.config.session_id)
         
+        # P1 & P4: Handle taint and exfiltration for provable_policy defense
+        # (reply_to_email is both taint and exfil)
+        if self.config and self.config.session_id:
+            from agent.agent_core import ProvablePolicyManager
+            from agent.tools_registry import is_exfiltration_tool
+            
+            # P4: Check if exfiltration should be blocked (check BEFORE tainting)
+            # If session is already U, block immediately (don't even read from inbox)
+            if not ProvablePolicyManager.is_trusted(self.config.session_id):
+                error_msg = (
+                    "🛡️ Security Policy: This action has been blocked for safety reasons. "
+                    "The current session has been marked as untrusted because untrusted data was accessed. "
+                    "Exfiltration tools (email sending) are not allowed in untrusted sessions."
+                )
+                
+                # Log blocked tool call
+                append_trace_event(
+                    self.config.trace_file,
+                    "tool_call",
+                    self.config.session_id,
+                    {
+                        "tool_name": self.name,
+                        "inputs": {"search_query": search_query, "reply_body": reply_body},
+                        "call_id": call_id,
+                        "blocked": True,
+                        "reason": "provable_policy_exfiltration_blocked"
+                    }
+                )
+                
+                append_trace_event(
+                    self.config.trace_file,
+                    "tool_result",
+                    self.config.session_id,
+                    {
+                        "tool_name": self.name,
+                        "outputs": {"error": error_msg, "blocked": True},
+                        "call_id": call_id
+                    }
+                )
+                
+                return error_msg
+            
+            # P1: Mark session as U (taint tool)
+            # Note: Since session was T, we allow the tool to execute (taint and exfil in same action)
+            # But we mark session as U for future tool calls
+            ProvablePolicyManager.set_untrusted(self.config.session_id)
+        
         # Log tool call
         if self.config and self.config.session_id:
             append_trace_event(
@@ -755,6 +807,53 @@ Important: The original email body and all content is automatically included - y
         if self.config and self.config.session_id:
             from agent.agent_core import SessionTrustManager
             SessionTrustManager.set_untrusted(self.config.session_id)
+        
+        # P1 & P4: Handle taint and exfiltration for provable_policy defense
+        # (forward_to_email is both taint and exfil)
+        if self.config and self.config.session_id:
+            from agent.agent_core import ProvablePolicyManager
+            from agent.tools_registry import is_exfiltration_tool
+            
+            # P4: Check if exfiltration should be blocked (check BEFORE tainting)
+            # If session is already U, block immediately (don't even read from inbox)
+            if not ProvablePolicyManager.is_trusted(self.config.session_id):
+                error_msg = (
+                    "🛡️ Security Policy: This action has been blocked for safety reasons. "
+                    "The current session has been marked as untrusted because untrusted data was accessed. "
+                    "Exfiltration tools (email sending) are not allowed in untrusted sessions."
+                )
+                
+                # Log blocked tool call
+                append_trace_event(
+                    self.config.trace_file,
+                    "tool_call",
+                    self.config.session_id,
+                    {
+                        "tool_name": self.name,
+                        "inputs": {"search_query": search_query, "forward_to": forward_to, "message": message},
+                        "call_id": call_id,
+                        "blocked": True,
+                        "reason": "provable_policy_exfiltration_blocked"
+                    }
+                )
+                
+                append_trace_event(
+                    self.config.trace_file,
+                    "tool_result",
+                    self.config.session_id,
+                    {
+                        "tool_name": self.name,
+                        "outputs": {"error": error_msg, "blocked": True},
+                        "call_id": call_id
+                    }
+                )
+                
+                return error_msg
+            
+            # P1: Mark session as U (taint tool)
+            # Note: Since session was T, we allow the tool to execute (taint and exfil in same action)
+            # But we mark session as U for future tool calls
+            ProvablePolicyManager.set_untrusted(self.config.session_id)
         
         # Log tool call
         if self.config and self.config.session_id:
@@ -916,6 +1015,52 @@ class ComposeEmailTool(BaseTool):
     def _run(self, to: str, subject: str, body: str) -> str:
         """Create and immediately send an email."""
         call_id = generate_id("tcall")
+        
+        # P4: Check if exfiltration should be blocked (provable_policy defense)
+        # Get session_id from config if available
+        session_id = None
+        if self.config and hasattr(self.config, 'session_id'):
+            session_id = self.config.session_id
+        
+        if session_id:
+            from agent.agent_core import ProvablePolicyManager
+            from agent.tools_registry import is_exfiltration_tool
+            
+            # P4: Block exfiltration if session is U
+            if not ProvablePolicyManager.is_trusted(session_id):
+                error_msg = (
+                    "🛡️ Security Policy: This action has been blocked for safety reasons. "
+                    "The current session has been marked as untrusted because untrusted data was accessed. "
+                    "Exfiltration tools (email sending) are not allowed in untrusted sessions."
+                )
+                
+                # Log blocked tool call
+                if self.config and self.config.trace_file:
+                    append_trace_event(
+                        self.config.trace_file,
+                        "tool_call",
+                        session_id,
+                        {
+                            "tool_name": self.name,
+                            "inputs": {"to": to, "subject": subject, "body": body},
+                            "call_id": call_id,
+                            "blocked": True,
+                            "reason": "provable_policy_exfiltration_blocked"
+                        }
+                    )
+                    
+                    append_trace_event(
+                        self.config.trace_file,
+                        "tool_result",
+                        session_id,
+                        {
+                            "tool_name": self.name,
+                            "outputs": {"error": error_msg, "blocked": True},
+                            "call_id": call_id
+                        }
+                    )
+                
+                return error_msg
         
         # Log tool call
         if self.config and self.config.session_id:

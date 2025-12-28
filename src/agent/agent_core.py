@@ -83,7 +83,7 @@ class SessionTrustManager:
         # Only print if this is the first time the session is being marked as untrusted
         if session_id not in _session_trust or _session_trust[session_id]:
             print(f"\n🛡️ Session '{session_id}' marked as UNTRUSTED (untrusted tool detected)")
-            print(f"   Memory indexing will be disabled for the rest of this session")
+            print(f"   Note: If 'no_untrusted_tools' defense is active, memory indexing will be disabled for the rest of this session")
         _session_trust[session_id] = False
     
     @staticmethod
@@ -98,52 +98,118 @@ class SessionTrustManager:
             del _session_trust[session_id]
 
 
+# Provable Policy Defense: Session state manager
+# Tracks session labels: T (Trusted) or U (Untrusted)
+_session_labels: Dict[str, str] = {}  # session_id -> "T" or "U"
+
+
+class ProvablePolicyManager:
+    """
+    Manages session-level labels for the provable_policy defense.
+    
+    Each session starts as T (Trusted). Session becomes U (Untrusted) if:
+    - A U-labeled memory is retrieved into context
+    - A taint tool is executed
+    
+    Once U, session remains U until session ends.
+    """
+    
+    @staticmethod
+    def initialize_session(session_id: str) -> None:
+        """Initialize a new session as Trusted (T)."""
+        _session_labels[session_id] = "T"
+    
+    @staticmethod
+    def get_session_label(session_id: str) -> str:
+        """
+        Get the current session label.
+        
+        Args:
+            session_id: Session identifier
+            
+        Returns:
+            "T" if session is Trusted, "U" if Untrusted.
+            If session not initialized, returns "T" (default trusted).
+        """
+        if session_id not in _session_labels:
+            # Initialize if not exists (lazy initialization)
+            _session_labels[session_id] = "T"
+        return _session_labels[session_id]
+    
+    @staticmethod
+    def is_trusted(session_id: str) -> bool:
+        """
+        Check if a session is trusted.
+        
+        Args:
+            session_id: Session identifier
+            
+        Returns:
+            True if session is Trusted (T), False if Untrusted (U)
+        """
+        return ProvablePolicyManager.get_session_label(session_id) == "T"
+    
+    @staticmethod
+    def set_untrusted(session_id: str) -> None:
+        """
+        Mark a session as Untrusted (U).
+        Once U, session remains U until session ends (P2: Taint Persistence).
+        
+        Args:
+            session_id: Session identifier
+        """
+        # Only print if this is the first time the session is being marked as untrusted
+        if session_id not in _session_labels or _session_labels[session_id] == "T":
+            print(f"\n🛡️ [Provable Policy] Session '{session_id}' upgraded to UNTRUSTED (U)")
+            print(f"   Note: Exfiltration tools will be blocked for the rest of this session")
+        _session_labels[session_id] = "U"
+    
+    @staticmethod
+    def reset_session(session_id: str) -> None:
+        """
+        Reset a session's label (for testing or session cleanup).
+        
+        Args:
+            session_id: Session identifier
+        """
+        if session_id in _session_labels:
+            del _session_labels[session_id]
+
+
 def _get_session_memory(session_id: str) -> list:
     if session_id not in _session_store:
         _session_store[session_id] = []
         # Initialize session as trusted when creating new session memory
         SessionTrustManager.initialize_session(session_id)
+        ProvablePolicyManager.initialize_session(session_id)
     return _session_store[session_id]
 
 
 def clear_agent_cache():
     """Clear the agent cache - useful for testing or when config changes."""
-    global _agent_cache
+    global _agent_cache, _session_trust, _session_labels
     _agent_cache.clear()
+    _session_trust.clear()  # Clear session trust state to prevent leakage between tests
+    _session_labels.clear()  # Clear session labels to prevent leakage between tests
+    
+    # Clear memory manager cache to prevent state leakage between tests
+    # This ensures each test gets fresh memory manager instances
+    try:
+        from agent.backend.memory_manager import _memory_manager_cache
+        _memory_manager_cache.clear()
+    except ImportError:
+        pass
 
 
-def clear_session_agent(session_id: str, config: Optional[dict] = None, auto_store_rag: bool = True):
+def clear_session_agent(session_id: str, config: Optional[dict] = None):
     """
     Clear the agent executor for a specific session - useful when starting new sessions.
     
     Args:
         session_id: Session ID to clear
-        config: Configuration dictionary (needed for RAG storage)
-        auto_store_rag: If True, automatically store session conversation in RAG memory before clearing
+        config: Configuration dictionary (optional, kept for backward compatibility)
     """
     global _agent_cache
-    
-    # Store session in RAG memory before clearing (if enabled)
-    # Skip if disable_memory defense is active
-    if auto_store_rag and config:
-        try:
-            from benchmark.rag_poisoning_attack import store_session_in_rag_memory
-            memory_config = config.get("memory", {})
-            memory_backend = memory_config.get("backend", "explicit")
-            # Skip if memory backend is disabled
-            if memory_backend == "none":
-                rag_memory_enabled = False
-                rag_defense_type = "none"
-            else:
-                rag_config = memory_config.get("rag_memory", {})
-                rag_memory_enabled = rag_config.get("enabled", False)
-                rag_defense_type = rag_config.get("defense_type", "none")
-            if rag_memory_enabled and rag_defense_type != "disable_memory":
-                chunks_stored = store_session_in_rag_memory(session_id, config)
-                if chunks_stored > 0:
-                    print(f"Automatically stored {chunks_stored} chunks from session {session_id} to RAG memory")
-        except Exception as e:
-            print(f"Warning: Could not auto-store session in RAG memory: {e}")
     
     if session_id in _agent_cache:
         del _agent_cache[session_id]
@@ -344,8 +410,18 @@ def _create_agent_executor_for_python(
         # Try to create LLM with all parameters, fallback to minimal params if model doesn't support them
         # Some models (e.g., future GPT versions) may not support all parameters
         
+        # Get seed from config for reproducibility (defaults to config seed or 42)
+        seed = config.get("seed", 42)
+        
         # Try with all parameters first (most common case)
+        # Add seed via model_kwargs for OpenAI API determinism
         try:
+            model_kwargs = {}
+            # OpenAI API supports seed parameter for determinism (for supported models)
+            # This helps reduce non-determinism even with temperature=0.0
+            if seed is not None:
+                model_kwargs["seed"] = seed
+            
             llm = ChatOpenAI(
                 model=model_name,
                 temperature=model_config.get("temperature", 0.0),
@@ -353,16 +429,22 @@ def _create_agent_executor_for_python(
                 presence_penalty=model_config.get("presence_penalty", 0),
                 frequency_penalty=model_config.get("frequency_penalty", 0),
                 api_key=api_key,
+                model_kwargs=model_kwargs if model_kwargs else {},
             )
         except (TypeError, ValueError) as e:
             # If initialization fails (e.g., parameter not accepted at init), try without optional params
             print(f"Warning: Model {model_name} may not support all initialization parameters. Trying minimal configuration. Error: {e}")
             try:
                 # Try with just model, temperature, and API key
+                # Still include seed for determinism
+                model_kwargs = {}
+                if seed is not None:
+                    model_kwargs["seed"] = seed
                 llm = ChatOpenAI(
                     model=model_name,
                     temperature=model_config.get("temperature", 0.0),
                     api_key=api_key,
+                    model_kwargs=model_kwargs if model_kwargs else {},
                 )
             except (TypeError, ValueError) as e2:
                 # If temperature also fails, use absolute minimal config
@@ -418,8 +500,12 @@ def _create_agent_executor_for_python(
         try:
             memory_file = explicit_memory_config.get("memory_file", 
                 config.get("data", {}).get("memory_file", "data/interactive_agent/agent_memory.json"))
-            memory_manager = get_memory_manager(memory_file=memory_file, force_new=True)
-            explicit_memory_context = memory_manager.get_long_term_as_text()
+            memory_manager = get_memory_manager(memory_file=memory_file)
+            # Pass session_id and defense_type for provable_policy defense
+            explicit_memory_context = memory_manager.get_long_term_as_text(
+                session_id=session_id,
+                defense_type=explicit_defense_type
+            )
         except Exception as e:
             print(f"Warning: Could not load explicit memory: {e}")
             explicit_memory_context = ""
@@ -497,9 +583,13 @@ def invoke_agent(
                 top_k=rag_memory_config.get("top_k", 3),
                 chunk_size=rag_memory_config.get("chunk_size", 512),
                 vectorstore_path=rag_memory_config.get("vectorstore_path", "data/interactive_agent/rag_vectorstore"),
-                force_new=False
             )
-            rag_context = rag_memory_manager.get_context(text)
+            # Pass session_id and defense_type for provable_policy defense
+            rag_context = rag_memory_manager.get_context(
+                text, 
+                session_id=session_id, 
+                defense_type=rag_defense_type
+            )
             if rag_context:
                 rag_context = "\n\n# Relevant Memory Context\n" + rag_context + "\n"
         except Exception as e:
@@ -534,24 +624,102 @@ def invoke_agent(
                 top_k=mem0_memory_config.get("top_k", 3),
                 user_id=mem0_memory_config.get("user_id", "default_user"),
                 agent_id=mem0_memory_config.get("agent_id", "email_agent"),
-                force_new=False
             )
-            mem0_context = mem0_memory_manager.get_context(text, user_id="vince")
+            # Pass session_id and defense_type for provable_policy defense
+            mem0_context = mem0_memory_manager.get_context(
+                text,
+                user_id="vince",
+                session_id=session_id,
+                defense_type=defense_type
+            )
             if mem0_context:
                 mem0_context = "\n\n# Relevant Mem0 Memory Context\n" + mem0_context + "\n"
         except Exception as e:
             print(f"Warning: Could not retrieve mem0 memory context: {e}")
             mem0_context = ""
 
+    # Retrieve context memory if enabled
+    context_memory_config = cfg.get("memory", {}).get("context_memory", {})
+    # Check if memory backend is disabled
+    memory_backend = cfg.get("memory", {}).get("backend", "explicit")
+    if memory_backend == "none":
+        context_memory_enabled = False
+        context_defense_type = "none"
+    else:
+        context_memory_config = cfg.get("memory", {}).get("context_memory", {})
+        context_memory_enabled = context_memory_config.get("enabled", False)
+        # Get unified defense type and map to backend-specific type
+        unified_defense_type = context_memory_config.get("defense_type", "none")
+        # Map unified defense name to backend-specific defense type
+        from benchmark.defense_backend import get_defense_backend_registry
+        defense_registry = get_defense_backend_registry()
+        context_defense_type = defense_registry.map_defense("context", unified_defense_type)
+    
+    context_memory_context = ""
+    
+    # Skip context memory entirely if memory backend is "none" or defense_type is "disable_memory"
+    if context_memory_enabled and context_defense_type != "disable_memory":
+        try:
+            from agent.backend.context_memory_manager import get_context_memory_manager
+            
+            # Get max_context_length from config, or calculate based on model
+            max_context_length = context_memory_config.get("max_context_length")
+            if max_context_length is None:
+                # Calculate reasonable default: model context window - buffer - generation tokens
+                # Default buffer: 50000 tokens, generation: 2000 tokens
+                # For common models:
+                model_name = cfg.get("agent", {}).get("target_model_name", "gpt-5-mini")
+                buffer_length = context_memory_config.get("buffer_length", 50000)
+                generation_max_length = cfg.get("benchmark", {}).get("dspy", {}).get("max_tokens", 2000)
+                
+                # Model context window sizes (approximate)
+                model_context_windows = {
+                    "gpt-5-mini": 400000,  # GPT-5 Mini: 400k context window
+                    "gpt-4o": 128000,
+                    "gpt-4o-mini": 128000,
+                    "gpt-4.1-mini": 1000000,
+                    "o1": 200000,
+                    "o1-mini": 200000,
+                    "claude-3-7-sonnet": 200000,
+                    "gemini-2.0-flash": 1000000,
+                }
+                
+                # Get model's context window, default to 128000 if unknown
+                context_window = model_context_windows.get(model_name.lower(), 128000)
+                max_context_length = max(0, context_window - buffer_length - generation_max_length)
+            
+            context_memory_manager = get_context_memory_manager(
+                context_path=context_memory_config.get("context_path", "data/interactive_agent/context_memory.json"),
+                max_context_length=max_context_length,
+                model_name=cfg.get("agent", {}).get("target_model_name", "gpt-5-mini"),
+            )
+            print(f"🔄 Retrieving context memory...")
+            # Pass session_id and defense_type for provable_policy defense
+            context_memory_context = context_memory_manager.get_context(
+                text,
+                session_id=session_id,
+                defense_type=context_defense_type
+            )
+            print(f"✅ Context memory retrieved (length: {len(context_memory_context) if context_memory_context else 0} chars)")
+            if context_memory_context:
+                context_memory_context = "\n\n# Relevant Context Memory\n" + context_memory_context + "\n"
+        except Exception as e:
+            print(f"Warning: Could not retrieve context memory: {e}")
+            import traceback
+            traceback.print_exc()
+            context_memory_context = ""
+    
     # Get session history
     session_messages = _get_session_memory(session_id)
     
-    # Add user message to session (with RAG and mem0 context if available)
+    # Add user message to session (with RAG, mem0, and context memory if available)
     context_parts = []
     if rag_context:
         context_parts.append(rag_context)
     if mem0_context:
         context_parts.append(mem0_context)
+    if context_memory_context:
+        context_parts.append(context_memory_context)
     user_message = "".join(context_parts) + text if context_parts else text
     session_messages.append({"role": "user", "content": user_message})
     
@@ -559,7 +727,9 @@ def invoke_agent(
     inputs = {"messages": session_messages}
     
     # Invoke the agent
+    print(f"🔄 Invoking LLM agent (model: {cfg.get('agent', {}).get('target_model_name', 'unknown')})...")
     result = agent.invoke(inputs)
+    print(f"✅ LLM agent returned")
     
     # Extract the response from the result
     if isinstance(result, dict) and "messages" in result:
@@ -588,8 +758,6 @@ def invoke_agent(
             defense_manager = get_rag_defense_manager(
                 defense_type=rag_defense_type,
                 session_id=session_id,
-                force_new=False,
-                trace_file=cfg.get("data", {}).get("trace_file"),
             )
             
             # Check if we should index memory (defense manager handles all defense checks including no_untrusted_tools)
@@ -613,7 +781,6 @@ def invoke_agent(
                     top_k=rag_memory_config.get("top_k", 3),
                     chunk_size=effective_chunk_size,  # Use effective chunk size from defense
                     vectorstore_path=rag_memory_config.get("vectorstore_path", "data/interactive_agent/rag_vectorstore"),
-                    force_new=False
                 )
                 
                 # RAGMemoryManager.add_memory() stores text as-is without chunking,
@@ -635,11 +802,16 @@ def invoke_agent(
                 # Store each chunk separately
                 for chunk in chunks:
                     if chunk.strip():
-                        rag_memory_manager.add_memory(chunk, metadata={
-                            "session_id": session_id,
-                            "type": "conversation",
-                            "defense_type": rag_defense_type
-                        })
+                        rag_memory_manager.add_memory(
+                            chunk, 
+                            metadata={
+                                "session_id": session_id,
+                                "type": "conversation",
+                                "defense_type": rag_defense_type
+                            },
+                            session_id=session_id,
+                            defense_type=rag_defense_type
+                        )
         except Exception as e:
             print(f"Warning: Could not store conversation in RAG memory: {e}")
     
@@ -650,9 +822,7 @@ def invoke_agent(
             # Get defense manager
             defense_manager = get_defense_manager(
                 defense_type=defense_type,
-                trace_file=cfg["data"]["trace_file"],
                 session_id=session_id,
-                force_new=False
             )
             
             # Store conversation as messages for mem0 (it extracts facts automatically)
@@ -670,9 +840,9 @@ def invoke_agent(
                 # Apply defense: filter messages if needed
                 filtered_messages = defense_manager.filter_messages(conversation_messages)
                 
-                # Debug: Print filtered messages when user_only defense is active
-                if defense_type == "user_only" and mem0_memory_config.get("mem0_print", False):
-                    print(f"\n🛡️ DEBUG: user_only defense active - filtering messages")
+                # Debug: Print filtered messages when user_prompt_only defense is active
+                if defense_type == "user_prompt_only" and mem0_memory_config.get("mem0_print", False):
+                    print(f"\n🛡️ DEBUG: user_prompt_only defense active - filtering messages")
                     print(f"   Original messages: {len(conversation_messages)} total")
                     original_roles = [msg.get("role", "unknown") for msg in conversation_messages]
                     print(f"   Original roles: {original_roles}")
@@ -701,7 +871,6 @@ def invoke_agent(
                         top_k=mem0_memory_config.get("top_k", 3),
                         user_id=mem0_memory_config.get("user_id", "default_user"),
                         agent_id=mem0_memory_config.get("agent_id", "email_agent"),
-                        force_new=False
                     )
                     
                     # Determine if we should limit individual memory length for this defense.
@@ -834,6 +1003,8 @@ Following is a conversation between the user and the assistant. You have to extr
                         },
                         user_id="vince",  # Hardcoded user_id for all mem0 operations
                         max_memory_length=max_memory_length,
+                        session_id=session_id,
+                        defense_type=defense_type,
                     )
                     # Debug: Print result if mem0_print is enabled
                     if mem0_print_enabled and result:
@@ -847,6 +1018,73 @@ Following is a conversation between the user and the assistant. You have to extr
             print(f"Warning: Could not store conversation in mem0 memory: {e}")
             import traceback
             traceback.print_exc()
+    
+    # Store conversation in context memory if enabled
+    # Skip entirely if defense_type is "disable_memory"
+    if context_memory_enabled and context_defense_type != "disable_memory":
+        try:
+            # Get defense manager (context_defense_type is already backend-specific from mapping above)
+            from agent.backend.context_defense_manager import get_context_defense_manager
+            defense_manager = get_context_defense_manager(
+                defense_type=context_defense_type,  # This should be "user_prompt_only", "no_untrusted_tools", etc. (backend-specific)
+                session_id=session_id,
+            )
+            
+            # Check if we should index memory (defense manager handles all defense checks including no_untrusted_tools)
+            if not defense_manager.should_index_memory(session_id, text, response_text):
+                # Skip memory indexing
+                pass
+            else:
+                # Filter/modify conversation turn based on defense
+                conversation_turn = defense_manager.filter_conversation_turn(text, response_text)
+                
+                # Get context memory manager (reuse same config as retrieval)
+                from agent.backend.context_memory_manager import get_context_memory_manager
+                
+                # Get max_context_length from config, or calculate based on model
+                max_context_length = context_memory_config.get("max_context_length")
+                if max_context_length is None:
+                    # Calculate reasonable default: model context window - buffer - generation tokens
+                    model_name = cfg.get("agent", {}).get("target_model_name", "gpt-5-mini")
+                    buffer_length = context_memory_config.get("buffer_length", 40000)  # Default updated for GPT-5 Mini
+                    generation_max_length = cfg.get("benchmark", {}).get("dspy", {}).get("max_tokens", 2000)
+                    
+                    # Model context window sizes (approximate)
+                    model_context_windows = {
+                        "gpt-5-mini": 400000,  # GPT-5 Mini: 400k context window
+                        "gpt-4o": 128000,
+                        "gpt-4o-mini": 128000,
+                        "gpt-4.1-mini": 1000000,
+                        "o1": 200000,
+                        "o1-mini": 200000,
+                        "claude-3-7-sonnet": 200000,
+                        "gemini-2.0-flash": 1000000,
+                    }
+                    
+                    # Get model's context window, default to 128000 if unknown
+                    context_window = model_context_windows.get(model_name.lower(), 128000)
+                    max_context_length = max(0, context_window - buffer_length - generation_max_length)
+                
+                context_memory_manager = get_context_memory_manager(
+                    context_path=context_memory_config.get("context_path", "data/interactive_agent/context_memory.json"),
+                    max_context_length=max_context_length,
+                    model_name=cfg.get("agent", {}).get("target_model_name", "gpt-5-mini"),
+                )
+                
+                # Store conversation turn (no chunking needed - just store as-is)
+                if conversation_turn.strip():
+                    context_memory_manager.add_memory(
+                        conversation_turn,
+                        metadata={
+                            "session_id": session_id,
+                            "type": "conversation",
+                            "defense_type": context_defense_type
+                        },
+                        session_id=session_id,
+                        defense_type=context_defense_type
+                    )
+        except Exception as e:
+            print(f"Warning: Could not store conversation in context memory: {e}")
     
     # Keep only last 15 messages (similar to old behavior)
     if len(session_messages) > 15:

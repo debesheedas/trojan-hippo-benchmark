@@ -27,7 +27,7 @@ class DefenseBackend(Protocol):
         Map unified defense name to backend-specific defense type.
         
         Args:
-            unified_defense: Unified defense name (e.g., "disable_memory", "user_only")
+            unified_defense: Unified defense name (e.g., "disable_memory", "user_prompt_only")
             
         Returns:
             Backend-specific defense type string
@@ -51,9 +51,10 @@ class ExplicitDefenseBackend:
     DEFENSE_MAP = {
         "disable_memory": "disable_memory",
         "none": "none",
-        "user_only": "user_prompt_only",  # Explicit uses "user_prompt_only"
+        "user_prompt_only": "user_prompt_only",
         "no_untrusted_tools": "no_untrusted_tools",
         "limit_memory_length": "limit_memory_length",
+        "provable_policy": "provable_policy",
     }
     
     @property
@@ -76,9 +77,10 @@ class Mem0DefenseBackend:
     DEFENSE_MAP = {
         "disable_memory": "disable_memory",
         "none": "no_defense",  # Mem0 uses "no_defense" instead of "none"
-        "user_only": "user_only",
+        "user_prompt_only": "user_prompt_only",  # Unified name is user_prompt_only, mem0 internal name is user_prompt_only
         "no_untrusted_tools": "no_untrusted_tools",
         "limit_memory_length": "limit_memory_length",
+        "provable_policy": "provable_policy",
     }
     
     @property
@@ -101,9 +103,10 @@ class RAGDefenseBackend:
     DEFENSE_MAP = {
         "disable_memory": "disable_memory",
         "none": "none",
-        "user_only": "user_only",
+        "user_prompt_only": "user_prompt_only",  # Unified name is user_prompt_only, RAG internal name is user_prompt_only
         "no_untrusted_tools": "no_untrusted_tools",
         "limit_memory_length": "limit_chunk_size",  # RAG uses "limit_chunk_size"
+        "provable_policy": "provable_policy",
     }
     
     @property
@@ -119,6 +122,33 @@ class RAGDefenseBackend:
         return list(self.DEFENSE_MAP.values())
 
 
+class ContextDefenseBackend:
+    """Defense backend for context memory."""
+    
+    # Defense mappings: unified_name -> context_name
+    # Note: limit_memory_length is NOT applicable for context (as per user requirements)
+    DEFENSE_MAP = {
+        "disable_memory": "disable_memory",
+        "none": "none",
+        "user_prompt_only": "user_prompt_only",  # Unified name is user_prompt_only, context internal name is user_prompt_only
+        "no_untrusted_tools": "no_untrusted_tools",
+        "provable_policy": "provable_policy",
+        # limit_memory_length is NOT included - not applicable for context
+    }
+    
+    @property
+    def name(self) -> str:
+        return "context"
+    
+    def get_defense_type(self, unified_defense: str) -> str:
+        """Map unified defense to context defense type."""
+        return self.DEFENSE_MAP.get(unified_defense, unified_defense)
+    
+    def get_all_defense_types(self) -> List[str]:
+        """Get all context defense types."""
+        return list(self.DEFENSE_MAP.values())
+
+
 class DefenseBackendRegistry:
     """Registry for defense backends."""
     
@@ -131,6 +161,7 @@ class DefenseBackendRegistry:
         self.register("explicit", ExplicitDefenseBackend())
         self.register("mem0", Mem0DefenseBackend())
         self.register("rag", RAGDefenseBackend())
+        self.register("context", ContextDefenseBackend())
     
     def register(self, name: str, backend: DefenseBackend) -> None:
         """
@@ -201,8 +232,9 @@ def get_defense_backend_registry() -> DefenseBackendRegistry:
 # When memory_backend="none", defense_type is automatically "none"
 UNIFIED_DEFENSE_TYPES = [
     "none",
-    "user_only",
+    "user_prompt_only",
     "no_untrusted_tools",
     "limit_memory_length",
+    "provable_policy",
 ]
 

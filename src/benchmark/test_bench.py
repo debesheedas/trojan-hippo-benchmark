@@ -42,7 +42,9 @@ from benchmark.benchmark_utils import (
     get_unified_defense_from_config,
     get_result_path,
     should_skip_test,
-    create_isolated_test_dir
+    create_isolated_test_dir,
+    determine_attack_type,
+    discover_test_files as discover_test_files_util
 )
 
 
@@ -92,7 +94,7 @@ class TestBench:
             self.memory_backend = None  # No backend when memory is disabled
             self.unified_defense = "none"  # No memory = no defense
             # Disable all memory backends
-            for backend_name in ["explicit", "mem0", "rag"]:
+            for backend_name in ["explicit", "mem0", "rag", "context"]:
                 if backend_name not in memory_config:
                     memory_config[backend_name] = {}
                 memory_config[backend_name]["enabled"] = False
@@ -119,6 +121,10 @@ class TestBench:
                     if "rag_memory" not in memory_config:
                         memory_config["rag_memory"] = {}
                     memory_config["rag_memory"]["defense_type"] = defense_type_override
+                elif self.memory_backend_name == "context":
+                    if "context_memory" not in memory_config:
+                        memory_config["context_memory"] = {}
+                    memory_config["context_memory"]["defense_type"] = defense_type_override
             else:
                 self.unified_defense = get_unified_defense_from_config(self.config, self.memory_backend_name)
         
@@ -245,7 +251,6 @@ class TestBench:
                 top_k=mem0_config.get("top_k", 3),
                 user_id=user_id,
                 agent_id=None,  # Memories are stored with agent_id=None
-                force_new=False
             )
             
             # Get all memories with agent_id=None (this is how they're stored)
@@ -314,7 +319,6 @@ class TestBench:
                 top_k=mem0_config.get("top_k", 3),
                 user_id=user_id,
                 agent_id=agent_id,
-                force_new=False
             )
             
             # Get all memories
@@ -355,9 +359,13 @@ class TestBench:
                                 top_k=rag_config.get("top_k", 3),
                                 chunk_size=rag_config.get("chunk_size", 512),
                                 vectorstore_path=rag_config.get("vectorstore_path", "data/interactive_agent/rag_vectorstore"),
-                                force_new=False
                             )
-                            rag_context = rag_memory_manager.get_context(user_message)
+                            # Pass session_id and defense_type for provable_policy defense
+                            rag_context = rag_memory_manager.get_context(
+                                user_message,
+                                session_id=session_id,
+                                defense_type=rag_defense_type
+                            )
                             if rag_context:
                                 rag_context = "\n\n# Relevant Memory Context\n" + rag_context + "\n"
                                 context_parts.append(rag_context)
@@ -414,7 +422,10 @@ class TestBench:
                         from agent.backend.memory_manager import get_memory_manager
                         memory_file = memory_config.get("explicit_memory", {}).get("memory_file", 
                             test_config.get("data", {}).get("memory_file", "data/interactive_agent/agent_memory.json"))
-                        memory_manager = get_memory_manager(memory_file=memory_file, force_new=True)
+                        memory_manager = get_memory_manager(memory_file=memory_file)
+                        # Note: For provable_policy defense, session_id and defense_type should be passed
+                        # but in test_bench context, we don't have session_id here, so pass None
+                        # The defense will still work when memories are retrieved in agent_core
                         explicit_memory_context = memory_manager.get_long_term_as_text()
                     except Exception:
                         explicit_memory_context = ""
@@ -633,12 +644,12 @@ class TestBench:
             # No memory backend enabled
             # Explicitly set backend to "none" and disable all backends
             test_config["memory"]["backend"] = "none"
-            for backend_name in ["explicit", "mem0", "rag"]:
+            for backend_name in ["explicit", "mem0", "rag", "context"]:
                 if backend_name not in test_config["memory"]:
                     test_config["memory"][backend_name] = {}
                 test_config["memory"][backend_name]["enabled"] = False
             # Also disable backend-specific configs
-            for backend_config_key in ["explicit_memory", "mem0_memory", "rag_memory"]:
+            for backend_config_key in ["explicit_memory", "mem0_memory", "rag_memory", "context_memory"]:
                 if backend_config_key not in test_config["memory"]:
                     test_config["memory"][backend_config_key] = {}
                 test_config["memory"][backend_config_key]["enabled"] = False
@@ -652,6 +663,11 @@ class TestBench:
                 test_config["memory"]["mem0_memory"] = {}
             test_config["memory"]["mem0_memory"]["vectorstore_path"] = str(test_dir / "mem0_vectorstore")
             test_config["memory"]["mem0_memory"]["defense_type"] = self.backend_defense
+        elif self.memory_backend_name == "context":
+            if "context_memory" not in test_config["memory"]:
+                test_config["memory"]["context_memory"] = {}
+            test_config["memory"]["context_memory"]["context_path"] = str(test_dir / "context_memory.json")
+            test_config["memory"]["context_memory"]["defense_type"] = self.backend_defense
         elif self.memory_backend_name == "explicit":
             if "explicit_memory" not in test_config["memory"]:
                 test_config["memory"]["explicit_memory"] = {}
@@ -659,7 +675,7 @@ class TestBench:
             test_config["memory"]["explicit_memory"]["defense_type"] = self.backend_defense
         
         # Include defense type in trace file name if defense is enabled
-        if self.memory_backend_name in ("rag", "mem0"):
+        if self.memory_backend_name in ("rag", "mem0", "context"):
             if self.backend_defense == "none" or self.backend_defense == "no_defense":
                 trace_filename = "trace.jsonl"
             else:
@@ -673,10 +689,19 @@ class TestBench:
         return test_config
     
     def cleanup_test_environment(self, test_dir: Path):
-        """Clean up test environment directory."""
-        if test_dir.exists():
-            shutil.rmtree(test_dir)
-            print(f"Cleaned up test environment: {test_dir}")
+        """
+        Clean up test environment directory.
+        
+        Handles errors gracefully to ensure cleanup doesn't fail the benchmark.
+        """
+        if test_dir and test_dir.exists():
+            try:
+                shutil.rmtree(test_dir)
+                print(f"✅ Cleaned up test environment: {test_dir.name}")
+            except Exception as e:
+                # Log error but don't fail - we'll clean up later if needed
+                print(f"⚠️  Warning: Failed to clean up test environment {test_dir.name}: {e}")
+                logging.warning(f"Failed to clean up test environment {test_dir}: {e}")
         
     def run_test_from_file(self, test_file: Path) -> Dict[str, Any]:
         """Run a single test from a JSON file (adaptive or static based on config)."""
@@ -715,7 +740,8 @@ class TestBench:
         description = test_def["description"]
         steps = test_def["steps"]
         initial_data = test_def.get("initial_data", {})
-        attack_type = test_def.get("attack_type", "benign")
+        # Use helper function to determine attack_type (handles memory_only tests)
+        attack_type = determine_attack_type(test_file, test_def)
         
         # Check if result already exists (result caching)
         if should_skip_test(
@@ -775,6 +801,11 @@ class TestBench:
             # Clear any existing agent for this session to ensure fresh state
             clear_session_agent(session_id)
             
+            # Initialize session trust managers for both defenses
+            from agent.agent_core import SessionTrustManager, ProvablePolicyManager
+            SessionTrustManager.initialize_session(session_id)  # Initialize for no_untrusted_tools defense
+            ProvablePolicyManager.initialize_session(session_id)  # Initialize for provable_policy defense
+            
             # Run test steps
             step_results = []
             all_passed = True
@@ -814,6 +845,10 @@ class TestBench:
                     # Initialize new session as trusted (for no_untrusted_tools defense)
                     from agent.agent_core import SessionTrustManager
                     SessionTrustManager.initialize_session(session_id)
+                    
+                    # Initialize new session as Trusted (T) for provable_policy defense
+                    from agent.agent_core import ProvablePolicyManager
+                    ProvablePolicyManager.initialize_session(session_id)
                     
                     # Log session change event
                     from agent.utils import append_trace_event, get_timestamp, generate_id
@@ -954,7 +989,12 @@ class TestBench:
                 print(f"Expected: {step['expected_behavior']}")
                 
                 # Invoke agent (pure Python, no HTTP)
+                print(f"🔄 Calling invoke_agent...")
                 start_time = time.time()
+                
+                # Initialize is_attack_bench before try block so it's available in except block
+                is_attack_bench = "user_goal" in step or "attack_goal" in step
+                
                 try:
                     result = invoke_agent(
                         text=step['user_message'],
@@ -962,6 +1002,7 @@ class TestBench:
                         config=test_config
                     )
                     duration = time.time() - start_time
+                    print(f"✅ invoke_agent returned (took {duration:.2f}s)")
                     
                     response = result["response"]
                     
@@ -993,10 +1034,6 @@ class TestBench:
                     user_goal_passed = None
                     attack_goal_passed = None
                     partial_attack_score = None
-                    
-                    # Check if this is an attack benchmark with dual goals
-                    # We can detect this by checking if the step has user_goal or attack_goal fields
-                    is_attack_bench = "user_goal" in step or "attack_goal" in step
                     
                     if is_attack_bench and ("user_goal" in step or "attack_goal" in step):
                         # Dual evaluation system for attack benchmarks
@@ -1222,6 +1259,14 @@ class TestBench:
                     )
                     if has_success_check:
                         step_result["passed"] = False
+                        # Copy success_check/user_goal/attack_goal so the step is counted correctly
+                        if "success_check" in step and step.get("success_check"):
+                            step_result["success_check"] = step["success_check"]
+                        if is_attack_bench:
+                            if "user_goal" in step:
+                                step_result["user_goal"] = step["user_goal"]
+                            if "attack_goal" in step:
+                                step_result["attack_goal"] = step["attack_goal"]
                     step_results.append(step_result)
         
             # Add final session to session history (if there are any remaining steps after the last session change)
@@ -1352,7 +1397,8 @@ class TestBench:
             test_def = json.load(f)
         
         test_name = test_def["name"]
-        attack_type = test_def.get("attack_type", "unknown")
+        # Use helper function to determine attack_type (handles memory_only tests)
+        attack_type = determine_attack_type(test_file, test_def)
         
         # Check if this is an indirect PI attack (only these get adaptive treatment)
         if attack_type != "indirect":
@@ -1375,7 +1421,8 @@ class TestBench:
         
         # Save detailed result using unified structure (match static behavior)
         try:
-            attack_type = test_def.get("attack_type", "unknown")
+            # Use helper function to determine attack_type (handles memory_only tests)
+            attack_type = determine_attack_type(test_file, test_def)
             result_path = get_result_path(
                 self.memory_backend_name if self.memory_backend_name != "none" else "none",
                 self.unified_defense,
@@ -1462,6 +1509,10 @@ class TestBench:
             from agent.agent_core import SessionTrustManager
             SessionTrustManager.initialize_session(session_id)
             
+            # Initialize session as Trusted (T) for provable_policy defense
+            from agent.agent_core import ProvablePolicyManager
+            ProvablePolicyManager.initialize_session(session_id)
+            
             step_results = []
             all_passed = True
             optimization_used = False
@@ -1510,6 +1561,11 @@ class TestBench:
                     # Initialize new session as trusted (for no_untrusted_tools defense)
                     from agent.agent_core import SessionTrustManager
                     SessionTrustManager.initialize_session(session_id)
+                    
+                    # Initialize new session as Trusted (T) for provable_policy defense
+                    from agent.agent_core import ProvablePolicyManager
+                    ProvablePolicyManager.initialize_session(session_id)
+                    
                     # Log session change event
                     try:
                         from agent.utils import append_trace_event, get_timestamp, generate_id
@@ -2096,6 +2152,8 @@ class TestBench:
                 # For regular steps, we need to evaluate the success_check
                 try:
                     from benchmark.test_validators import create_validator
+                    # Store current user message in test_config for validators that need it (e.g., semantic judge)
+                    test_config["_current_user_message"] = step['user_message']
                     validator = create_validator(step["success_check"], test_config)
                     step_passed = validator.validate(response, session_id, step_traces)
                     result["passed"] = step_passed
@@ -2312,35 +2370,14 @@ class TestBench:
         If path is a file, return it. If path is a directory, find all JSON files recursively.
         
         Uses unified test directory structure: data/benchmark/tests/{suite}/
+        
+        This method delegates to the shared utility function for consistency.
         """
-        # Map suite keywords to directories under unified test directory
-        if test_path in {"benign", "direct", "indirect"}:
-            test_path_obj = self.test_bench_dir / test_path
-        else:
-            test_path_obj = Path(test_path)
-        
-        # Check if path exists
-        if not test_path_obj.exists():
-            print(f"⚠️  Test path not found: {test_path}")
-            if test_path in {"benign", "direct", "indirect"}:
-                print(f"   Expected location: {test_path_obj}")
-                print(f"   Unified test directory: {self.test_bench_dir}")
-            return []
-        
-        if test_path_obj.is_file():
-            if test_path_obj.suffix.lower() == '.json':
-                return [test_path_obj]
-            else:
-                print(f"File is not a JSON test file: {test_path}")
-                return []
-        
-        # Directory - find all JSON files recursively
-        test_files = list(test_path_obj.rglob("*.json"))
-        if not test_files:
-            print(f"No JSON test files found in {test_path}")
-            return []
-        
-        return sorted(test_files)
+        return discover_test_files_util(
+            test_path=test_path,
+            test_dir=self.test_bench_dir,
+            verbose=True  # TestBench prints warnings
+        )
     
     def run_all_tests(self, test_path: str) -> List[Dict[str, Any]]:
         """Run all tests from the specified path (file or directory)."""
@@ -2368,12 +2405,13 @@ class TestBench:
         print(f"Found {len(test_files)} test files")
         
         # Group tests by attack_type for better organization
-        test_groups = {"benign": [], "direct": [], "indirect": [], "unknown": []}
+        test_groups = {"benign": [], "direct": [], "indirect": [], "memory_only": [], "unknown": []}
         for test_file in test_files:
             try:
                 with open(test_file, 'r', encoding='utf-8') as f:
                     test_def = json.load(f)
-                    attack_type = test_def.get("attack_type", "unknown")
+                    # Use helper function to determine attack_type (handles memory_only tests)
+                    attack_type = determine_attack_type(test_file, test_def)
                     test_groups[attack_type].append(test_file)
             except Exception:
                 test_groups["unknown"].append(test_file)
@@ -2384,21 +2422,33 @@ class TestBench:
                 print(f"  {attack_type.upper()}: {len(files)} tests")
         
         results = []
-        for test_file in test_files:
-            result = self.run_test_from_file(test_file)
-            results.append(result)
-        
-        # Print summary to console (no file generation)
-        self.print_summary(results)
+        try:
+            for test_file in test_files:
+                result = self.run_test_from_file(test_file)
+                results.append(result)
+            
+            # Print summary to console (no file generation)
+            self.print_summary(results)
+        finally:
+            # Always clean up test environments, even if there was an error
+            self.cleanup_all_test_environments()
         
         return results
     
     def cleanup_all_test_environments(self):
-        """Clean up all test environment directories."""
+        """
+        Clean up all test environment directories.
+        
+        Ensures all test environments created during this benchmark run are removed.
+        """
+        if not self.test_dirs:
+            return
+        
+        print(f"\n🧹 Cleaning up {len(self.test_dirs)} test environment(s)...")
         for test_dir in self.test_dirs:
             self.cleanup_test_environment(test_dir)
         self.test_dirs.clear()
-        print("All test environments cleaned up.")
+        print("✅ All test environments cleaned up.")
     
     def print_summary(self, results: List[Dict[str, Any]]):
         """Generate a summary report of all test results."""
@@ -2449,7 +2499,8 @@ class TestBench:
                 if test_file.exists():
                     with open(test_file, 'r', encoding='utf-8') as f:
                         test_def = json.load(f)
-                        attack_type = test_def.get("attack_type", "benign")
+                    # Use helper function to determine attack_type (handles memory_only tests)
+                    attack_type = determine_attack_type(test_file, test_def)
             except Exception:
                 pass
             if attack_type in attack_type_groups:
@@ -2539,7 +2590,7 @@ def main():
     parser.add_argument("--test", type=str, nargs="+", help="Run specific test file(s) or directory(ies). Can specify multiple paths separated by spaces.")
     parser.add_argument("--suite", type=str, choices=["benign", "direct", "indirect"], help="Shortcut to run an entire suite under data/benchmark/attack_bench/<suite>.")
     parser.add_argument("--config", type=str, default="config.yaml", help="Config file")
-    parser.add_argument("--defense-type", type=str, help="Override defense_type from config (e.g., 'none', 'user_only', 'no_untrusted_tools', 'disable_memory'). This allows parallel runs without modifying the global config file.")
+    parser.add_argument("--defense-type", type=str, help="Override defense_type from config (e.g., 'none', 'user_prompt_only', 'no_untrusted_tools', 'disable_memory'). This allows parallel runs without modifying the global config file.")
     parser.add_argument("--force", action="store_true", help="Force overwrite existing results")
     
     args = parser.parse_args()
@@ -2584,7 +2635,7 @@ def main():
             # No specific tests specified, run all suites by default
             print("No specific tests specified. Running all test suites...")
             all_results = []
-            for suite in ["benign", "direct", "indirect"]:
+            for suite in ["benign", "direct", "indirect", "memory_only"]:
                 print(f"\n{'='*60}")
                 print(f"Running suite: {suite}")
                 print(f"{'='*60}")

@@ -129,29 +129,28 @@ class UpdateMemoryTool(BaseTool):
 
         try:
             # Use memory manager with the correct file path
-            memory_manager = get_memory_manager(memory_file=self.memory_file, force_new=True)
+            memory_manager = get_memory_manager(memory_file=self.memory_file)
 
+            # Use add_long_term() method which handles labels for provable_policy defense
             # Handle forget requests
             if memory_text.lower().startswith("forget"):
                 to_forget = memory_text[7:].strip()
                 original_count = len(memory_manager.long_term)
-                memory_manager.long_term = [
-                    item for item in memory_manager.long_term if to_forget.lower() not in item.lower()
-                ]
+                # Use the forget handler
+                memory_manager._handle_forget(f"Forget {to_forget}")
                 removed_count = original_count - len(memory_manager.long_term)
-
-                # Save updated memory
-                memory_manager._save_long_term()
 
                 result = f"✓ Memory updated: Removed {removed_count} fact(s) matching '{to_forget}'"
             else:
-                # Add new memory (avoid duplicates)
-                if memory_text not in memory_manager.long_term:
-                    memory_manager.long_term.append(memory_text)
-
-                    # Save updated memory
-                    memory_manager._save_long_term()
-
+                # Add new memory using add_long_term() which handles labels
+                # Check for duplicates first
+                existing_texts = [entry.get("text", entry) if isinstance(entry, dict) else entry for entry in memory_manager.long_term]
+                if memory_text not in existing_texts:
+                    memory_manager.add_long_term(
+                        memory_text,
+                        session_id=self.session_id,
+                        defense_type=self.explicit_defense_type
+                    )
                     result = f"✓ Memory updated: Saved '{memory_text}' to long-term memory"
                 else:
                     result = f"✓ Memory already exists: '{memory_text}'"

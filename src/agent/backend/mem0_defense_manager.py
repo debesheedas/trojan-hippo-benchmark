@@ -3,7 +3,7 @@ Mem0 Defense Manager
 
 Manages defense mechanisms for mem0 memory indexing:
 1. disable_memory: Baseline defense that disables all memory indexing
-2. user_only: Only index user messages (filter out assistant messages)
+2. user_prompt_only: Only index user messages (filter out assistant messages)
 3. no_untrusted_tools: Only index when no untrusted tools have been called in the session
 """
 
@@ -17,8 +17,7 @@ class Mem0DefenseManager:
     
     def __init__(
         self,
-        defense_type: str = "none",
-        trace_file: Optional[str] = None  # Kept for backward compatibility, but not used
+        defense_type: str = "none"
     ):
         """
         Initialize the defense manager.
@@ -27,10 +26,9 @@ class Mem0DefenseManager:
             defense_type: Type of defense to apply. Options:
                 - "none": No defense (default behavior)
                 - "disable_memory": Disable all memory indexing
-                - "user_only": Only index user messages
+                - "user_prompt_only": Only index user messages
                 - "no_untrusted_tools": Only index when no untrusted tools called
                 - "limit_memory_length": Truncate extracted mem0 memories to a fixed length
-            trace_file: Deprecated - kept for backward compatibility only
         """
         self.defense_type = defense_type
         
@@ -54,7 +52,7 @@ class Mem0DefenseManager:
             return False
         
         # Defense 2: User-only indexing
-        if self.defense_type == "user_only":
+        if self.defense_type == "user_prompt_only":
             # This is handled by filtering messages, not by returning False
             # So we return True here and filter in filter_messages
             return True
@@ -88,7 +86,7 @@ class Mem0DefenseManager:
             Filtered list of messages
         """
         # Defense 2: User-only indexing
-        if self.defense_type == "user_only":
+        if self.defense_type == "user_prompt_only":
             # Filter to only include user messages
             return [msg for msg in messages if msg.get("role") == "user"]
         
@@ -97,38 +95,21 @@ class Mem0DefenseManager:
     
 
 
-# Global defense manager cache (per session)
-_defense_manager_cache: Dict[str, Mem0DefenseManager] = {}
-
-
 def get_defense_manager(
     defense_type: str = "none",
-    trace_file: Optional[str] = None,
     session_id: Optional[str] = None,
-    force_new: bool = False
 ) -> Mem0DefenseManager:
     """
-    Get or create a defense manager instance.
+    Create a new defense manager instance.
     
     Args:
         defense_type: Type of defense to apply
-        trace_file: Path to trace file
-        session_id: Optional session ID for caching
-        force_new: If True, create a new instance
+        session_id: Optional session ID (kept for API compatibility, not used)
         
     Returns:
-        Mem0DefenseManager instance
+        A new Mem0DefenseManager instance
     """
-    global _defense_manager_cache
-    
-    # Use session_id + defense_type as cache key
-    cache_key = f"{session_id or 'default'}_{defense_type}"
-    
-    if force_new or cache_key not in _defense_manager_cache:
-        _defense_manager_cache[cache_key] = Mem0DefenseManager(
-            defense_type=defense_type,
-            trace_file=trace_file
-        )
-    
-    return _defense_manager_cache[cache_key]
+    return Mem0DefenseManager(
+        defense_type=defense_type
+    )
 

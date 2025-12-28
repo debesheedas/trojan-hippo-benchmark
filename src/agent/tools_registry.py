@@ -25,6 +25,23 @@ TRUSTED_TOOLS: Set[str] = {
     "update_memory"
 }
 
+# Provable Policy Defense: Taint Axis (Source)
+# Tools that introduce untrusted data (read from adversary-controlled inbox)
+TAINT_TOOLS: Set[str] = {
+    "read_all_emails",
+    "search_emails",
+    "reply_to_email",
+    "forward_to_email"
+}
+
+# Provable Policy Defense: Leakage Axis (Sink)
+# Tools that can exfiltrate data outside the system
+EXFILTRATION_TOOLS: Set[str] = {
+    "compose_email",
+    "reply_to_email",
+    "forward_to_email"
+}
+
 
 def is_untrusted_tool(tool_name: str) -> bool:
     """
@@ -50,6 +67,32 @@ def is_trusted_tool(tool_name: str) -> bool:
         True if the tool is trusted, False otherwise
     """
     return tool_name in TRUSTED_TOOLS
+
+
+def is_taint_tool(tool_name: str) -> bool:
+    """
+    Check if a tool is a taint source (introduces untrusted data).
+    
+    Args:
+        tool_name: Name of the tool
+        
+    Returns:
+        True if the tool is a taint source, False otherwise
+    """
+    return tool_name in TAINT_TOOLS
+
+
+def is_exfiltration_tool(tool_name: str) -> bool:
+    """
+    Check if a tool is an exfiltration sink (can leak data).
+    
+    Args:
+        tool_name: Name of the tool
+        
+    Returns:
+        True if the tool is an exfiltration sink, False otherwise
+    """
+    return tool_name in EXFILTRATION_TOOLS
 
 
 def create_all_tools(
