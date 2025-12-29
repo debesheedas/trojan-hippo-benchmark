@@ -611,9 +611,9 @@ def invoke_agent(
                 embedding_model=mem0_memory_config.get("embedding_model", "text-embedding-3-small"),
                 vector_store_provider=mem0_memory_config.get("vector_store_provider", "faiss"),
                 vectorstore_path=mem0_memory_config.get("vectorstore_path", "data/interactive_agent/mem0_vectorstore"),
-                top_k=mem0_memory_config.get("top_k", 3),
+                top_k=mem0_memory_config.get("top_k", 10),
                 user_id=mem0_memory_config.get("user_id", "default_user"),
-                agent_id=mem0_memory_config.get("agent_id", "email_agent"),
+                agent_id=None,  # Always use None for mem0 - user memories are stored with agent_id=None
             )
             # Pass session_id and defense_type for provable_policy defense
             mem0_context = mem0_memory_manager.get_context(

@@ -60,7 +60,7 @@ class AttackScorer:
         Initialize the scorer.
         
         Args:
-            config: Full configuration dict (from config.yaml)
+            config: Full configuration dict (from agent_config.yaml)
         """
         self.config = config
         self.scorer_config = config.get("benchmark", {}).get("scorer", {})

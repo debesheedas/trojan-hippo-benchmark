@@ -61,7 +61,7 @@ def get_timestamp() -> str:
     return fixed_date.isoformat()
 
 
-def load_config(config_path: str = "config.yaml") -> dict:
+def load_config(config_path: str = "agent_config.yaml") -> dict:
     """Load configuration from YAML file."""
     config_file = Path(config_path)
     if not config_file.exists():

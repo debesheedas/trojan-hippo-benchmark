@@ -39,7 +39,7 @@ class RAGMemoryManager:
     def __init__(
         self,
         embedding_model: str = "text-embedding-3-small",
-        top_k: int = 3,
+        top_k: int = 8,
         chunk_size: int = 512,
         vectorstore_path: Optional[str] = None,
         api_key: Optional[str] = None
@@ -311,7 +311,7 @@ class RAGMemoryManager:
 
 def get_rag_memory_manager(
     embedding_model: str = "text-embedding-3-small",
-    top_k: int = 3,
+    top_k: int = 10,
     chunk_size: int = 512,
     vectorstore_path: Optional[str] = None,
 ) -> RAGMemoryManager:

@@ -156,7 +156,7 @@ python scripts/run_benchmark.py \
   --memory-backend explicit \
   --defense-type user_prompt_only \
   --suite benign \
-  --config config.yaml \
+  --config benchmark_config.yaml \
   --force \
   --results-dir data/benchmark/results
 ```
@@ -178,7 +178,7 @@ python scripts/run_benchmark.py --help
 --all-defenses                        # Run all defense types
 
 # Optional:
---config CONFIG                       # Config file (default: config.yaml)
+--config CONFIG                       # Benchmark config file (default: benchmark_config.yaml)
 --force                              # Force overwrite existing results
 --results-dir RESULTS_DIR            # Custom results directory
 ```
@@ -206,10 +206,10 @@ Run the adaptive benchmark with attack optimization when static attacks fail:
 # Activate virtual environment (if using one)
 source venv/bin/activate
 
-# 1. Enable adaptive mode in config.yaml
+# 1. Enable adaptive mode in benchmark_config.yaml
 # Set benchmark.enable_adaptive_benchmark: true
 
-# 2. Configure memory backend in config.yaml
+# 2. Configure memory backend in agent_config.yaml
 # Set memory.backend: "explicit" (or "mem0" or "rag")
 # Set memory.{backend}_memory.enabled: true
 
@@ -222,7 +222,7 @@ python scripts/run_benchmark.py --memory-backend explicit --defense-type none --
 
 **What it does**: When a static attack fails, the system automatically attempts to optimize the attack using configured strategies (OpenEvolve or DSPy) to find a successful variant.
 
-**Configuration**: Configure optimizers in `config.yaml`:
+**Configuration**: Configure optimizers in `benchmark_config.yaml`:
 ```yaml
 benchmark:
   enable_adaptive_benchmark: true
@@ -244,7 +244,8 @@ benchmark:
 memory-agent-security-benchmark/
 ├── README.md                    # This file
 ├── requirements.txt             # Python dependencies
-├── config.yaml                  # Configuration (agent & benchmark settings)
+├── agent_config.yaml            # Agent configuration (model, temperature, etc.)
+├── benchmark_config.yaml         # Benchmark-specific settings
 ├── src/
 │   ├── agent/                   # Core agent implementation
 │   │   ├── agent_core.py        # Main agent execution logic
@@ -346,7 +347,7 @@ memory-agent-security-benchmark/
 
 ## Configuration
 
-Edit `config.yaml` to customize behavior:
+Edit `agent_config.yaml` to customize agent behavior:
 
 ### Agent Configuration
 
@@ -387,7 +388,6 @@ memory:
     vector_store_provider: "faiss"
     top_k: 10
     user_id: "vince"
-    agent_id: "email_agent"
   
   # RAG memory configuration
   rag_memory:
@@ -395,9 +395,8 @@ memory:
     defense_type: "none"  # Unified defense type
     vectorstore_path: "data/interactive_agent/rag_vectorstore"
     chunk_size: 512
-    chunk_overlap: 20
     embedding_model: "text-embedding-3-small"
-    top_k: 15
+    top_k: 8
 ```
 
 **Important Notes**:
@@ -790,19 +789,19 @@ The caching key is: `{memory_backend}/{defense_type}/{model_name}/{attack_type}/
 
 **Agent not responding:**
 - Check `OPENAI_API_KEY` in `.env` file
-- Verify model name in `config.yaml`
+- Verify model name in `agent_config.yaml`
 - Check terminal output for errors
 
 **Benchmark tests failing:**
 - Verify test files exist in `data/benchmark/tests/{suite}/` (unified location)
 - Check that initial data sets exist in `data/benchmark/initial_*/`
-- Verify memory backend is correctly configured in `config.yaml`
+- Verify memory backend is correctly configured in `agent_config.yaml`
 - Check that the specified memory backend is enabled
 - Review logs in `logs/` directory
 - Ensure test case format is correct (use unified format)
 
 **Memory backend not working:**
-- Ensure only one memory backend is enabled in `config.yaml`
+- Ensure only one memory backend is enabled in `agent_config.yaml`
 - Check that `memory.backend` matches the enabled backend (or use `--memory-backend` CLI argument)
 - Verify backend-specific configuration (vectorstore paths, etc.)
 - For mem0/rag: Ensure vectorstore directories are accessible
@@ -812,7 +811,7 @@ The caching key is: `{memory_backend}/{defense_type}/{model_name}/{attack_type}/
 - Check that results directory is writable
 - Verify result path structure: `results/{backend}/{defense}/{model}/{attack_type}/`
 - Use `--force` flag to overwrite existing results if needed
-- Check that model name is correctly set in `config.yaml` (`agent.target_model_name`)
+- Check that model name is correctly set in `agent_config.yaml` (`agent.target_model_name`)
 
 **Test cases not found:**
 - Check test directory: `data/benchmark/tests/{attack_type}/`
@@ -894,7 +893,7 @@ data/benchmark/results/
 ### Configuration Priority
 
 1. **CLI arguments** (highest priority) - `--memory-backend`, `--defense-type`
-2. **Config file** - `config.yaml` settings
+2. **Config file** - `agent_config.yaml` settings
 3. **Defaults** - System defaults
 
 The `--memory-backend` argument automatically enables the specified backend and disables others, overriding config file settings.

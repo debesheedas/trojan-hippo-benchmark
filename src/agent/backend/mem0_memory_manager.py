@@ -10,6 +10,8 @@ Features:
 """
 
 import os
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import threading
@@ -41,9 +43,9 @@ class Mem0MemoryManager:
         embedding_model: str = "text-embedding-3-small",
         vector_store_provider: str = "faiss",
         vectorstore_path: Optional[str] = None,
-        top_k: int = 3,
+        top_k: int = 10,
         user_id: str = "vince",
-        agent_id: str = "email_agent",
+        agent_id: Optional[str] = None,  # Always None for mem0 - user memories use agent_id=None
         api_key: Optional[str] = None
     ):
         """
@@ -59,7 +61,7 @@ class Mem0MemoryManager:
             vectorstore_path: Optional path to persist vector store
             top_k: Number of top memories to retrieve
             user_id: User identifier for memory scoping
-            agent_id: Agent identifier for memory scoping
+            agent_id: Agent identifier (should always be None for mem0 - user memories use agent_id=None)
             api_key: Optional API key (uses env vars if not provided)
         """
         if not MEM0_AVAILABLE:
@@ -77,7 +79,7 @@ class Mem0MemoryManager:
         self.vectorstore_path = Path(vectorstore_path) if vectorstore_path else None
         self.top_k = top_k
         self.user_id = user_id
-        self.agent_id = agent_id
+        self.agent_id = None  # Always None for mem0 - user memories are stored with agent_id=None
         self._lock = threading.Lock()
         
         # Get API key from parameter or environment
@@ -164,9 +166,9 @@ class Mem0MemoryManager:
             if not messages:
                 return {"results": []}
             
-            # Always use "vince" as user_id (hardcoded)
+            # Always use "vince" as user_id (hardcoded) and None for agent_id
             user_id = "vince"
-            agent_id = agent_id or self.agent_id
+            agent_id = None  # Always None for mem0
             
             # Combine metadata
             combined_metadata = metadata or {}
@@ -217,13 +219,47 @@ class Mem0MemoryManager:
                             messages_to_use.append(msg)
                 
                 # Extract memories using mem0 (with potentially truncated messages)
-                result = self.memory.add(
-                    messages=messages_to_use,
-                    user_id=user_id,
-                    agent_id=None,  # Don't pass agent_id to force USER_MEMORY_EXTRACTION_PROMPT
-                    metadata=combined_metadata,  # Don't include agent_id here
-                    infer=True,  # Use LLM to extract facts
-                )
+                # Capture mem0's internal error messages to handle UPDATE operation failures gracefully
+                # Root cause: mem0's deduplication logic uses simple IDs (e.g., '6') to track memories,
+                # but stored memories have UUIDs. When mem0 tries to UPDATE a similar memory, it fails
+                # with KeyError because it can't find the memory with the simple ID.
+                # This is a mem0 bug - we can't fix it without modifying mem0 source code.
+                error_buffer = StringIO()
+                try:
+                    with redirect_stderr(error_buffer), redirect_stdout(error_buffer):
+                        result = self.memory.add(
+                            messages=messages_to_use,
+                            user_id=user_id,
+                            agent_id=None,  # Don't pass agent_id to force USER_MEMORY_EXTRACTION_PROMPT
+                            metadata=combined_metadata,  # Don't include agent_id here
+                            infer=True,  # Use LLM to extract facts
+                        )
+                    
+                    # Check if mem0 printed any UPDATE-related errors
+                    error_output = error_buffer.getvalue()
+                    if error_output and "Error processing memory action" in error_output:
+                        # Check if the operation still succeeded (new memories were added)
+                        has_results = False
+                        if isinstance(result, dict):
+                            has_results = bool(result.get("results"))
+                        elif isinstance(result, list):
+                            has_results = bool(result)
+                        elif result:
+                            has_results = True
+                        
+                        if has_results:
+                            # Operation succeeded despite UPDATE failure - log as warning for monitoring
+                            # The new memory was added, but mem0 failed to UPDATE the old similar memory
+                            # This is non-fatal but worth tracking to see if it affects performance
+                            print(f"Warning: mem0 UPDATE operation failed (mem0 bug - ID mismatch), but new memory was added. "
+                                  f"This may cause duplicate memories. Error: {error_output[:300]}")
+                        else:
+                            # Operation completely failed - this is more serious
+                            print(f"Error: mem0 UPDATE operation failed, and no new memories were added. "
+                                  f"This may indicate a more serious issue. Error: {error_output[:300]}")
+                except Exception as e:
+                    # Re-raise the exception - this is a real error, not just an UPDATE failure
+                    raise
                 
                 # Post-process: Ensure extracted memories are also truncated (defense in depth)
                 # Even though we truncated input, mem0 might combine or rephrase, so we check again
@@ -375,14 +411,15 @@ class Mem0MemoryManager:
             
             # Always use "vince" as user_id (hardcoded)
             user_id = "vince"
-            agent_id = agent_id or self.agent_id
+            # Always use None for agent_id - user memories are stored with agent_id=None
+            agent_id = None
             limit = limit or self.top_k
             
             try:
                 result = self.memory.search(
                     query=query,
                     user_id=user_id,
-                    agent_id=agent_id,
+                    agent_id=agent_id,  # Always None
                     limit=limit
                 )
                 # Extract results from mem0 response
@@ -434,18 +471,26 @@ class Mem0MemoryManager:
         Returns:
             Formatted context string with retrieved memories
         """
-        # Always use "vince" as user_id (hardcoded)
-        memories = self.search(query, user_id="vince", agent_id=agent_id, session_id=session_id, defense_type=defense_type)
+        # Always use "vince" as user_id (hardcoded) and None for agent_id
+        memories = self.search(query, user_id="vince", agent_id=None, session_id=session_id, defense_type=defense_type)
         
-        # If no memories found, try a fallback: get some general persona memories
-        # This helps when the query is too specific and doesn't match persona details
-        if not memories:
+        # If we got fewer memories than top_k, try a more aggressive fallback
+        # This helps when the query is too specific and doesn't match stored memories well
+        if len(memories) < self.top_k:
             try:
-                # Get a sample of all memories as fallback (up to top_k)
-                all_memories = self.get_all_memories(user_id="vince", agent_id=agent_id, limit=self.top_k)
+                # Get a sample of all memories as fallback
+                all_memories = self.get_all_memories(user_id="vince", agent_id=None, limit=self.top_k)
                 if all_memories:
                     # Use first few memories as fallback context
-                    memories = all_memories[:min(5, len(all_memories))]
+                    existing_texts = {m.get("memory", "") for m in memories if isinstance(m, dict)}
+                    for mem in all_memories[:min(10, len(all_memories))]:
+                        if isinstance(mem, dict):
+                            mem_text = mem.get("memory", "")
+                            if mem_text and mem_text not in existing_texts:
+                                memories.append(mem)
+                                existing_texts.add(mem_text)
+                                if len(memories) >= self.top_k:
+                                    break
             except Exception:
                 pass
         
@@ -469,14 +514,13 @@ class Mem0MemoryManager:
         limit: int = 100
     ) -> List[Dict[str, Any]]:
         """
-        Get all memories for a user/agent using the get_all API.
+        Get all memories for a user using the get_all API.
         
         Note: User memories are stored with agent_id=None (to use USER_MEMORY_EXTRACTION_PROMPT).
-        This method will try both the provided agent_id and None to find all relevant memories.
         
         Args:
             user_id: Optional user ID (defaults to self.user_id)
-            agent_id: Optional agent ID (defaults to None to match how user memories are stored)
+            agent_id: Optional agent ID (ignored - always uses None)
             filters: Optional additional filters (supports AND, OR, etc.)
             limit: Maximum number of memories to return (default: 100)
             
@@ -485,28 +529,23 @@ class Mem0MemoryManager:
         """
         with self._lock:
             user_id = user_id or self.user_id
-            # User memories are stored with agent_id=None, so default to None if not explicitly provided
-            # This ensures we retrieve user memories correctly
-            if agent_id is None:
-                agent_id = None  # Explicitly use None for user memories
-            # If agent_id is provided, we'll try both that and None to get all memories
+            # Always use None for agent_id - user memories are stored with agent_id=None
+            agent_id = None
             
             all_memories = []
             
             try:
-                # First, try with the provided agent_id (or None)
                 query_filters = (filters or {}).copy()
                 
-                # Add user_id and agent_id to filters if provided
+                # Add user_id to filters
                 if user_id:
                     query_filters["user_id"] = user_id
-                if agent_id:
-                    query_filters["agent_id"] = agent_id
+                # Don't add agent_id - always use None
                 
-                # Call get_all with filters
+                # Call get_all with agent_id=None
                 result = self.memory.get_all(
                     user_id=user_id if user_id else None,
-                    agent_id=agent_id if agent_id else None,
+                    agent_id=None,
                     filters=query_filters if query_filters else None,
                     limit=limit
                 )
@@ -516,36 +555,6 @@ class Mem0MemoryManager:
                     all_memories.extend(result["results"])
                 elif isinstance(result, list):
                     all_memories.extend(result)
-                
-                # Also try with agent_id=None to find user memories (stored with agent_id=None)
-                # This is important because user memories are stored with agent_id=None
-                if agent_id is not None:  # Only try None if we haven't already
-                    try:
-                        query_filters_none = (filters or {}).copy()
-                        if user_id:
-                            query_filters_none["user_id"] = user_id
-                        # Don't add agent_id to filters for this query
-                        
-                        result_none = self.memory.get_all(
-                            user_id=user_id if user_id else None,
-                            agent_id=None,
-                            filters=query_filters_none if query_filters_none else None,
-                            limit=limit
-                        )
-                        
-                        if isinstance(result_none, dict) and "results" in result_none:
-                            # Add memories that aren't already in all_memories (deduplicate by id)
-                            existing_ids = {m.get("id") for m in all_memories if isinstance(m, dict) and "id" in m}
-                            for mem in result_none["results"]:
-                                if isinstance(mem, dict) and mem.get("id") not in existing_ids:
-                                    all_memories.append(mem)
-                        elif isinstance(result_none, list):
-                            existing_ids = {m.get("id") for m in all_memories if isinstance(m, dict) and "id" in m}
-                            for mem in result_none:
-                                if isinstance(mem, dict) and mem.get("id") not in existing_ids:
-                                    all_memories.append(mem)
-                    except Exception:
-                        pass  # If this fails, just return the memories we found with the original query
                 
                 return all_memories
             except Exception as e:
@@ -568,7 +577,7 @@ class Mem0MemoryManager:
         """
         with self._lock:
             user_id = user_id or self.user_id
-            agent_id = agent_id or self.agent_id
+            agent_id = None  # Always None for mem0
             
             try:
                 # Get all memories first
@@ -630,7 +639,7 @@ class Mem0MemoryManager:
                     "vector_store_provider": self.vector_store_provider,
                     "top_k": self.top_k,
                     "user_id": self.user_id,
-                    "agent_id": self.agent_id
+                    "agent_id": None  # Always None for mem0
                 }
             except Exception as e:
                 print(f"Warning: Could not get mem0 memory stats: {e}")
@@ -645,9 +654,9 @@ def get_mem0_memory_manager(
     embedding_model: str = "text-embedding-3-small",
     vector_store_provider: str = "faiss",
     vectorstore_path: Optional[str] = None,
-    top_k: int = 3,
+    top_k: int = 10,
     user_id: str = "vince",
-    agent_id: str = "email_agent",
+    agent_id: Optional[str] = None,  # Always None for mem0
 ) -> Mem0MemoryManager:
     """
     Create a new mem0 memory manager instance.

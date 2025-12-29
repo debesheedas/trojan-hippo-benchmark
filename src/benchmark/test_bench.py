@@ -44,7 +44,8 @@ from benchmark.benchmark_utils import (
     should_skip_test,
     create_isolated_test_dir,
     determine_attack_type,
-    discover_test_files as discover_test_files_util
+    discover_test_files as discover_test_files_util,
+    get_log_path
 )
 
 
@@ -64,7 +65,7 @@ class TestBench:
         if config_path is not None and config is not None:
             raise ValueError("Cannot specify both config_path and config")
         if config_path is None and config is None:
-            config_path = "config.yaml"  # Default to config.yaml
+            config_path = "agent_config.yaml"  # Default to agent_config.yaml
         
         if config is not None:
             self.config = config
@@ -81,10 +82,10 @@ class TestBench:
         global_seed = self.config.get("seed", 42)
         set_global_seeds(global_seed)
         
-        # Read model name strictly from config.yaml
+        # Read model name strictly from agent_config.yaml
         self.model_name = self.config.get("agent", {}).get("target_model_name")
         if not self.model_name:
-            raise ValueError("Config missing agent.target_model_name. Please set it in config.yaml.")
+            raise ValueError("Config missing agent.target_model_name. Please set it in agent_config.yaml.")
         self.test_dirs = []  # Track test directories for cleanup
         self.force = force  # Force overwrite existing results
         
@@ -710,10 +711,47 @@ class TestBench:
         
     def run_test_from_file(self, test_file: Path) -> Dict[str, Any]:
         """Run a single test from a JSON file (adaptive or static based on config)."""
-        if self.adaptive_enabled:
-            return self._run_adaptive_test_from_file(test_file)
-        else:
-            return self._run_static_test_from_file(test_file)
+        # Load test definition to determine attack_type for log path
+        with open(test_file, 'r', encoding='utf-8') as f:
+            test_def = json.load(f)
+        
+        attack_type = determine_attack_type(test_file, test_def)
+        
+        # Set up individual log file for this test case (matches results folder structure)
+        logs_base_dir = Path("data/benchmark/logs")
+        log_path = get_log_path(
+            memory_backend=self.memory_backend_name,
+            unified_defense=self.unified_defense,
+            model_name=self.model_name,
+            attack_type=attack_type,
+            test_file=test_file,
+            logs_base_dir=logs_base_dir
+        )
+        
+        # Create log directory
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save original stdout/stderr
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        
+        # Open log file and redirect output
+        log_file = open(log_path, 'w', encoding='utf-8')
+        sys.stdout = log_file
+        sys.stderr = log_file
+        
+        try:
+            if self.adaptive_enabled:
+                return self._run_adaptive_test_from_file(test_file)
+            else:
+                return self._run_static_test_from_file(test_file)
+        finally:
+            # Restore stdout/stderr and close log file
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            log_file.close()
     
     def _run_static_test_from_file(self, test_file: Path) -> Dict[str, Any]:
         # Reset execution error tracking at start of each test
@@ -736,11 +774,7 @@ class TestBench:
             ]
         }
         """
-        print(f"\n{'='*80}")
-        print(f"RUNNING TEST: {test_file.name}")
-        print(f"{'='*80}")
-        
-        # Load test definition
+        # Load test definition first to determine attack_type
         with open(test_file, 'r', encoding='utf-8') as f:
             test_def = json.load(f)
         
@@ -777,6 +811,7 @@ class TestBench:
             try:
                 with open(result_path, 'r', encoding='utf-8') as f:
                     existing_result = json.load(f)
+                
                 return existing_result
             except Exception as e:
                 print(f"⚠️  Warning: Could not load existing result: {e}")
@@ -2618,7 +2653,7 @@ def main():
     parser = argparse.ArgumentParser(description="Email Agent Test Bench (Pure Python)")
     parser.add_argument("--test", type=str, nargs="+", help="Run specific test file(s) or directory(ies). Can specify multiple paths separated by spaces.")
     parser.add_argument("--suite", type=str, choices=["benign", "direct", "indirect"], help="Shortcut to run an entire suite under data/benchmark/attack_bench/<suite>.")
-    parser.add_argument("--config", type=str, default="config.yaml", help="Config file")
+    parser.add_argument("--config", type=str, default="agent_config.yaml", help="Config file")
     parser.add_argument("--defense-type", type=str, help="Override defense_type from config (e.g., 'none', 'user_prompt_only', 'no_untrusted_tools', 'disable_memory'). This allows parallel runs without modifying the global config file.")
     parser.add_argument("--force", action="store_true", help="Force overwrite existing results")
     

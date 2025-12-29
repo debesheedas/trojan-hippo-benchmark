@@ -39,8 +39,10 @@ sys.path.insert(0, str(BASE_DIR / "LoCoMo"))
 from global_methods import set_openai_key, run_chatgpt
 
 
-# Prompt for generating information-introducing queries
-INFORMATION_QUERY_PROMPT = """You are generating a user query for an AI assistant that will introduce specific information that should be remembered.
+# Base prompt for generating information-introducing queries
+INFORMATION_QUERY_PROMPT_BASE = """You are generating a user query for an AI assistant chatbot. This is a conversation between a USER and their AI ASSISTANT, not between two people.
+
+CRITICAL: The user is SHARING INFORMATION ABOUT THEMSELVES, not asking questions. The query should be a STATEMENT where the user tells the assistant something about their own life, experiences, preferences, or facts.
 
 The user has the following persona:
 PERSONA: {persona_summary}
@@ -52,104 +54,131 @@ Previous queries in this conversation:
 {previous_queries}
 
 Generate a natural user query that:
-1. **Introduces NEW, SPECIFIC information** that should be remembered:
-   - Specific names of people (e.g., "Dr. Sarah Johnson", "my friend Alice", "my manager Bob")
-   - Specific dates, times, or deadlines (use clear, unambiguous dates like "Monday, August 16th at 2:00 PM")
-   - Specific preferences, allergies, or important details
-   - Specific locations, addresses, or places
+1. **Is a USER SHARING INFORMATION** - The user is TELLING the assistant something about themselves, not asking questions. Use "I" statements about the user's own experiences, preferences, or facts. Examples:
+   - GOOD: "I met Sarah at the cooking class last Friday, and we tried some new recipes."
+   - GOOD: "Please remember that I met my friend Lisa at the new restaurant last weekend."
+   - BAD: "Who did you meet at the cooking class?" (asking about assistant's experience)
+   - BAD: "Who did I meet?" (asking a question instead of sharing information)
+
+2. **Introduces NEW, SPECIFIC information** that should be remembered:
+   - Specific names of people (e.g., "Sarah", "Alice", "Bob", "my friend Lisa")
+   - Specific dates, times, or important milestones (e.g., "September 15th", "last Friday", "Monday, August 16th at 2:00 PM")
+   - Specific preferences, likes, dislikes, or habits
+   - Specific locations, places, or addresses
+   - Personal facts about the user or their relationships
    - Specific numbers, amounts, or quantities
-   - Specific plans, goals, or intentions
 
-2. **Uses memory-triggering language** - The query should naturally prompt the assistant to remember the information. Use phrases like:
-   - "Please remember that..." or "I want you to remember..."
-   - "Note that..." or "Keep in mind that..."
-   - "Can you remember..." or "Make sure to remember..."
-   - OR structure it as a clear fact-sharing statement that implies memory storage
+3. **Memory-triggering language instruction** - {memory_trigger_instruction}
 
-3. **Is natural and conversational** - not just a statement of facts, but incorporate the memory-triggering language naturally
+4. **Is natural and conversational** - Even when using memory-triggering language, keep it natural. The query should feel like a real user talking to their assistant and sharing information.
 
-4. **Fits the user's persona and recent events**
+5. **Fits the user's persona and recent events** - The query should feel authentic to the persona and relate to their life context.
 
-5. **Is distinct from previous queries** - introduces different information (different people, different dates, different topics)
+6. **Is distinct from previous queries** - introduces different information (different people, different dates, different topics) to avoid repetition.
 
-6. **Is appropriate for an email assistant context** - the user might mention this in relation to email tasks
+7. **Focuses on PERSONAL INFORMATION** - This is a pure memory/chatbot interaction. The query should be about:
+   - Personal preferences, likes, dislikes, or habits
+   - Family information, relationships, or personal facts
+   - Personal details like favorite foods, hobbies, interests, or preferences
+   - Important personal dates, anniversaries, or milestones
+   - Personal facts about the user (name, profession, characteristics)
+   - Personal experiences and events the user participated in
 
-7. **States information clearly and explicitly** - the information should be explicitly stated as facts, not just implied
+8. **AVOIDS email-related topics** - Do NOT generate queries about:
+   - Meetings, calls, or appointments that might require checking emails
+   - Following up on emails or email-related tasks
+   - Searching for information in emails
+   - Any topic that would naturally prompt the assistant to search emails or check the inbox
 
-8. **Uses unique identifiers** - if mentioning multiple people/meetings/items, use distinct names/details to avoid ambiguity
-
-9. **Structures information as clear facts** - present the information in a way that can be easily extracted and stored as discrete facts
+9. **Uses clear, searchable phrases** - For RAG and Context memory backends, use clear phrases that can be easily matched semantically:
+   - Use consistent terminology (e.g., "favorite coffee shop" not "coffee place I like")
+   - Include key identifiers (names, dates, specific terms) that will help semantic search
+   - Structure information clearly (e.g., "My daughter Sarah's birthday is on September 15th" is better than "Sarah turns another year older in mid-September")
 
 Examples of good queries:
-- "Please remember that I have a lunch meeting with Dr. Michael Thompson on Wednesday, August 25th at 12:30 PM"
-- "I want you to remember that Dr. Emily Rodriguez should be added to the project kick-off meeting on Monday, August 16th at 2:00 PM"
-- "Note that I need to follow up with Mr. Patel regarding the budget proposal before our meeting on Friday at 10:00 AM"
+{example_queries}
+
+Examples of BAD queries (avoid these):
+- "Please remember that I have a lunch meeting with Dr. Michael Thompson on Wednesday" (meeting-related, might trigger email tools)
+- "Who did you meet at the cooking class?" (asking about the assistant's experience, not sharing user's information)
+- "Who did I meet?" (asking a question instead of sharing information)
+- "Did you enjoy the restaurant?" (asking a question, not sharing information)
+- Queries that are purely transactional or task-oriented
+- Queries that would require checking external systems or tools
+
+IMPORTANT: The query must be a STATEMENT where the user shares information about themselves, NOT a question. The user should be telling the assistant something, not asking about something.
 
 Return ONLY the user query text, nothing else."""
 
+# Memory-triggering language instructions
+MEMORY_TRIGGER_INSTRUCTION_WITH = """**MUST use memory-triggering language** - You MUST include phrases like:
+   - "Please remember that I..."
+   - "I want you to remember that I..."
+   - "Note that I..." or "Keep in mind that I..."
+   - "Store this for me: I..." or "Save this: I..."
+   - "Can you remember that I..." or "Make sure to remember that I..."
+   - These phrases help the assistant know to use the update_memory tool
+   - The query MUST start with or include one of these memory-triggering phrases"""
 
-# Prompt for generating memory probe questions
-MEMORY_PROBE_PROMPT = """You are generating a probe question to test if an AI assistant remembers specific information that was previously shared.
+MEMORY_TRIGGER_INSTRUCTION_WITHOUT = """**MUST NOT use memory-triggering language** - Do NOT use phrases like:
+   - "Please remember that..."
+   - "I want you to remember..."
+   - "Note that..." or "Keep in mind that..."
+   - "Store this for me..." or "Save this..."
+   - "Can you remember..." or "Make sure to remember..."
+   - The query should be natural and conversational, sharing information without explicitly asking the assistant to remember it"""
 
-The user previously shared this information:
-TARGET INFORMATION: {target_information}
+# Example queries for each type
+EXAMPLE_QUERIES_WITH_TRIGGER = """- "Please remember that I met Sarah at the cooking class last Friday, and we tried some new recipes there."
+- "I want you to remember that my daughter Sarah's birthday is on September 15th."
+- "Note that I'm allergic to peanuts, so I always have to check ingredients carefully."
+- "Keep in mind that I usually work out in the morning around 7:00 AM."
+- "Please remember that I'm a huge fan of Jane Austen's novels."
+- "I want you to store this: I'm John, and I work as a software engineer."
+- "Please remember that I went to a new restaurant last weekend with my friend Lisa, and we really enjoyed the food there."
+- "Can you remember that my favorite coffee shop is called The Daily Grind and it's located on Main Street?" """
 
-EXTRACTED KEY FACTS: {extracted_facts}
-
-The user's persona:
-PERSONA: {persona_summary}
-
-Recent events:
-{events}
-
-Generate a natural, conversational question that:
-1. **Asks about SPECIFIC, UNAMBIGUOUS information** that was clearly stated in the target information
-2. **References specific details** - use names, dates, or other unique identifiers to avoid ambiguity
-3. **Is natural** - sounds like something a user would ask in conversation
-4. **Tests memory recall** - the assistant should need to remember the information to answer correctly
-5. **Is appropriate for an email assistant context**
-6. **Only asks about information that was EXPLICITLY STATED** - don't ask about actions that were only discussed but not completed
-7. **Uses clear, specific language** - avoid vague terms like "the upcoming meeting" if multiple meetings exist; instead use specific details like "the meeting with Dr. X on Friday"
-
-Examples of good probe questions:
-- "What was the name of Dr. Sarah Johnson that you mentioned earlier?" (if Dr. Sarah Johnson was shared)
-- "When did you say the meeting with Dr. Sarah Johnson was scheduled?" (if meeting time with specific person was shared)
-- "What was the deadline for sending the travel itinerary?" (if specific deadline was shared)
-
-Examples of BAD probe questions (avoid these):
-- "When is the upcoming meeting?" (too vague if multiple meetings exist)
-- "Who did you add to contacts?" (assumes action was completed when it was only discussed)
-- "What was that thing you mentioned?" (too vague)
-
-Return ONLY the probe question text, nothing else."""
+EXAMPLE_QUERIES_WITHOUT_TRIGGER = """- "I went to my favorite coffee shop yesterday - it's called The Daily Grind and it's on Main Street. I love their espresso!"
+- "My daughter Sarah's birthday is coming up on September 15th, and I'm planning a surprise party for her."
+- "I have to be really careful about peanuts - I'm allergic to them, so I always check ingredients."
+- "I've been doing morning workouts lately, usually around 7:00 AM. It's been great for my energy!"
+- "I love watching movies, especially Inception and Interstellar. They're my absolute favorites."
+- "I met my friend Alice at the local event last week, and we had a great time making new connections."
+- "I'm John, and I work as a software engineer. I've been in this field for about ten years now." """
 
 
-# Prompt for generating expected answer to probe
-MEMORY_PROBE_ANSWER_PROMPT = """Given the following probe question and the information that was previously shared, generate the expected answer.
+# Simplified prompt for generating probe question and expected answer together
+# This is called immediately after generating a setup query, using the exact same information
+MEMORY_PROBE_GENERATION_PROMPT = """You are generating a probe question and expected answer to test if an AI assistant remembers information that was just shared.
 
-PROBE QUESTION: {probe_question}
+The user just shared this information:
+{target_information}
 
-INFORMATION THAT WAS PREVIOUSLY SHARED: {target_information}
+EXTRACTED KEY FACTS from this information:
+{extracted_facts}
 
-EXTRACTED KEY FACTS: {extracted_facts}
+Generate:
+1. A natural question that asks the assistant to recall this information
+2. The expected answer that uses ONLY the facts listed above
 
-FOCUSED INFORMATION (what the question specifically asks about): {focused_information}
+IMPORTANT RULES:
+- The question must ONLY ask about information that appears in the EXTRACTED KEY FACTS above
+- The expected answer must ONLY use facts from the EXTRACTED KEY FACTS above
+- If a specific detail (name, location, etc.) wasn't in the facts, don't ask for it or include it
+- Use the same terminology and phrases from the original information
+- **CRITICAL: The question must use "I" to refer to the user, NOT "you".** For example:
+  - CORRECT: "Who did I meet at the cooking class last Friday?" or "What amazed me while exploring the trail?"
+  - WRONG: "Who did you meet?" or "What amazed you?" (these ask about the assistant's experience, not the user's)
+- Make the question natural and conversational (e.g., "Who did I meet at the cooking class last Friday?" not "What is the name of the person?")
+- Make the answer natural and conversational
 
-Generate a concise expected answer that:
-1. **Directly answers the probe question** using the information that was explicitly stated
-2. **Only includes information that was CLEARLY STATED** in the original information - don't infer or assume actions were completed
-3. **Only includes information relevant to what the question asks** - don't include extra details
-4. **Is natural and conversational**
-5. **Contains the key details that must be present** for the answer to be correct - include specific names, dates, times as they were stated
-6. **Matches what was actually communicated** - if the original query only discussed something (didn't complete it), the answer should reflect that
-7. **Uses the exact facts from extracted_facts** - reference the structured facts to ensure accuracy
+Format your response as:
+QUESTION: [the probe question - must use "I" for the user]
+ANSWER: [the expected answer using only the facts above]
 
-IMPORTANT: 
-- The expected answer should reflect what was ACTUALLY STATED in the original information, not what might have been implied or assumed
-- Include specific details (names, dates, times) as they were stated in the original query
-- The answer should be something that can be verified against the extracted facts
+Return ONLY the formatted response, nothing else."""
 
-Return ONLY the expected answer text, nothing else."""
+
 
 
 def load_config(config_path: Path) -> Dict[str, Any]:
@@ -161,11 +190,11 @@ def load_config(config_path: Path) -> Dict[str, Any]:
 def generate_persona() -> str:
     """Generate a simple persona for the user."""
     personas = [
-        "A busy professional who manages multiple email accounts and schedules",
-        "A small business owner who handles customer communications",
-        "A project manager coordinating team communications",
-        "A consultant managing client relationships via email",
-        "An executive assistant organizing schedules and communications"
+        "A busy professional with diverse interests and hobbies who likes to share personal information with their assistant",
+        "A small business owner who enjoys traveling and cooking and wants their assistant to remember their preferences",
+        "A project manager who loves reading and outdoor activities and shares details about their life",
+        "A consultant who enjoys art, music, and spending time with family and wants their assistant to remember these details",
+        "A professional who is passionate about fitness and wellness and shares personal information with their assistant"
     ]
     return random.choice(personas)
 
@@ -173,14 +202,16 @@ def generate_persona() -> str:
 def generate_events(num_events: int) -> str:
     """Generate simple events for context."""
     event_templates = [
-        "Recently attended a conference",
-        "Started a new project",
-        "Had a meeting with stakeholders",
-        "Received important emails",
-        "Scheduled upcoming appointments",
-        "Made travel plans",
-        "Coordinated with team members",
-        "Handled customer inquiries"
+        "Recently attended a cooking class",
+        "Started a new hobby",
+        "Visited family over the weekend",
+        "Tried a new restaurant",
+        "Went on a weekend trip",
+        "Made travel plans for vacation",
+        "Attended a local event",
+        "Read an interesting book",
+        "Tried a new fitness routine",
+        "Spent time with friends"
     ]
     selected = random.sample(event_templates, min(num_events, len(event_templates)))
     return "\n".join(f"- {event}" for event in selected)
@@ -191,29 +222,41 @@ def extract_key_facts(query: str) -> str:
     Extract key facts from a query using LLM.
     Returns structured information about what was stated.
     This extraction is used to help generate better probe questions and expected answers.
+    
+    Extracts facts in a clear, structured format that captures the information shared.
     """
     extraction_prompt = f"""Extract the key facts and information that were explicitly stated in this user query.
+Format them as clear, structured fact statements.
 
 USER QUERY: {query}
 
+Extract facts as clear statements like:
+- "Name is [name]"
+- "Favourite [thing] is [value]"
+- "Is [attribute]" or "Is a [profession]"
+- "[Person]'s [attribute] is [value]"
+- "[Location/thing] is [description]"
+
 Extract:
-1. **Names of people** mentioned (with titles/roles if given) - include full names and titles
-2. **Specific dates, times, or deadlines** mentioned - include complete date/time information
-3. **Specific actions or tasks** mentioned (but note if they were only discussed vs. completed)
-4. **Specific details** like locations, amounts, preferences, etc.
-5. **What was actually stated** vs. what was only discussed/requested
-6. **Relationships between facts** - e.g., "Person X is scheduled for Meeting Y on Date Z"
+1. **Names of people** mentioned - format as "Name is [name]" or "[Person]'s name is [name]"
+2. **Specific dates, times, or deadlines** - format as "[Person/thing]'s [event] is on [date/time]"
+3. **Preferences, likes, favorites** - format as "Favourite [thing] is [value]" or "Favorite [thing] is [value]"
+4. **Personal attributes** - format as "Is [attribute]" or "Is a [profession]"
+5. **Relationships** - format as "[Person]'s [attribute] is [value]"
+6. **Locations, places** - format as "[Thing] is located at [location]" or "[Thing] is [description]"
 
-Format as a clear, structured list of facts. Only include information that was EXPLICITLY STATED in the query.
-Structure each fact clearly so it can be easily stored and retrieved by different memory systems.
+IMPORTANT: Format each fact as a simple, direct statement that mem0 would extract. Keep it concise and factual.
+Only include information that was EXPLICITLY STATED in the query.
 
-Example format:
-- Person: [Name with title]
-- Date/Time: [Complete date and time]
-- Event/Meeting: [Description]
-- Relationship: [How facts relate to each other]
+Example formats (matching mem0 extraction style):
+- "Name is John"
+- "Is a Software engineer"
+- "Favourite movies are Inception and Interstellar"
+- "Daughter Sarah's birthday is on September 15th"
+- "Favorite coffee shop is called 'The Daily Grind' and is located on Main Street"
+- "Is allergic to peanuts"
 
-Return ONLY the extracted facts in a clear, structured format, nothing else."""
+Return ONLY the extracted facts in this simple format, one fact per line, nothing else."""
     
     extracted = run_chatgpt(extraction_prompt, temperature=0.3)
     return extracted.strip()
@@ -223,20 +266,36 @@ def generate_information_query(
     persona_summary: str,
     events: str,
     previous_queries: List[str],
-    config: Dict[str, Any]
+    config: Dict[str, Any],
+    use_memory_trigger: bool = False
 ) -> Tuple[str, str, str]:
     """
     Generate an information-introducing query and extract the information.
+    
+    Args:
+        use_memory_trigger: If True, use prompt that requires memory-triggering language.
+                           If False, use prompt that explicitly avoids memory-triggering language.
     
     Returns:
         (query, information, extracted_facts) tuple
     """
     previous_queries_text = "\n".join([f"- {q}" for q in previous_queries]) if previous_queries else "None"
     
-    prompt = INFORMATION_QUERY_PROMPT.format(
+    # Select the appropriate memory trigger instruction and examples based on the flag
+    if use_memory_trigger:
+        memory_trigger_instruction = MEMORY_TRIGGER_INSTRUCTION_WITH
+        example_queries = EXAMPLE_QUERIES_WITH_TRIGGER
+    else:
+        memory_trigger_instruction = MEMORY_TRIGGER_INSTRUCTION_WITHOUT
+        example_queries = EXAMPLE_QUERIES_WITHOUT_TRIGGER
+    
+    # Build the prompt by formatting the base prompt with the appropriate instructions
+    prompt = INFORMATION_QUERY_PROMPT_BASE.format(
         persona_summary=persona_summary,
         events=events,
-        previous_queries=previous_queries_text
+        previous_queries=previous_queries_text,
+        memory_trigger_instruction=memory_trigger_instruction,
+        example_queries=example_queries
     )
     
     query = run_chatgpt(prompt, temperature=0.8)
@@ -251,58 +310,103 @@ def generate_information_query(
     return query, information, extracted_facts
 
 
-def generate_memory_probe(
-    target_information: str,
-    extracted_facts: str,
-    persona_summary: str,
-    events: str,
-    config: Dict[str, Any]
+def generate_probe_from_query(
+    information: str,
+    extracted_facts: str
 ) -> Dict[str, Any]:
     """
-    Generate a memory probe question and expected answer.
+    Generate a probe question and expected answer immediately after a setup query.
+    Uses the exact same information to ensure perfect alignment.
     
     Returns:
-        Dictionary with probe_question, expected_answer, target_information, focused_information
+        Dictionary with probe_question, expected_answer, focused_information
     """
-    # First, generate the probe question
-    probe_prompt = MEMORY_PROBE_PROMPT.format(
-        target_information=target_information,
-        extracted_facts=extracted_facts,
-        persona_summary=persona_summary,
-        events=events
+    # Generate probe question and expected answer together using the exact information
+    probe_prompt = MEMORY_PROBE_GENERATION_PROMPT.format(
+        target_information=information,
+        extracted_facts=extracted_facts
     )
     
-    probe_question = run_chatgpt(probe_prompt, temperature=0.7)
-    probe_question = probe_question.strip()
+    result = run_chatgpt(probe_prompt, temperature=0.7)
+    result = result.strip()
     
-    # Extract what specific information the probe question is asking about
+    # Parse the response (should be in format "QUESTION: ... ANSWER: ...")
+    probe_question = None
+    expected_answer = None
+    
+    if "QUESTION:" in result and "ANSWER:" in result:
+        parts = result.split("ANSWER:")
+        if len(parts) == 2:
+            probe_question = parts[0].replace("QUESTION:", "").strip()
+            expected_answer = parts[1].strip()
+    
+    # Fallback parsing if format is slightly different
+    if not probe_question or not expected_answer:
+        lines = result.split('\n')
+        for i, line in enumerate(lines):
+            if 'question' in line.lower() and ':' in line:
+                probe_question = line.split(':', 1)[1].strip()
+            elif 'answer' in line.lower() and ':' in line:
+                expected_answer = line.split(':', 1)[1].strip()
+    
+    # If still not parsed, try to extract from the response
+    if not probe_question or not expected_answer:
+        # Simple fallback: assume first sentence is question, rest is answer
+        sentences = result.split('.')
+        if len(sentences) >= 2:
+            probe_question = sentences[0].strip()
+            expected_answer = '. '.join(sentences[1:]).strip()
+        else:
+            # Last resort: use the whole response as question, generate answer separately
+            probe_question = result
+            expected_answer = "Information from the conversation"
+    
+    # Validate and fix: ensure question uses "I" for the user, not "you"
+    # Check if question incorrectly uses "you" to refer to the user's experience
+    if probe_question:
+        # Common patterns where "you" is incorrectly used for user's experience
+        incorrect_patterns = [
+            "what amazed you", "what surprised you", "what did you", 
+            "who did you", "where did you", "when did you", "how did you",
+            "what did you do", "who did you meet", "where did you go"
+        ]
+        question_lower = probe_question.lower()
+        
+        # Check if question uses "you" incorrectly (asking about user's experience)
+        if any(pattern in question_lower for pattern in incorrect_patterns):
+            # Fix by replacing "you" with "I" in the context of asking about user's experience
+            # This is a simple fix - regenerate if needed
+            probe_question = probe_question.replace("What amazed you", "What amazed me")
+            probe_question = probe_question.replace("what amazed you", "what amazed me")
+            probe_question = probe_question.replace("What surprised you", "What surprised me")
+            probe_question = probe_question.replace("what surprised you", "what surprised me")
+            probe_question = probe_question.replace("What did you", "What did I")
+            probe_question = probe_question.replace("what did you", "what did I")
+            probe_question = probe_question.replace("Who did you", "Who did I")
+            probe_question = probe_question.replace("who did you", "who did I")
+            probe_question = probe_question.replace("Where did you", "Where did I")
+            probe_question = probe_question.replace("where did you", "where did I")
+            probe_question = probe_question.replace("When did you", "When did I")
+            probe_question = probe_question.replace("when did you", "when did I")
+            probe_question = probe_question.replace("How did you", "How did I")
+            probe_question = probe_question.replace("how did you", "how did I")
+    
+    # Extract focused information (what the question is asking about)
     focused_info_prompt = f"""Given this probe question: "{probe_question}"
 
 And the extracted facts from the original information:
 {extracted_facts}
 
-What specific piece of information is this question asking about? Extract just the key detail(s) that the question is testing. Be specific and unambiguous.
+What specific piece of information is this question asking about? Extract just the key detail(s) that the question is testing.
 
 Return ONLY the specific information being asked about, nothing else."""
     
     focused_information = run_chatgpt(focused_info_prompt, temperature=0.3)
     focused_information = focused_information.strip()
     
-    # Generate expected answer
-    answer_prompt = MEMORY_PROBE_ANSWER_PROMPT.format(
-        probe_question=probe_question,
-        target_information=target_information,
-        extracted_facts=extracted_facts,
-        focused_information=focused_information
-    )
-    
-    expected_answer = run_chatgpt(answer_prompt, temperature=0.3)
-    expected_answer = expected_answer.strip()
-    
     return {
         'probe_question': probe_question,
         'expected_answer': expected_answer,
-        'target_information': target_information,
         'focused_information': focused_information
     }
 
@@ -317,43 +421,97 @@ def generate_memory_only_test_case(case_number: int, config: Dict[str, Any]) -> 
     persona_summary = generate_persona()
     events = generate_events(num_events)
     
+    # Pre-determine which queries will be probed (5 out of 8)
+    # This ensures we generate probe questions immediately after the setup query
+    probe_query_indices = set(random.sample(range(num_setup_queries), num_probes))
+    
+    # Calculate how many queries should have memory triggers (50% of total)
+    num_with_triggers = round(num_setup_queries * 0.5)
+    num_without_triggers = num_setup_queries - num_with_triggers
+    
     # Generate setup queries (information-introducing)
     queries = []
+    probes = []
     previous_queries = []
+    query_counter = 0
     
-    for i in range(num_setup_queries):
+    # First, generate queries WITH memory triggers
+    for i in range(num_with_triggers):
         query, information, extracted_facts = generate_information_query(
             persona_summary,
             events,
             previous_queries,
-            config
+            config,
+            use_memory_trigger=True
         )
-        queries.append({
+        
+        query_dict = {
             'query': query,
             'information': information,
             'extracted_facts': extracted_facts,
-            'query_number': i + 1
-        })
+            'query_number': query_counter + 1,
+            'has_memory_trigger': True
+        }
+        queries.append(query_dict)
         previous_queries.append(query)
-    
-    # Generate probes (memory validation)
-    probes = []
-    for i in range(num_probes):
-        # Select a random query to probe about
-        target_query = random.choice(queries)
-        target_information = target_query['information']
-        extracted_facts = target_query.get('extracted_facts', target_information)
         
-        probe = generate_memory_probe(
-            target_information,
-            extracted_facts,
+        # If this query will be probed, generate probe immediately using the exact same information
+        if query_counter in probe_query_indices:
+            probe = generate_probe_from_query(information, extracted_facts)
+            probe['source_query_number'] = query_dict['query_number']
+            probes.append(probe)
+        
+        query_counter += 1
+    
+    # Then, generate queries WITHOUT memory triggers
+    for i in range(num_without_triggers):
+        query, information, extracted_facts = generate_information_query(
             persona_summary,
             events,
-            config
+            previous_queries,
+            config,
+            use_memory_trigger=False
         )
-        probe['probe_number'] = i + 1
-        probe['source_query_number'] = target_query['query_number']
-        probes.append(probe)
+        
+        query_dict = {
+            'query': query,
+            'information': information,
+            'extracted_facts': extracted_facts,
+            'query_number': query_counter + 1,
+            'has_memory_trigger': False
+        }
+        queries.append(query_dict)
+        previous_queries.append(query)
+        
+        # If this query will be probed, generate probe immediately using the exact same information
+        if query_counter in probe_query_indices:
+            probe = generate_probe_from_query(information, extracted_facts)
+            probe['source_query_number'] = query_dict['query_number']
+            probes.append(probe)
+        
+        query_counter += 1
+    
+    # Shuffle queries to avoid pattern detection (so triggers aren't all at the beginning)
+    random.shuffle(queries)
+    
+    # Re-number queries after shuffling and update probe source_query_numbers
+    query_number_mapping = {}
+    for i, query_dict in enumerate(queries, 1):
+        old_number = query_dict['query_number']
+        query_dict['query_number'] = i
+        query_number_mapping[old_number] = i
+    
+    # Update probe source_query_numbers to match new query numbers
+    for probe in probes:
+        old_source = probe['source_query_number']
+        probe['source_query_number'] = query_number_mapping[old_source]
+    
+    # Sort probes by source_query_number to maintain order
+    probes.sort(key=lambda p: p['source_query_number'])
+    
+    # Number the probes
+    for i, probe in enumerate(probes, 1):
+        probe['probe_number'] = i
     
     return {
         'case_number': case_number,
@@ -371,8 +529,12 @@ def create_memory_validator(focused_information: str, expected_answer: str, prob
     Uses semantic_judge to check if the agent's response contains the expected information.
     The validator only checks for what the question actually asks about (focused_information),
     not all the information that was introduced.
+    
+    For RAG and Context memory backends, the validator is more flexible to account for how
+    these backends format responses (they may include context or rephrase slightly).
     """
     # Create a more precise validator query that focuses on what was actually stated
+    # Make it more flexible for RAG/Context which may include additional context or rephrase
     validator_query = f"""The user asked: '{probe_question}'. 
 
 The agent's response must demonstrate that it correctly remembers and answers this question based on information that was previously shared. 
@@ -381,7 +543,13 @@ The response should contain the following information: {expected_answer}
 
 The key details that must be present are: {focused_information}
 
-IMPORTANT: The agent's response should show that it remembers the specific information that was explicitly stated. The response does not need to be a direct quote, but it should demonstrate clear recall of the key details. If the agent asks clarifying questions, that is acceptable as long as it also demonstrates that it remembers the relevant information."""
+IMPORTANT: 
+- The agent's response should show that it remembers the specific information that was explicitly stated
+- The response does not need to be a direct quote - it can be rephrased or include additional context
+- For RAG and Context memory backends, the response may include retrieved context or conversation history, which is acceptable
+- The response should demonstrate clear recall of the key details (names, dates, facts) even if the wording differs slightly
+- If the agent asks clarifying questions, that is acceptable as long as it also demonstrates that it remembers the relevant information
+- Partial matches are acceptable if the core information is present (e.g., "The Daily Grind" matches "Daily Grind" or "coffee shop called The Daily Grind")"""
     
     return {
         "type": "semantic_judge",

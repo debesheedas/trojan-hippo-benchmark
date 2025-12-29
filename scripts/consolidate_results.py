@@ -252,13 +252,15 @@ def generate_csv(
         for defense_type in defense_types:
             row = [defense_type.replace("_", " ").title()]
             for backend in memory_backends:
-                _, _, rate, has_errors = data[defense_type][backend]
+                _, total_steps, rate, has_errors = data[defense_type][backend]
                 if has_errors:
                     # Show "ERR" instead of percentage when execution errors occurred
                     row.append("ERR")
-                elif rate > 0:
+                elif total_steps > 0:
+                    # Show percentage even if 0% (results exist, just 0% success rate)
                     row.append(f"{rate:.1f}%")
                 else:
+                    # No results available
                     row.append("-")
             writer.writerow(row)
     

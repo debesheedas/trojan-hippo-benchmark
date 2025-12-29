@@ -114,16 +114,40 @@ def run_benchmark(
         print(f"Running {memory_backend.upper()} benchmark with defense: {unified_defense}")
         print(f"{'='*80}\n")
     
-    # Load config and make a deep copy to avoid modifying the original
+    # Load benchmark config and make a deep copy to avoid modifying the original
     # This is important when multiple processes might be running in parallel
     import copy
     config = copy.deepcopy(load_config(config_path))
+    
+    # Load agent config from agent_config.yaml and merge it into benchmark config
+    # Agent settings (target_model_name, etc.) and memory settings are only in agent_config.yaml to avoid duplication
+    try:
+        agent_config = load_config("agent_config.yaml")
+        # Merge agent section
+        if "agent" in agent_config:
+            config["agent"] = agent_config["agent"].copy()
+        # Merge memory section (memory settings are only in agent_config.yaml)
+        if "memory" in agent_config:
+            config["memory"] = agent_config["memory"].copy()
+        # Merge seed if present
+        if "seed" in agent_config:
+            config["seed"] = agent_config["seed"]
+    except FileNotFoundError:
+        # If agent_config.yaml doesn't exist, that's okay - agent section will be missing
+        # and will be handled by the target_model_name check below
+        pass
     
     # Set target model name (command line arg takes precedence over config)
     if target_model_name:
         if "agent" not in config:
             config["agent"] = {}
         config["agent"]["target_model_name"] = target_model_name
+    elif "agent" not in config or "target_model_name" not in config.get("agent", {}):
+        # If no agent config was loaded and no target_model_name provided, raise error
+        raise ValueError(
+            "Agent configuration missing. Please ensure agent_config.yaml exists with an 'agent' section, "
+            "or provide --model argument to specify target_model_name."
+        )
     
     # Handle no memory backend: disable all backends
     if memory_backend == "none":
@@ -440,16 +464,13 @@ def _run_single_combination(
     Returns:
         (memory_backend, unified_defense, result_dict)
     """
-    import os
-    import sys
-    from pathlib import Path
-    from benchmark.benchmark_utils import get_combination_log_path, determine_attack_type
+    # determine_attack_type is already imported at module level
     
     # Set process name for debugging
     process_id = os.getpid()
     memory_backend, unified_defense, test_path, config_path, force, results_base_dir, target_model_name = args_tuple
     
-    # Determine attack type from test_path
+    # Determine attack type from test_path (needed for result paths)
     test_dir = Path("data/benchmark/tests")
     if isinstance(test_path, str):
         if test_path in ["benign", "direct", "indirect", "memory_only"]:
@@ -464,33 +485,15 @@ def _run_single_combination(
     else:
         attack_type = determine_attack_type(test_path, {})
     
-    # Get log file path
-    logs_base_dir = Path("data/benchmark/logs")
-    log_path = get_combination_log_path(
-        memory_backend=memory_backend,
-        unified_defense=unified_defense,
-        model_name=target_model_name or "unknown",
-        attack_type=attack_type,
-        logs_base_dir=logs_base_dir
-    )
-    
-    # Create log directory
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Redirect all output to log file
-    log_file = open(log_path, 'w', encoding='utf-8')
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
+    # Note: We no longer create combination.log since each test case has its own log file
+    # Individual test log files are created in TestBench.run_test_from_file()
     
     result = None
     try:
-        # Redirect stdout and stderr to log file
-        sys.stdout = log_file
-        sys.stderr = log_file
-        
+        # Print start message to terminal (not redirected to file)
         print(f"[PID {process_id}] Starting: {memory_backend} + {unified_defense}")
-        print(f"Log file: {log_path}")
-        print(f"{'='*80}\n")
+        print(f"Individual test logs will be written to: data/benchmark/logs/{target_model_name or 'unknown'}/{memory_backend}/{unified_defense}/{attack_type}/")
+        print(f"{'='*80}\n", flush=True)
         
         result = run_benchmark(
             memory_backend=memory_backend,
@@ -502,18 +505,19 @@ def _run_single_combination(
             target_model_name=target_model_name
         )
         
-        print(f"\n{'='*80}")
-        print(f"[PID {process_id}] Completed: {memory_backend} + {unified_defense}")
-        print(f"Tests run: {result.get('tests_run', 0)}, Passed: {result.get('tests_passed', 0)}, Failed: {result.get('tests_failed', 0)}")
-        print(f"{'='*80}")
+        # Print completion summary to terminal
+        print(f"\n{'='*80}", flush=True)
+        print(f"[PID {process_id}] Completed: {memory_backend} + {unified_defense}", flush=True)
+        print(f"Tests run: {result.get('tests_run', 0)}, Passed: {result.get('tests_passed', 0)}, Failed: {result.get('tests_failed', 0)}", flush=True)
+        print(f"{'='*80}", flush=True)
         
     except Exception as e:
         # Catch any exceptions and return error result
         import traceback
         error_msg = f"{str(e)}\n{traceback.format_exc()}"
-        print(f"\n{'='*80}")
-        print(f"[PID {process_id}] ERROR in {memory_backend} + {unified_defense}: {error_msg}")
-        print(f"{'='*80}")
+        print(f"\n{'='*80}", flush=True)
+        print(f"[PID {process_id}] ERROR in {memory_backend} + {unified_defense}: {error_msg}", flush=True)
+        print(f"{'='*80}", flush=True)
         result = {
             "success": False,
             "error": str(e),
@@ -522,18 +526,12 @@ def _run_single_combination(
             "tests_failed": 0
         }
     finally:
-        # Restore stdout/stderr and close log file
-        sys.stdout = original_stdout
-        sys.stderr = original_stderr
-        log_file.flush()  # Ensure all output is written
-        log_file.close()
-        
-        # Print completion status to terminal (only this goes to terminal)
+        # Print completion status to terminal
         if result and result.get("success"):
             status = "✅"
         else:
             status = "❌"
-        print(f"{status} {memory_backend.upper()} + {unified_defense} - Log: {log_path}", flush=True)
+        print(f"{status} {memory_backend.upper()} + {unified_defense} - See individual test logs in data/benchmark/logs/{target_model_name or 'unknown'}/{memory_backend}/{unified_defense}/{attack_type}/", flush=True)
     
     # Ensure result is never None
     if result is None:
