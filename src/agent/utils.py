@@ -514,7 +514,51 @@ def call_openai_chat_completion(
     if seed is not None:
         params["seed"] = seed
     
-    return client.chat.completions.create(**params)
+    import time
+    import random
+    
+    max_retries = 5
+    base_delay = 1.0  # Start with 1 second
+    
+    for attempt in range(max_retries):
+        try:
+            return client.chat.completions.create(**params)
+        except Exception as e:
+            error_str = str(e).lower()
+            
+            # Check for rate limiting errors
+            is_rate_limit = "rate limit" in error_str or "429" in error_str or "quota" in error_str
+            
+            # Check for connection errors (retryable)
+            is_connection_error = (
+                "connection" in error_str or 
+                "timeout" in error_str or
+                "network" in error_str or
+                "apiconnectionerror" in error_str or
+                type(e).__name__ == "APIConnectionError"
+            )
+            
+            # Only retry on rate limits or connection errors
+            if (is_rate_limit or is_connection_error) and attempt < max_retries - 1:
+                # Exponential backoff with jitter
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                import sys
+                error_type_display = "RATE LIMIT" if is_rate_limit else "CONNECTION"
+                print(f"⚠️  {error_type_display} ERROR (attempt {attempt + 1}/{max_retries}): {e}", file=sys.stderr, flush=True)
+                print(f"   Retrying in {delay:.2f}s...", file=sys.stderr, flush=True)
+                time.sleep(delay)
+                continue
+            else:
+                # Log non-retryable errors or final failure
+                import sys
+                if is_rate_limit:
+                    print(f"⚠️  RATE LIMIT ERROR (final after {max_retries} attempts): {e}", file=sys.stderr, flush=True)
+                elif is_connection_error:
+                    print(f"⚠️  CONNECTION ERROR (final after {max_retries} attempts): {e}", file=sys.stderr, flush=True)
+                else:
+                    print(f"⚠️  API ERROR (non-retryable): {e}", file=sys.stderr, flush=True)
+                # Re-raise the exception (this will be caught by test_bench and tracked)
+                raise
 
 
 def call_gemini_chat_completion(

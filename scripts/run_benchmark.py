@@ -21,7 +21,10 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import argparse
 import json
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
+import multiprocessing
+import sys
 
 # Add src to path
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -30,36 +33,11 @@ sys.path.insert(0, str(BASE_DIR / "src"))
 from agent.utils import load_config
 from benchmark.defense_backend import get_defense_backend_registry, UNIFIED_DEFENSE_TYPES
 from benchmark.benchmark_utils import (
-    get_result_path,
     should_skip_test,
-    get_memory_backend_from_config,
-    get_unified_defense_from_config,
     determine_attack_type,
-    cleanup_old_test_environments,
     discover_test_files
 )
 from benchmark.test_bench import TestBench
-
-
-def get_all_test_files(test_path: str, test_dir: Path) -> List[Path]:
-    """
-    Get all test files from a path.
-    
-    This is a wrapper around the shared discover_test_files utility.
-    Kept for backward compatibility.
-    
-    Args:
-        test_path: Path string (file, directory, or suite name)
-        test_dir: Base test directory
-        
-    Returns:
-        List of test file paths
-    """
-    return discover_test_files(
-        test_path=test_path,
-        test_dir=test_dir,
-        verbose=False
-    )
 
 
 def check_results_exist(
@@ -136,8 +114,10 @@ def run_benchmark(
         print(f"Running {memory_backend.upper()} benchmark with defense: {unified_defense}")
         print(f"{'='*80}\n")
     
-    # Load config
-    config = load_config(config_path)
+    # Load config and make a deep copy to avoid modifying the original
+    # This is important when multiple processes might be running in parallel
+    import copy
+    config = copy.deepcopy(load_config(config_path))
     
     # Set target model name (command line arg takes precedence over config)
     if target_model_name:
@@ -215,7 +195,11 @@ def run_benchmark(
     test_dir = Path(benchmark_config.get("test_dir", "data/benchmark/tests"))
     
     # Get test files
-    test_files = get_all_test_files(test_path, test_dir)
+    test_files = discover_test_files(
+        test_path=test_path,
+        test_dir=test_dir,
+        verbose=False
+    )
     if not test_files:
         print(f"⚠️  No test files found for path: {test_path}")
         return {
@@ -277,12 +261,10 @@ def run_benchmark(
         }
     finally:
         # Ensure cleanup happens even if there was an error
+        # Only clean up test environments created by THIS benchmark run
+        # Do NOT clean up old test environments here - that should be done
+        # manually or at the end of all parallel runs to avoid interference
         bench.cleanup_all_test_environments()
-        
-        # Also clean up any old test environments that might have been left behind
-        # (e.g., from crashed processes or interrupted runs)
-        # Only clean up environments older than 1 hour to avoid deleting active ones
-        cleanup_old_test_environments(max_age_hours=1)
 
 
 def run_all_defenses(
@@ -370,6 +352,523 @@ def run_all_defenses(
     return summary
 
 
+def _check_result_for_errors(
+    result: Dict[str, Any],
+    backend_key: str,
+    defense_key: str,
+    summary: Dict[str, Any]
+) -> Tuple[bool, bool, bool]:
+    """
+    Check a result dictionary for execution errors and update summary.
+    
+    Returns:
+        (has_error, has_connection_error, has_rate_limit_error) tuple
+    """
+    error_msg = result.get("error", "")
+    has_error = bool(error_msg)
+    has_connection_error = False
+    has_rate_limit_error = False
+    
+    if error_msg:
+        error_lower = error_msg.lower()
+        if "rate limit" in error_lower or "429" in error_lower or "quota" in error_lower:
+            has_rate_limit_error = True
+            if (backend_key, defense_key) not in summary["combinations_with_rate_limit_errors"]:
+                summary["combinations_with_rate_limit_errors"].append((backend_key, defense_key))
+        elif "connection" in error_lower or "timeout" in error_lower:
+            has_connection_error = True
+            if (backend_key, defense_key) not in summary["combinations_with_connection_errors"]:
+                summary["combinations_with_connection_errors"].append((backend_key, defense_key))
+    
+    # Check for execution errors in test results (execution_success=False)
+    test_results = result.get("results", [])
+    for test_result in test_results:
+        # Check execution_success flag
+        if not test_result.get("execution_success", True):
+            has_error = True
+            if (backend_key, defense_key) not in summary["combinations_with_errors"]:
+                summary["combinations_with_errors"].append((backend_key, defense_key))
+            
+            # Check execution_errors list for specific error types
+            execution_errors = test_result.get("execution_errors")
+            if execution_errors:
+                for err_msg in execution_errors:
+                    err_lower = str(err_msg).lower()
+                    if "rate limit" in err_lower or "429" in err_lower:
+                        has_rate_limit_error = True
+                        if (backend_key, defense_key) not in summary["combinations_with_rate_limit_errors"]:
+                            summary["combinations_with_rate_limit_errors"].append((backend_key, defense_key))
+                    elif "connection" in err_lower or "timeout" in err_lower:
+                        has_connection_error = True
+                        if (backend_key, defense_key) not in summary["combinations_with_connection_errors"]:
+                            summary["combinations_with_connection_errors"].append((backend_key, defense_key))
+        
+        # Also check step results for connection errors (backward compatibility)
+        steps = test_result.get("steps", [])
+        for step in steps:
+            step_error = step.get("error", "")
+            if step_error and ("connection" in step_error.lower() or "timeout" in step_error.lower()):
+                has_connection_error = True
+                if (backend_key, defense_key) not in summary["combinations_with_connection_errors"]:
+                    summary["combinations_with_connection_errors"].append((backend_key, defense_key))
+    
+    # Track combinations with any errors
+    if has_error or has_connection_error or has_rate_limit_error:
+        if (backend_key, defense_key) not in summary["combinations_with_errors"]:
+            summary["combinations_with_errors"].append((backend_key, defense_key))
+    
+    return (has_error, has_connection_error, has_rate_limit_error)
+
+
+def _run_single_combination(
+    args_tuple: Tuple[str, str, str, str, bool, Optional[Path], Optional[str]]
+) -> Tuple[str, str, Dict[str, Any]]:
+    """
+    Wrapper function to run a single backend+defense combination.
+    This is used by ProcessPoolExecutor - it must be a top-level function
+    (not a method) and must be picklable.
+    
+    IMPORTANT: Each call runs in a completely separate Python process with
+    isolated memory space. Global variables, caches, and file handles are
+    NOT shared between processes.
+    
+    All output is redirected to a log file specific to this combination.
+    
+    Args:
+        args_tuple: (memory_backend, unified_defense, test_path, config_path, force, results_base_dir, target_model_name)
+    
+    Returns:
+        (memory_backend, unified_defense, result_dict)
+    """
+    import os
+    import sys
+    from pathlib import Path
+    from benchmark.benchmark_utils import get_combination_log_path, determine_attack_type
+    
+    # Set process name for debugging
+    process_id = os.getpid()
+    memory_backend, unified_defense, test_path, config_path, force, results_base_dir, target_model_name = args_tuple
+    
+    # Determine attack type from test_path
+    test_dir = Path("data/benchmark/tests")
+    if isinstance(test_path, str):
+        if test_path in ["benign", "direct", "indirect", "memory_only"]:
+            attack_type = test_path
+        else:
+            # Try to determine from path
+            test_file = test_dir / test_path
+            if test_file.exists():
+                attack_type = determine_attack_type(test_file, {})
+            else:
+                attack_type = "unknown"
+    else:
+        attack_type = determine_attack_type(test_path, {})
+    
+    # Get log file path
+    logs_base_dir = Path("data/benchmark/logs")
+    log_path = get_combination_log_path(
+        memory_backend=memory_backend,
+        unified_defense=unified_defense,
+        model_name=target_model_name or "unknown",
+        attack_type=attack_type,
+        logs_base_dir=logs_base_dir
+    )
+    
+    # Create log directory
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Redirect all output to log file
+    log_file = open(log_path, 'w', encoding='utf-8')
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    
+    result = None
+    try:
+        # Redirect stdout and stderr to log file
+        sys.stdout = log_file
+        sys.stderr = log_file
+        
+        print(f"[PID {process_id}] Starting: {memory_backend} + {unified_defense}")
+        print(f"Log file: {log_path}")
+        print(f"{'='*80}\n")
+        
+        result = run_benchmark(
+            memory_backend=memory_backend,
+            unified_defense=unified_defense,
+            test_path=test_path,
+            config_path=config_path,
+            force=force,
+            results_base_dir=results_base_dir,
+            target_model_name=target_model_name
+        )
+        
+        print(f"\n{'='*80}")
+        print(f"[PID {process_id}] Completed: {memory_backend} + {unified_defense}")
+        print(f"Tests run: {result.get('tests_run', 0)}, Passed: {result.get('tests_passed', 0)}, Failed: {result.get('tests_failed', 0)}")
+        print(f"{'='*80}")
+        
+    except Exception as e:
+        # Catch any exceptions and return error result
+        import traceback
+        error_msg = f"{str(e)}\n{traceback.format_exc()}"
+        print(f"\n{'='*80}")
+        print(f"[PID {process_id}] ERROR in {memory_backend} + {unified_defense}: {error_msg}")
+        print(f"{'='*80}")
+        result = {
+            "success": False,
+            "error": str(e),
+            "tests_run": 0,
+            "tests_passed": 0,
+            "tests_failed": 0
+        }
+    finally:
+        # Restore stdout/stderr and close log file
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_file.flush()  # Ensure all output is written
+        log_file.close()
+        
+        # Print completion status to terminal (only this goes to terminal)
+        if result and result.get("success"):
+            status = "✅"
+        else:
+            status = "❌"
+        print(f"{status} {memory_backend.upper()} + {unified_defense} - Log: {log_path}", flush=True)
+    
+    # Ensure result is never None
+    if result is None:
+        result = {
+            "success": False,
+            "error": "Unknown error - result is None",
+            "tests_run": 0,
+            "tests_passed": 0,
+            "tests_failed": 0
+        }
+    
+    return (memory_backend, unified_defense, result)
+
+
+def run_all_combinations(
+    memory_backends: List[str],
+    defense_types: List[str],
+    test_path: str,
+    config_path: str = "benchmark_config.yaml",
+    force: bool = False,
+    num_workers: int = 1,
+    results_base_dir: Optional[Path] = None,
+    target_model_name: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Run benchmarks for all combinations of memory backends and defense types in parallel.
+    
+    Each combination runs in a separate process with its own log file.
+    All output is redirected to individual log files per combination.
+    
+    Args:
+        memory_backends: List of memory backend names
+        defense_types: List of defense type names
+        test_path: Path to test file, directory, or suite name
+        config_path: Path to config file
+        force: Force overwrite existing results
+        num_workers: Number of parallel workers (1 = serial execution)
+        results_base_dir: Base directory for results
+        target_model_name: Target model name
+        
+    Returns:
+        Dictionary with results summary for all combinations
+    """
+    # Generate all combinations
+    combinations = []
+    for backend in memory_backends:
+        if backend == "none":
+            # Special case: none backend only runs with none defense (once)
+            combinations.append(("none", "none"))
+        else:
+            # Regular backends: run with all specified defenses
+            for defense in defense_types:
+                combinations.append((backend, defense))
+    
+    total_combinations = len(combinations)
+    print(f"\n{'#'*80}")
+    print(f"Running {total_combinations} combination(s) with {num_workers} worker(s)")
+    print(f"Memory backends: {memory_backends}")
+    print(f"Defense types: {defense_types}")
+    print(f"{'#'*80}\n")
+    
+    # Note: Error logging is now done per-combination in individual log files
+    # No shared error.log file needed - each combination has its own log
+    
+    rate_limit_count = 0
+    api_error_count = 0
+    
+    all_results = {}
+    summary = {
+        "total_combinations": total_combinations,
+        "combinations": {},
+        "total_tests": 0,
+        "total_passed": 0,
+        "total_failed": 0,
+        "successful_combinations": 0,
+        "failed_combinations": 0,
+        "combinations_with_errors": [],  # List of (backend, defense) tuples that had errors
+        "combinations_with_connection_errors": [],  # List of (backend, defense) tuples with connection errors
+        "combinations_with_rate_limit_errors": []  # List of (backend, defense) tuples with rate limit errors
+    }
+    
+    # Prepare arguments for each combination
+    args_list = [
+        (backend, defense, test_path, config_path, force, results_base_dir, target_model_name)
+        for backend, defense in combinations
+    ]
+    
+    # Run combinations in parallel or serial
+    if num_workers == 1:
+        # Serial execution (easier debugging, no multiprocessing overhead)
+        print("Running combinations serially...\n")
+        for i, args_tuple in enumerate(args_list, 1):
+            backend, defense = args_tuple[0], args_tuple[1]
+            print(f"[{i}/{total_combinations}] {backend.upper()} + {defense}")
+            print("-" * 80)
+            
+            backend_key, defense_key, result = _run_single_combination(args_tuple)
+            
+            # Check for errors in result
+            has_error, has_connection_error, has_rate_limit_error = _check_result_for_errors(
+                result, backend_key, defense_key, summary
+            )
+            
+            all_results[f"{backend_key}_{defense_key}"] = result
+            
+            if result.get("success"):
+                if not result.get("skipped"):
+                    summary["combinations"][f"{backend_key}_{defense_key}"] = {
+                        "tests_run": result.get("tests_run", 0),
+                        "tests_passed": result.get("tests_passed", 0),
+                        "tests_failed": result.get("tests_failed", 0),
+                        "has_errors": has_error or has_connection_error or has_rate_limit_error
+                    }
+                    summary["total_tests"] += result.get("tests_run", 0)
+                    summary["total_passed"] += result.get("tests_passed", 0)
+                    summary["total_failed"] += result.get("tests_failed", 0)
+                    summary["successful_combinations"] += 1
+                else:
+                    summary["combinations"][f"{backend_key}_{defense_key}"] = {"skipped": True}
+                    summary["successful_combinations"] += 1
+            else:
+                summary["combinations"][f"{backend_key}_{defense_key}"] = {
+                    "error": result.get("error", "Unknown error"),
+                    "tests_run": result.get("tests_run", 0),
+                    "has_errors": True
+                }
+                summary["failed_combinations"] += 1
+            
+            print()  # Blank line between combinations
+    else:
+        # Parallel execution using ProcessPoolExecutor
+        print(f"Running combinations in parallel with {num_workers} workers...\n")
+        print(f"NOTE: Each combination runs in a separate Python process for complete isolation.\n")
+        print(f"WARNING: With {num_workers} workers, ensure you have sufficient API rate limits.\n")
+        print(f"         If you see rate limit errors, reduce --num-workers.\n")
+        
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all jobs
+            future_to_combo = {
+                executor.submit(_run_single_combination, args_tuple): (args_tuple[0], args_tuple[1])
+                for args_tuple in args_list
+            }
+            
+            # Process results as they complete
+            completed = 0
+            for future in as_completed(future_to_combo):
+                backend, defense = future_to_combo[future]
+                completed += 1
+                
+                try:
+                    # Add timeout to prevent hanging (10 minutes per combination should be enough)
+                    # This prevents the entire benchmark from hanging if one process gets stuck
+                    backend_key, defense_key, result = future.result(timeout=600)
+                    
+                    # Check for errors in result
+                    has_error, has_connection_error, has_rate_limit_error = _check_result_for_errors(
+                        result, backend_key, defense_key, summary
+                    )
+                    
+                    # Update error counts for reporting
+                    if has_rate_limit_error:
+                        rate_limit_count += 1
+                    if has_connection_error:
+                        api_error_count += 1
+                    if has_error:
+                        api_error_count += 1
+                    
+                    # Print result with error indicators
+                    status = "✅" if result.get("success") else "❌"
+                    if result.get("skipped"):
+                        status = "⏭️"
+                    
+                    error_indicator = ""
+                    if has_rate_limit_error:
+                        error_indicator = " [RATE LIMIT]"
+                    elif has_connection_error:
+                        error_indicator = " [CONNECTION ERROR]"
+                    elif has_error:
+                        error_indicator = " [ERROR]"
+                    
+                    print(f"[{completed}/{total_combinations}] {status} {backend_key.upper()} + {defense_key}{error_indicator}", flush=True)
+                    
+                    all_results[f"{backend_key}_{defense_key}"] = result
+                    
+                    if result.get("success"):
+                        if not result.get("skipped"):
+                            summary["combinations"][f"{backend_key}_{defense_key}"] = {
+                                "tests_run": result.get("tests_run", 0),
+                                "tests_passed": result.get("tests_passed", 0),
+                                "tests_failed": result.get("tests_failed", 0),
+                                "has_errors": has_error or has_connection_error or has_rate_limit_error
+                            }
+                            summary["total_tests"] += result.get("tests_run", 0)
+                            summary["total_passed"] += result.get("tests_passed", 0)
+                            summary["total_failed"] += result.get("tests_failed", 0)
+                            summary["successful_combinations"] += 1
+                        else:
+                            summary["combinations"][f"{backend_key}_{defense_key}"] = {"skipped": True}
+                            summary["successful_combinations"] += 1
+                    else:
+                        error_msg = result.get("error", "Unknown error")
+                        print(f"   Error: {error_msg}")
+                        summary["combinations"][f"{backend_key}_{defense_key}"] = {
+                            "error": error_msg,
+                            "tests_run": result.get("tests_run", 0),
+                            "has_errors": True
+                        }
+                        summary["failed_combinations"] += 1
+                except FutureTimeoutError:
+                    error_str = f"Process timed out after 10 minutes - may be stuck"
+                    print(f"[{completed}/{total_combinations}] ❌ {backend.upper()} + {defense} - TIMEOUT: {error_str}")
+                    # Try to cancel the future
+                    future.cancel()
+                    summary["combinations"][f"{backend}_{defense}"] = {
+                        "error": error_str,
+                        "tests_run": 0,
+                        "has_errors": True
+                    }
+                    summary["failed_combinations"] += 1
+                    if (backend, defense) not in summary["combinations_with_errors"]:
+                        summary["combinations_with_errors"].append((backend, defense))
+                    # Error is logged to individual log file - no need for shared error.log
+                except Exception as e:
+                    error_str = str(e)
+                    print(f"[{completed}/{total_combinations}] ❌ {backend.upper()} + {defense} - Exception: {error_str}")
+                    
+                    # Track this as a failed combination with error
+                    summary["combinations"][f"{backend}_{defense}"] = {
+                        "error": error_str,
+                        "tests_run": 0,
+                        "has_errors": True
+                    }
+                    summary["failed_combinations"] += 1
+                    
+                    # Add to error tracking lists
+                    if (backend, defense) not in summary["combinations_with_errors"]:
+                        summary["combinations_with_errors"].append((backend, defense))
+                    
+                    # Check if it's a process crash (fork issue on macOS)
+                    if "terminated abruptly" in error_str.lower() or "fork" in error_str.lower():
+                        # Error is already logged to individual log file - no need for shared error.log
+                        pass
+            
+            # Explicitly shutdown executor to ensure all processes are cleaned up
+            # This prevents hanging if any child processes are stuck
+            executor.shutdown(wait=True, cancel_futures=False)
+    
+    # Print final summary
+    print(f"\n{'='*80}", flush=True)
+    print("FINAL SUMMARY", flush=True)
+    print(f"{'='*80}", flush=True)
+    print(f"Total combinations: {total_combinations}")
+    print(f"Successful: {summary['successful_combinations']}")
+    print(f"Failed: {summary['failed_combinations']}")
+    if summary["total_tests"] > 0:
+        print(f"Total tests: {summary['total_tests']}")
+        print(f"Passed: {summary['total_passed']}")
+        print(f"Failed: {summary['total_failed']}")
+    
+    # Report combinations with errors
+    if summary["combinations_with_errors"]:
+        print(f"\n{'⚠️' * 40}")
+        print("⚠️  COMBINATIONS WITH ERRORS - RESULTS MAY BE INCORRECT ⚠️")
+        print(f"{'⚠️' * 40}")
+        print(f"\nThe following {len(summary['combinations_with_errors'])} combination(s) had errors:")
+        print("You should rerun these to get reliable results:\n")
+        
+        for backend, defense in summary["combinations_with_errors"]:
+            print(f"  - {backend.upper()} + {defense}")
+        
+        # Generate rerun command
+        failed_backends = sorted(set(b for b, d in summary['combinations_with_errors']))
+        failed_defenses = sorted(set(d for b, d in summary['combinations_with_errors']))
+        model_arg = f"--model {target_model_name}" if target_model_name else ""
+        
+        print(f"\nTo rerun only the failed combinations, use:")
+        if "suite" in test_path or test_path in ["benign", "direct", "indirect", "memory_only"]:
+            print(f"  python scripts/run_benchmark.py --suite {test_path} {model_arg} \\")
+        else:
+            print(f"  python scripts/run_benchmark.py --test {test_path} {model_arg} \\")
+        print(f"    --memory-backend {' '.join(failed_backends)} \\")
+        print(f"    --defense-type {' '.join(failed_defenses)} \\")
+        print(f"    --num-workers 8 --force")
+        print()
+    
+    # Report specific error types
+    if summary["combinations_with_connection_errors"]:
+        print(f"⚠️  Connection errors detected in {len(summary['combinations_with_connection_errors'])} combination(s)")
+        print(f"   These may have incomplete results due to network issues")
+        print(f"   Affected: {', '.join([f'{b}+{d}' for b, d in summary['combinations_with_connection_errors']])}")
+        print()
+    
+    if summary["combinations_with_rate_limit_errors"]:
+        print(f"⚠️  Rate limit errors detected in {len(summary['combinations_with_rate_limit_errors'])} combination(s)")
+        print(f"   Consider reducing --num-workers or adding delays")
+        print(f"   Affected: {', '.join([f'{b}+{d}' for b, d in summary['combinations_with_rate_limit_errors']])}")
+        print()
+    
+    # Report general API issues
+    if rate_limit_count > 0 or api_error_count > 0:
+        print(f"⚠️  API ISSUES DETECTED:")
+        if rate_limit_count > 0:
+            print(f"   Rate limit errors: {rate_limit_count}")
+        if api_error_count > 0:
+            print(f"   API/Connection errors: {api_error_count}")
+        print(f"   Check individual log files in data/benchmark/logs/ for details")
+        print()
+    
+    # Final status
+    if summary["combinations_with_errors"] or summary["failed_combinations"] > 0:
+        print(f"{'❌' * 40}")
+        print("❌  WARNING: Some combinations had EXECUTION ERRORS. Results may be unreliable!")
+        print(f"{'❌' * 40}")
+        print(f"\n⚠️  Remember: Test failures (some tests passing, some failing) are EXPECTED")
+        print(f"   and are what we're measuring. Execution errors (API failures, connection")
+        print(f"   errors, exceptions) are NOT expected and indicate problems running the benchmark.")
+        if summary["combinations_with_errors"]:
+            print(f"\nRerun the combinations with execution errors listed above to get correct results.")
+        if summary["failed_combinations"] > 0:
+            print(f"\n{summary['failed_combinations']} combination(s) failed completely (could not run).")
+    else:
+        print(f"{'✅' * 40}")
+        print("✅  All combinations completed without EXECUTION ERRORS. Results are reliable!")
+        print(f"{'✅' * 40}")
+        print(f"\nNote: Test failures (some tests passing, some failing) are expected and normal.")
+        print(f"      Only execution errors (API failures, connection errors, etc.) are reported here.")
+    
+    # Note: Detailed errors are in individual log files per combination
+    # No need to write to shared error.log file
+    
+    print()
+    
+    return summary
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -377,42 +876,55 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run explicit memory with no defense
+  # Run ALL combinations (default behavior - all backends × all defenses)
+  python scripts/run_benchmark.py --suite memory_only --model gpt-5-mini --num-workers 16 --force
+  
+  # Run specific memory backends with all defenses
+  python scripts/run_benchmark.py --memory-backend explicit mem0 --suite memory_only --num-workers 8
+  
+  # Run all backends with specific defenses
+  python scripts/run_benchmark.py --defense-type none user_prompt_only --suite memory_only --num-workers 8
+  
+  # Run specific backends and defenses
+  python scripts/run_benchmark.py --memory-backend explicit mem0 --defense-type none user_prompt_only --suite memory_only --num-workers 4
+  
+  # Single combination (one backend, one defense)
   python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite benign
   
-  # Run mem0 with all defenses
-  python scripts/run_benchmark.py --memory-backend mem0 --all-defenses --suite benign
+  # Run mem0 with all defenses (serial)
+  python scripts/run_benchmark.py --memory-backend mem0 --suite benign --num-workers 1
   
-  # Run memory_only test suite
-  python scripts/run_benchmark.py --memory-backend rag --defense-type none --suite memory_only --model gpt-5-mini
-  
-  # Run specific test file with custom model
+  # Run specific test file
   python scripts/run_benchmark.py --memory-backend rag --defense-type user_prompt_only --test data/benchmark/tests/benign/00_email_tools.json --model gpt-5-mini
   
   # Force overwrite existing results
-  python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite benign --force --model gpt-5-mini
+  python scripts/run_benchmark.py --suite memory_only --model gpt-5-mini --force --num-workers 16
         """
     )
     
     parser.add_argument(
         "--memory-backend",
         type=str,
+        nargs="+",
         choices=["explicit", "mem0", "rag", "context", "none"],
-        required=True,
-        help="Memory backend to use (use 'none' to disable all memory backends)"
+        help="Memory backend(s) to use. Can specify multiple (e.g., --memory-backend explicit mem0). "
+             "If not specified, all backends are used. Use 'none' to disable all memory backends."
     )
     
     parser.add_argument(
         "--defense-type",
         type=str,
+        nargs="+",
         choices=UNIFIED_DEFENSE_TYPES,
-        help="Specific defense type to run (mutually exclusive with --all-defenses). Not used when --memory-backend is 'none'."
+        help="Defense type(s) to run. Can specify multiple (e.g., --defense-type none user_prompt_only). "
+             "If not specified, all defense types are used. Not used when --memory-backend is 'none'."
     )
     
     parser.add_argument(
         "--all-defenses",
         action="store_true",
-        help="Run all defense types (mutually exclusive with --defense-type)"
+        help="DEPRECATED: Use --defense-type without arguments or omit it to run all defenses. "
+             "This flag is kept for backward compatibility but has no effect."
     )
     
     parser.add_argument(
@@ -454,11 +966,19 @@ Examples:
         help="Target model name (e.g., 'gpt-5-mini', 'gpt-4o'). Overrides config value."
     )
     
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers for running multiple combinations (default: 1 = serial). "
+             "When multiple backends/defenses are specified or defaults are used, combinations run in parallel."
+    )
+    
     args = parser.parse_args()
     
     # Validate arguments
-    if args.defense_type and args.all_defenses:
-        parser.error("--defense-type and --all-defenses are mutually exclusive")
+    if args.num_workers < 1:
+        parser.error("--num-workers must be >= 1")
     
     if not args.test and not args.suite:
         parser.error("Must specify either --test or --suite")
@@ -472,28 +992,67 @@ Examples:
     # Determine results directory
     results_base_dir = Path(args.results_dir) if args.results_dir else None
     
-    # Set memory backend from args
-    memory_backend = args.memory_backend
+    # Determine if memory backends and defense types were specified
+    memory_backends_specified = args.memory_backend is not None
+    defense_types_specified = args.defense_type is not None
     
-    # If backend is "none", automatically set defense to "none" (no memory = no defense)
-    if memory_backend == "none":
-        if args.defense_type and args.defense_type != "none":
-            parser.error("When using --memory-backend none, --defense-type must be 'none' (or omitted)")
-        defense_type = "none"
+    # Determine memory backends to use
+    if memory_backends_specified:
+        memory_backends = args.memory_backend
     else:
-        # For other backends, use provided defense type or default to "none"
-        defense_type = args.defense_type or "none"
+        # Default: all backends
+        memory_backends = ["explicit", "mem0", "rag", "context"]
+    
+    # Determine defense types to use
+    if defense_types_specified:
+        defense_types = args.defense_type
+    else:
+        # Default: all defense types
+        defense_types = UNIFIED_DEFENSE_TYPES
+    
+    # Determine if we're running multiple combinations
+    # Multiple combinations if:
+    # - Multiple backends (specified or defaulted), OR
+    # - Multiple defenses (specified or defaulted), OR
+    # - Neither specified (defaults to all = multiple)
+    # Single combination only if BOTH are single values
+    total_combinations = len(memory_backends) * len(defense_types)
+    
+    if total_combinations > 1:
+        # Multiple combinations - use parallel execution
+        running_multiple_combinations = True
+    else:
+        # Single combination mode (1 backend × 1 defense = 1 combination)
+        running_multiple_combinations = False
+        # Validate single combination constraints
+        if memory_backends[0] == "none" and defense_types_specified and defense_types[0] != "none":
+            parser.error("When using --memory-backend none, --defense-type must be 'none' (or omitted)")
     
     # Run benchmark(s)
-    if args.all_defenses:
-        result = run_all_defenses(
-            memory_backend=memory_backend,
+    if running_multiple_combinations:
+        # Multiple combinations mode - use parallel execution
+        # Each combination writes to its own log file - no shared error.log needed
+        result = run_all_combinations(
+            memory_backends=memory_backends,
+            defense_types=defense_types,
             test_path=test_path,
             config_path=args.config,
             force=args.force,
+            num_workers=args.num_workers,
+            results_base_dir=results_base_dir,
             target_model_name=args.target_model_name
         )
     else:
+        # Single combination mode
+        memory_backend = memory_backends[0]
+        
+        # If backend is "none", automatically set defense to "none" (no memory = no defense)
+        if memory_backend == "none":
+            defense_type = "none"
+        else:
+            # Use provided defense type or default to "none"
+            defense_type = defense_types[0] if defense_types_specified else "none"
+        
         result = run_benchmark(
             memory_backend=memory_backend,
             unified_defense=defense_type,
@@ -512,4 +1071,22 @@ Examples:
 
 
 if __name__ == "__main__":
+    # Set start method for multiprocessing (required on some platforms)
+    # On macOS, 'fork' causes crashes with Objective-C runtime (objc[PID]: fork() errors)
+    # Use 'spawn' on macOS for safety, 'fork' on Linux for speed
+    import platform
+    if platform.system() == "Darwin":  # macOS
+        try:
+            multiprocessing.set_start_method("spawn", force=True)
+        except RuntimeError:
+            # Already set, ignore
+            pass
+    elif platform.system() != "Windows":  # Linux/Unix
+        try:
+            multiprocessing.set_start_method("fork", force=True)
+        except RuntimeError:
+            # Already set, ignore
+            pass
+    # Windows defaults to 'spawn' automatically
+    
     main()

@@ -308,19 +308,15 @@ def _create_agent_executor_for_python(
     """
     Create an agent for direct Python invocation using the new LangChain API.
     """
-    # Always start from full config, then overlay provided config to avoid losing sections
-    base_cfg = load_config()
-    if config:
-        try:
-            # shallow merge is sufficient for our current keys (data, model, agent)
-            for k, v in config.items():
-                if isinstance(v, dict) and isinstance(base_cfg.get(k), dict):
-                    base_cfg[k].update(v)
-                else:
-                    base_cfg[k] = v
-        except Exception:
-            base_cfg.update(config)
-    config = base_cfg
+    # If config is provided, use it directly (it should already be complete)
+    # Only load from file if no config is provided (for interactive agent mode)
+    if config is None:
+        config = load_config()
+    else:
+        # Config is provided (benchmark mode) - use it as-is
+        # Make a deep copy to avoid modifying the original
+        import copy
+        config = copy.deepcopy(config)
     
     # Set global seed for reproducibility (if not already set)
     # This ensures reproducibility when agent_core is called directly
@@ -414,14 +410,10 @@ def _create_agent_executor_for_python(
         seed = config.get("seed", 42)
         
         # Try with all parameters first (most common case)
-        # Add seed via model_kwargs for OpenAI API determinism
+        # Pass seed as explicit parameter (not in model_kwargs) to avoid deprecation warning
         try:
-            model_kwargs = {}
             # OpenAI API supports seed parameter for determinism (for supported models)
             # This helps reduce non-determinism even with temperature=0.0
-            if seed is not None:
-                model_kwargs["seed"] = seed
-            
             llm = ChatOpenAI(
                 model=model_name,
                 temperature=model_config.get("temperature", 0.0),
@@ -429,7 +421,7 @@ def _create_agent_executor_for_python(
                 presence_penalty=model_config.get("presence_penalty", 0),
                 frequency_penalty=model_config.get("frequency_penalty", 0),
                 api_key=api_key,
-                model_kwargs=model_kwargs if model_kwargs else {},
+                seed=seed if seed is not None else None,  # Pass seed as explicit parameter
             )
         except (TypeError, ValueError) as e:
             # If initialization fails (e.g., parameter not accepted at init), try without optional params
@@ -437,14 +429,11 @@ def _create_agent_executor_for_python(
             try:
                 # Try with just model, temperature, and API key
                 # Still include seed for determinism
-                model_kwargs = {}
-                if seed is not None:
-                    model_kwargs["seed"] = seed
                 llm = ChatOpenAI(
                     model=model_name,
                     temperature=model_config.get("temperature", 0.0),
                     api_key=api_key,
-                    model_kwargs=model_kwargs if model_kwargs else {},
+                    seed=seed if seed is not None else None,  # Pass seed as explicit parameter
                 )
             except (TypeError, ValueError) as e2:
                 # If temperature also fails, use absolute minimal config
@@ -570,7 +559,8 @@ def invoke_agent(
         rag_defense_type = "none"
     else:
         rag_memory_config = cfg.get("memory", {}).get("rag_memory", {})
-        rag_memory_enabled = rag_memory_config.get("enabled", False)
+        # Enable RAG if explicitly enabled OR if backend is set to "rag"
+        rag_memory_enabled = rag_memory_config.get("enabled", False) or (memory_backend == "rag")
         rag_defense_type = rag_memory_config.get("defense_type", "none")
     
     rag_context = ""
@@ -647,7 +637,8 @@ def invoke_agent(
         context_defense_type = "none"
     else:
         context_memory_config = cfg.get("memory", {}).get("context_memory", {})
-        context_memory_enabled = context_memory_config.get("enabled", False)
+        # Enable Context if explicitly enabled OR if backend is set to "context"
+        context_memory_enabled = context_memory_config.get("enabled", False) or (memory_backend == "context")
         # Get unified defense type and map to backend-specific type
         unified_defense_type = context_memory_config.get("defense_type", "none")
         # Map unified defense name to backend-specific defense type

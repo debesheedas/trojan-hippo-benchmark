@@ -73,6 +73,10 @@ class TestBench:
         else:
             raise ValueError("Must specify either config_path or config")
         
+        # Track execution errors for this benchmark run (simple flag, no complex tracker)
+        self.execution_errors = []  # List of error messages
+        self.execution_success = True  # Set to False if any execution errors occur
+        
         # Set global seed for reproducibility
         global_seed = self.config.get("seed", 42)
         set_global_seeds(global_seed)
@@ -624,8 +628,9 @@ class TestBench:
                 with open(sessions_dir / "session_index.json", 'w', encoding='utf-8') as f:
                     json.dump(empty_sessions, f, indent=2)
         
-        # Create test-specific config
-        test_config = self.config.copy()
+        # Create test-specific config (deep copy to avoid modifying original)
+        import copy
+        test_config = copy.deepcopy(self.config)
         # Initialize data section if it doesn't exist
         if "data" not in test_config:
             test_config["data"] = {}
@@ -711,6 +716,10 @@ class TestBench:
             return self._run_static_test_from_file(test_file)
     
     def _run_static_test_from_file(self, test_file: Path) -> Dict[str, Any]:
+        # Reset execution error tracking at start of each test
+        test_execution_errors = []
+        test_execution_success = True
+        
         """
         Run a single test from a JSON file (static mode).
         
@@ -1246,6 +1255,12 @@ class TestBench:
                 except Exception as e:
                     print(f"Error: {e}")
                     all_passed = False
+                    
+                    # Track execution exception
+                    error_msg = f"Step {i} execution exception: {str(e)}"
+                    test_execution_errors.append(error_msg)
+                    test_execution_success = False
+                    
                     # Only include "passed" if this step has a success_check
                     step_result = {
                         "step": i,
@@ -1307,7 +1322,9 @@ class TestBench:
                 "overall_success": all_passed,
                 "steps": step_results,
                 "session_history": session_history,
-                "test_environment": str(test_dir)
+                "test_environment": str(test_dir),
+                "execution_success": test_execution_success,  # True if no execution errors, False otherwise
+                "execution_errors": test_execution_errors if test_execution_errors else None  # List of error messages
             }
             
             # Add defense info if mem0 is enabled
@@ -1357,6 +1374,8 @@ class TestBench:
             test_result["total_user_steps"] = total_user_steps
             test_result["total_successful_user_steps"] = total_successful_user_steps
             
+            # Write result file (each process writes to unique directory, so no conflicts)
+            result_path.parent.mkdir(parents=True, exist_ok=True)
             with open(result_path, 'w', encoding='utf-8') as f:
                 json.dump(test_result, f, indent=2, ensure_ascii=False)
             
@@ -1444,6 +1463,7 @@ class TestBench:
                 result["attack_type"] = attack_type
             
             # Ensure total_user_steps and total_successful_user_steps are calculated
+            # (already calculated in _run_test_with_optimization, but ensure they exist)
             if "total_user_steps" not in result or "total_successful_user_steps" not in result:
                 step_results = result.get("steps", [])
                 total_user_steps = 0
@@ -1466,6 +1486,7 @@ class TestBench:
                 result["total_user_steps"] = total_user_steps
                 result["total_successful_user_steps"] = total_successful_user_steps
             
+            # Write result file (each process writes to unique directory, so no conflicts)
             with open(result_path, 'w', encoding='utf-8') as f:
                 json.dump(result, f, indent=2, ensure_ascii=False)
             print(f"Result saved to: {result_path}")
@@ -2002,6 +2023,10 @@ class TestBench:
                 config=test_config
             )
             duration = time.time() - start_time
+        except Exception as e:
+            # API call failed after retries - this is an execution error
+            # Re-raise to be caught by caller and tracked
+            raise
             
             response = result["response"]
             print(f"Agent Response: {response}")
@@ -2081,6 +2106,10 @@ class TestBench:
             
         except Exception as e:
             print(f"Error in step {step_num}: {e}")
+            
+            # Track execution exception (will be handled by caller)
+            # This is a test execution error, not a test failure
+            
             result = {
                 "step": step_num,
                 "user_message": step['user_message'],

@@ -95,6 +95,86 @@ def get_result_path(
     return result_path
 
 
+def get_log_path(
+    memory_backend: str,
+    unified_defense: str,
+    model_name: str,
+    attack_type: str,
+    test_file: Path,
+    logs_base_dir: Path = Path("data/benchmark/logs")
+) -> Path:
+    """
+    Generate log file path using the same structure as results.
+    
+    Path structure: {model_name}/{memory_backend}/{defense_type}/{attack_type}/{test_file}.log
+    
+    Args:
+        memory_backend: Memory backend name ("explicit", "mem0", "rag", or "none" for disable_memory)
+        unified_defense: Unified defense name (e.g., "none", "disable_memory")
+        model_name: Model name (e.g., "gpt-5-mini")
+        attack_type: Attack type ("benign", "direct", "indirect", "memory_only")
+        test_file: Path to test file
+        logs_base_dir: Base directory for logs
+        
+    Returns:
+        Path to log file
+    """
+    backend_for_path, defense_folder = _get_result_path_components(
+        memory_backend, unified_defense, model_name, attack_type
+    )
+    
+    # Construct path: logs/{model_name}/{memory_backend}/{defense_folder}/{attack_type}/{test_file_name}.log
+    log_path = (
+        logs_base_dir /
+        model_name /
+        backend_for_path /
+        defense_folder /
+        attack_type /
+        test_file.with_suffix('.log').name
+    )
+    
+    return log_path
+
+
+def get_combination_log_path(
+    memory_backend: str,
+    unified_defense: str,
+    model_name: str,
+    attack_type: str,
+    logs_base_dir: Path = Path("data/benchmark/logs")
+) -> Path:
+    """
+    Generate log file path for an entire combination (all tests in a suite).
+    
+    Path structure: {model_name}/{memory_backend}/{defense_type}/{attack_type}/combination.log
+    
+    Args:
+        memory_backend: Memory backend name
+        unified_defense: Unified defense name
+        model_name: Model name
+        attack_type: Attack type ("benign", "direct", "indirect", "memory_only")
+        logs_base_dir: Base directory for logs
+        
+    Returns:
+        Path to combination log file
+    """
+    backend_for_path, defense_folder = _get_result_path_components(
+        memory_backend, unified_defense, model_name, attack_type
+    )
+    
+    # Construct path: logs/{model_name}/{memory_backend}/{defense_folder}/{attack_type}/combination.log
+    log_path = (
+        logs_base_dir /
+        model_name /
+        backend_for_path /
+        defense_folder /
+        attack_type /
+        "combination.log"
+    )
+    
+    return log_path
+
+
 def get_results_dir(
     memory_backend: str,
     unified_defense: str,
