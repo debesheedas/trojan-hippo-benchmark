@@ -473,7 +473,7 @@ def _run_single_combination(
     # Determine attack type from test_path (needed for result paths)
     test_dir = Path("data/benchmark/tests")
     if isinstance(test_path, str):
-        if test_path in ["benign", "direct", "indirect", "memory_only", "assistant_responses"]:
+        if test_path in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe"]:
             attack_type = test_path
         else:
             # Try to determine from path
@@ -808,7 +808,7 @@ def run_all_combinations(
         model_arg = f"--model {target_model_name}" if target_model_name else ""
         
         print(f"\nTo rerun only the failed combinations, use:")
-        if "suite" in test_path or test_path in ["benign", "direct", "indirect", "memory_only", "assistant_responses"]:
+        if "suite" in test_path or test_path in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe"]:
             print(f"  python scripts/run_benchmark.py --suite {test_path} {model_arg} \\")
         else:
             print(f"  python scripts/run_benchmark.py --test {test_path} {model_arg} \\")
@@ -934,8 +934,8 @@ Examples:
     parser.add_argument(
         "--suite",
         type=str,
-        choices=["benign", "direct", "indirect", "memory_only", "assistant_responses"],
-        help="Test suite to run (benign, direct, indirect, memory_only, or assistant_responses)"
+        choices=["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe"],
+        help="Test suite to run (benign, direct, indirect, memory_only, assistant_responses, or untrusted_probe)"
     )
     
     parser.add_argument(

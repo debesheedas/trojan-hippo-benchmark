@@ -112,7 +112,7 @@ def get_log_path(
         memory_backend: Memory backend name ("explicit", "mem0", "rag", or "none" for disable_memory)
         unified_defense: Unified defense name (e.g., "none", "disable_memory")
         model_name: Model name (e.g., "gpt-5-mini")
-        attack_type: Attack type ("benign", "direct", "indirect", "memory_only")
+        attack_type: Attack type ("benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe")
         test_file: Path to test file
         logs_base_dir: Base directory for logs
         
@@ -152,7 +152,7 @@ def get_combination_log_path(
         memory_backend: Memory backend name
         unified_defense: Unified defense name
         model_name: Model name
-        attack_type: Attack type ("benign", "direct", "indirect", "memory_only")
+        attack_type: Attack type ("benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe")
         logs_base_dir: Base directory for logs
         
     Returns:
@@ -457,7 +457,7 @@ def discover_test_files(
     Intelligently discover test files from a path.
     
     Handles:
-    - Suite keywords (benign, direct, indirect, memory_only) -> maps to test_dir/{suite}/
+    - Suite keywords (benign, direct, indirect, memory_only, assistant_responses, untrusted_probe) -> maps to test_dir/{suite}/
     - File paths -> returns single file if JSON
     - Directory paths -> finds all JSON files recursively
     
@@ -473,7 +473,7 @@ def discover_test_files(
     """
     
     # Handle suite keywords
-    if test_path in {"benign", "direct", "indirect", "memory_only", "assistant_responses"}:
+    if test_path in {"benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe"}:
         test_path_obj = test_dir / test_path
     else:
         test_path_obj = Path(test_path)
@@ -482,7 +482,7 @@ def discover_test_files(
     if not test_path_obj.exists():
         if verbose:
             print(f"⚠️  Test path not found: {test_path}")
-            if test_path in {"benign", "direct", "indirect", "memory_only", "assistant_responses"}:
+            if test_path in {"benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe"}:
                 print(f"   Expected location: {test_path_obj}")
                 print(f"   Unified test directory: {test_dir}")
         return []
@@ -506,9 +506,9 @@ def discover_test_files(
 
 def determine_attack_type(test_file: Path, test_def: Optional[Dict[str, Any]] = None) -> str:
     """
-    Determine the attack_type for a test file, handling memory_only and assistant_responses tests specially.
+    Determine the attack_type for a test file, handling memory_only, assistant_responses, and untrusted_probe tests specially.
     
-    Memory_only and assistant_responses tests should be saved to their respective folders even if they have
+    Memory_only, assistant_responses, and untrusted_probe tests should be saved to their respective folders even if they have
     attack_type="benign" in their JSON. This function detects these tests by:
     1. Checking if "memory_only" or "assistant_responses" is in the test file path
     2. Checking if the filename starts with "memory_only_" or "assistant_responses_"
@@ -518,14 +518,16 @@ def determine_attack_type(test_file: Path, test_def: Optional[Dict[str, Any]] = 
         test_def: Optional test definition dict (if already loaded)
         
     Returns:
-        Attack type string ("benign", "direct", "indirect", "memory_only", or "assistant_responses")
+        Attack type string ("benign", "direct", "indirect", "memory_only", "assistant_responses", or "untrusted_probe")
     """
-    # Check if this is a memory_only or assistant_responses test by path or filename
+    # Check if this is a memory_only, assistant_responses, or untrusted_probe test by path or filename
     test_file_str = str(test_file)
     if "memory_only" in test_file_str or test_file.name.startswith("memory_only_"):
         return "memory_only"
     if "assistant_responses" in test_file_str or test_file.name.startswith("assistant_responses_"):
         return "assistant_responses"
+    if "untrusted_probe" in test_file_str or test_file.name.startswith("untrusted_probe_"):
+        return "untrusted_probe"
     
     # Otherwise, use attack_type from test definition if available
     if test_def:

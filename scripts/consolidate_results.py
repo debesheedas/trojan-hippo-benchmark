@@ -5,7 +5,7 @@ Results Consolidation Script with CSV and Plots
 Generates comprehensive CSV tables and visualizations for each test suite:
 - CSV files with success percentages for each memory backend and defense type
 - Bar charts and heatmaps showing performance across configurations
-- Separate files for each suite: benign, direct, indirect, memory_only, assistant_responses
+- Separate files for each suite: benign, direct, indirect, memory_only, assistant_responses, untrusted_probe
 
 Usage:
     python scripts/consolidate_results.py
@@ -178,7 +178,7 @@ def discover_models_and_attack_types(results_base_dir: Path) -> Tuple[List[str],
                     for defense_dir in backend_dir.iterdir():
                         if defense_dir.is_dir():
                             for attack_dir in defense_dir.iterdir():
-                                if attack_dir.is_dir() and attack_dir.name in ["benign", "direct", "indirect", "memory_only", "assistant_responses"]:
+                                if attack_dir.is_dir() and attack_dir.name in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe"]:
                                     attack_types.add(attack_dir.name)
     
     return (sorted(list(models)), sorted(list(attack_types)))
@@ -467,7 +467,7 @@ def main():
     parser.add_argument(
         "--suite",
         type=str,
-        choices=["benign", "direct", "indirect", "memory_only", "assistant_responses"],
+        choices=["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe"],
         help="Specific test suite to consolidate (default: all suites)"
     )
     
