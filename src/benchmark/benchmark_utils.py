@@ -473,7 +473,7 @@ def discover_test_files(
     """
     
     # Handle suite keywords
-    if test_path in {"benign", "direct", "indirect", "memory_only"}:
+    if test_path in {"benign", "direct", "indirect", "memory_only", "assistant_responses"}:
         test_path_obj = test_dir / test_path
     else:
         test_path_obj = Path(test_path)
@@ -482,7 +482,7 @@ def discover_test_files(
     if not test_path_obj.exists():
         if verbose:
             print(f"⚠️  Test path not found: {test_path}")
-            if test_path in {"benign", "direct", "indirect", "memory_only"}:
+            if test_path in {"benign", "direct", "indirect", "memory_only", "assistant_responses"}:
                 print(f"   Expected location: {test_path_obj}")
                 print(f"   Unified test directory: {test_dir}")
         return []
@@ -506,24 +506,26 @@ def discover_test_files(
 
 def determine_attack_type(test_file: Path, test_def: Optional[Dict[str, Any]] = None) -> str:
     """
-    Determine the attack_type for a test file, handling memory_only tests specially.
+    Determine the attack_type for a test file, handling memory_only and assistant_responses tests specially.
     
-    Memory_only tests should be saved to memory_only/ folders even if they have
-    attack_type="benign" in their JSON. This function detects memory_only tests by:
-    1. Checking if "memory_only" is in the test file path
-    2. Checking if the filename starts with "memory_only_"
+    Memory_only and assistant_responses tests should be saved to their respective folders even if they have
+    attack_type="benign" in their JSON. This function detects these tests by:
+    1. Checking if "memory_only" or "assistant_responses" is in the test file path
+    2. Checking if the filename starts with "memory_only_" or "assistant_responses_"
     
     Args:
         test_file: Path to test file
         test_def: Optional test definition dict (if already loaded)
         
     Returns:
-        Attack type string ("benign", "direct", "indirect", or "memory_only")
+        Attack type string ("benign", "direct", "indirect", "memory_only", or "assistant_responses")
     """
-    # Check if this is a memory_only test by path or filename
+    # Check if this is a memory_only or assistant_responses test by path or filename
     test_file_str = str(test_file)
     if "memory_only" in test_file_str or test_file.name.startswith("memory_only_"):
         return "memory_only"
+    if "assistant_responses" in test_file_str or test_file.name.startswith("assistant_responses_"):
+        return "assistant_responses"
     
     # Otherwise, use attack_type from test definition if available
     if test_def:

@@ -2469,7 +2469,7 @@ class TestBench:
         print(f"Found {len(test_files)} test files")
         
         # Group tests by attack_type for better organization
-        test_groups = {"benign": [], "direct": [], "indirect": [], "memory_only": [], "unknown": []}
+        test_groups = {"benign": [], "direct": [], "indirect": [], "memory_only": [], "assistant_responses": [], "unknown": []}
         for test_file in test_files:
             try:
                 with open(test_file, 'r', encoding='utf-8') as f:
@@ -2699,7 +2699,7 @@ def main():
             # No specific tests specified, run all suites by default
             print("No specific tests specified. Running all test suites...")
             all_results = []
-            for suite in ["benign", "direct", "indirect", "memory_only"]:
+            for suite in ["benign", "direct", "indirect", "memory_only", "assistant_responses"]:
                 print(f"\n{'='*60}")
                 print(f"Running suite: {suite}")
                 print(f"{'='*60}")
