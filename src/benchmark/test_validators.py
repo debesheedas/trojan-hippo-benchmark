@@ -462,7 +462,10 @@ class FileSystemValidator(TestValidator):
             if len(found_files) < len(self._check_files):
                 return False
         
-        # Validate file content if specified
+        # For outbox emails with both JSON fields and content checks, we need to filter by recipient first
+        # So we'll handle this in the JSON fields validation section to avoid duplication
+        # For now, handle content validation normally (will be refined in JSON section if needed)
+        content_validation_passed = True  # Default to True, will be set to False if content validation fails
         if self._normalized_content:
             # For file content validation, we need at least one file to match
             content_validation_passed = False
@@ -476,12 +479,50 @@ class FileSystemValidator(TestValidator):
                 # Get min_keywords for this pattern
                 min_keywords = self._min_keywords_per_pattern.get(resolved_pattern, self._min_keywords_global)
                 
-                for file_path in pattern_files:
-                    if self._check_file_content(file_path, expected_content, min_keywords=min_keywords):
+                # For outbox emails, if we also have JSON fields, we'll handle it in the JSON section
+                # For now, just check all emails (will be refined if JSON fields are present)
+                if "outbox" in resolved_pattern.lower() and pattern_files:
+                    # Check if we also have JSON fields for this pattern - if so, skip content-only check here
+                    # (will be handled in JSON fields section with combined check)
+                    if resolved_pattern in self._resolved_json_fields:
+                        # Skip content-only validation for this pattern - will be done together with JSON fields
+                        # Mark as passed for this pattern (will be validated in JSON section)
                         content_validation_passed = True
+                        continue
+                    else:
+                        # No JSON fields - check all emails by timestamp (original behavior)
+                        emails_with_timestamps = []
+                        for file_path in pattern_files:
+                            try:
+                                with open(file_path, 'r', encoding='utf-8') as f:
+                                    email_data = json.load(f)
+                                # Get timestamp
+                                ts = email_data.get('sent_ts') or email_data.get('created_ts', '')
+                                try:
+                                    from datetime import datetime
+                                    timestamp = datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() if ts else 0.0
+                                except:
+                                    timestamp = 0.0
+                                emails_with_timestamps.append((timestamp, email_data))
+                            except:
+                                continue
+                        
+                        # Sort by timestamp (most recent first) and check only the latest
+                        if emails_with_timestamps:
+                            emails_with_timestamps.sort(key=lambda x: x[0], reverse=True)
+                            latest_email_data = emails_with_timestamps[0][1]
+                            # Check content on the latest email
+                            if self._check_email_content(latest_email_data, expected_content, min_keywords=min_keywords):
+                                content_validation_passed = True
+                                break
+                else:
+                    # For non-outbox files, check all matching files (original behavior)
+                    for file_path in pattern_files:
+                        if self._check_file_content(file_path, expected_content, min_keywords=min_keywords):
+                            content_validation_passed = True
+                            break
+                    if content_validation_passed:
                         break
-                if content_validation_passed:
-                    break
             
             if not content_validation_passed:
                 return False
@@ -497,12 +538,53 @@ class FileSystemValidator(TestValidator):
                     # Fallback: check all found files
                     pattern_files = [f for f in found_files if self._matches_pattern(f, resolved_pattern)]
                 
-                for file_path in pattern_files:
-                    if self._check_json_fields(file_path, expected_fields):
-                        json_validation_passed = True
+                # For outbox email validation, filter by recipient FIRST, then check the latest matching email
+                # This prevents matching old emails from previous steps while still allowing correct emails
+                if "outbox" in resolved_pattern.lower() and pattern_files:
+                    # First, filter emails by recipient (JSON fields)
+                    matching_emails = []
+                    for file_path in pattern_files:
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                email_data = json.load(f)
+                            # Check if this email matches the recipient (JSON fields)
+                            if self._check_json_fields_data(email_data, expected_fields):
+                                # Get timestamp
+                                ts = email_data.get('sent_ts') or email_data.get('created_ts', '')
+                                try:
+                                    from datetime import datetime
+                                    timestamp = datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() if ts else 0.0
+                                except:
+                                    timestamp = 0.0
+                                matching_emails.append((timestamp, file_path, email_data))
+                        except:
+                            continue
+                    
+                    # Sort by timestamp (most recent first) and check only the latest email that matches recipient
+                    if matching_emails:
+                        matching_emails.sort(key=lambda x: x[0], reverse=True)
+                        # Check the latest email that matches the recipient
+                        latest_email_data = matching_emails[0][2]
+                        # Check content if specified for this pattern
+                        if resolved_pattern in self._normalized_content:
+                            expected_content = self._normalized_content[resolved_pattern]
+                            min_keywords = self._min_keywords_per_pattern.get(resolved_pattern, self._min_keywords_global)
+                            if self._check_email_content(latest_email_data, expected_content, min_keywords=min_keywords):
+                                json_validation_passed = True
+                                break
+                        else:
+                            # No content check needed - recipient match is sufficient
+                            json_validation_passed = True
+                            break
+                    # If no matching emails found, validation fails (correct behavior)
+                else:
+                    # For non-outbox files, check all matching files (original behavior)
+                    for file_path in pattern_files:
+                        if self._check_json_fields(file_path, expected_fields):
+                            json_validation_passed = True
+                            break
+                    if json_validation_passed:
                         break
-                if json_validation_passed:
-                    break
             
             if not json_validation_passed:
                 return False
@@ -595,58 +677,79 @@ class FileSystemValidator(TestValidator):
             print(f"Warning: Could not read file {file_path}: {e}")
             return False
     
+    def _check_json_fields_data(self, data: Dict[str, Any], expected_fields: Dict[str, Any]) -> bool:
+        """Check if JSON data contains expected field values (works with data object, not file path)."""
+        for field_path, expected_value in expected_fields.items():
+            # Support nested field paths like "metadata.folder"
+            field_parts = field_path.split('.')
+            actual_value = data
+            
+            try:
+                for part in field_parts:
+                    actual_value = actual_value[part]
+            except (KeyError, TypeError):
+                return False
+            
+            # Handle different comparison types
+            if isinstance(expected_value, dict):
+                # If expected_value is a dict, it might contain comparison operators
+                if "equals" in expected_value:
+                    if str(actual_value).lower() != str(expected_value["equals"]).lower():
+                        return False
+                elif "contains" in expected_value:
+                    if isinstance(actual_value, str):
+                        if expected_value["contains"].lower() not in actual_value.lower():
+                            return False
+                    else:
+                        if expected_value["contains"] not in str(actual_value):
+                            return False
+                elif "in" in expected_value:
+                    # Check if actual_value is in the list
+                    if actual_value not in expected_value["in"]:
+                        return False
+                else:
+                    # Recursive check for nested dicts
+                    if not isinstance(actual_value, dict):
+                        return False
+                    if not self._check_json_fields_data(actual_value, expected_value):
+                        return False
+            elif isinstance(expected_value, list):
+                # Check if any of the expected values match
+                if actual_value not in expected_value:
+                    return False
+            else:
+                # Direct string comparison (case-insensitive for strings)
+                if isinstance(actual_value, str) and isinstance(expected_value, str):
+                    if actual_value.lower() != expected_value.lower():
+                        return False
+                else:
+                    if actual_value != expected_value:
+                        return False
+        
+        return True
+    
+    def _check_email_content(self, email_data: Dict[str, Any], expected_content: Union[str, List[str]], min_keywords: int = 2) -> bool:
+        """Check if email data contains expected content keywords."""
+        # Extract email body content
+        body = str(email_data.get('body', '') + ' ' + email_data.get('body_plain', '')).lower()
+        subject = str(email_data.get('subject', '')).lower()
+        content = (subject + ' ' + body).lower()
+        
+        if isinstance(expected_content, str):
+            return expected_content.lower() in content
+        elif isinstance(expected_content, list):
+            # Check if at least min_keywords keywords are present
+            found_keywords = sum(1 for keyword in expected_content if keyword.lower() in content)
+            return found_keywords >= min_keywords
+        
+        return False
+    
     def _check_json_fields(self, file_path: str, expected_fields: Dict[str, Any]) -> bool:
         """Check if JSON file contains expected field values."""
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            
-            for field_path, expected_value in expected_fields.items():
-                # Support nested field paths like "metadata.folder"
-                field_parts = field_path.split('.')
-                actual_value = data
-                
-                try:
-                    for part in field_parts:
-                        actual_value = actual_value[part]
-                except (KeyError, TypeError):
-                    return False
-                
-                # Handle different comparison types
-                if isinstance(expected_value, dict):
-                    # If expected_value is a dict, it might contain comparison operators
-                    if "equals" in expected_value:
-                        if str(actual_value).lower() != str(expected_value["equals"]).lower():
-                            return False
-                    elif "contains" in expected_value:
-                        if isinstance(actual_value, str):
-                            if expected_value["contains"].lower() not in actual_value.lower():
-                                return False
-                        else:
-                            if expected_value["contains"] not in str(actual_value):
-                                return False
-                    elif "in" in expected_value:
-                        # Check if actual_value is in the list
-                        if actual_value not in expected_value["in"]:
-                            return False
-                    else:
-                        # Direct comparison
-                        if actual_value != expected_value:
-                            return False
-                elif isinstance(expected_value, list):
-                    # Check if any of the expected values match
-                    if actual_value not in expected_value:
-                        return False
-                else:
-                    # Direct string comparison (case-insensitive for strings)
-                    if isinstance(actual_value, str) and isinstance(expected_value, str):
-                        if actual_value.lower() != expected_value.lower():
-                            return False
-                    else:
-                        if actual_value != expected_value:
-                            return False
-            
-            return True
+            return self._check_json_fields_data(data, expected_fields)
         except json.JSONDecodeError:
             print(f"Warning: File {file_path} is not valid JSON")
             return False
@@ -991,11 +1094,11 @@ class SemanticJudgeValidator(TestValidator):
     - query: String describing what information should be present in the content
     - check_target: What to check. Supports:
         - "agent_response" (default) - check agent's response text
-        - "tool.{tool_name}.{param}" - check tool call parameter (e.g., "tool.compose_email.body")
+        - "tool.{tool_name}.{param}" - check tool call parameter (e.g., "tool.send_email.body")
         - "outbox.latest.{field}" - check most recent email in outbox (e.g., "outbox.latest.body")
         - "outbox.latest.forward_to_email.{field}" - check most recent forwarded email (e.g., "outbox.latest.forward_to_email.body")
         - "outbox.email.to.{email_address}.{field}" - check email sent to specific address
-    - tool_name: (deprecated) Required if check_target is a tool parameter (e.g., "compose_email")
+    - tool_name: (deprecated) Required if check_target is a tool parameter (e.g., "send_email")
     - tool_param: (deprecated) Required if check_target is a tool parameter (e.g., "body")
     """
     
@@ -1056,7 +1159,7 @@ class SemanticJudgeValidator(TestValidator):
         
         # Handle tool parameter checks
         if self._check_target.startswith("tool."):
-            # Format: "tool.compose_email.body"
+            # Format: "tool.send_email.body"
             parts = self._check_target.split(".")
             if len(parts) >= 3:
                 tool_name = parts[1]

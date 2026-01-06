@@ -434,23 +434,31 @@ class Mem0MemoryManager:
                 # P1: Check if any retrieved memory has U label (provable_policy defense)
                 if defense_type == "provable_policy" and session_id:
                     from agent.agent_core import ProvablePolicyManager
-                    for memory_item in memories:
+                    print(f"🔍 [DEBUG] mem0 search: Checking {len(memories)} memories for U labels (session_id={session_id})")
+                    found_u_label = False
+                    for i, memory_item in enumerate(memories):
                         if isinstance(memory_item, dict):
                             # Check metadata for label
                             metadata = memory_item.get("metadata", {})
                             label = metadata.get("label", None)
+                            memory_text = memory_item.get("memory", "")[:50]
+                            print(f"🔍 [DEBUG] mem0 Memory {i}: label={label}, text_preview='{memory_text}'")
                             if label == "U":
                                 # Upgrade session to U if U-labeled memory is retrieved
+                                print(f"🛡️ [DEBUG] mem0: Found U-labeled memory! Upgrading session '{session_id}' to UNTRUSTED")
                                 ProvablePolicyManager.set_untrusted(session_id)
+                                found_u_label = True
                                 break
                             elif label is None:
                                 # Error: memory should have a label
-                                memory_text = memory_item.get("memory", "")[:50]
+                                print(f"⚠️ [DEBUG] mem0 Memory {i} missing label! text_preview='{memory_text}'")
                                 raise ValueError(
                                     f"Mem0 memory entry missing label in provable_policy defense. "
                                     f"All memories must have 'label' metadata set to 'T' or 'U'. "
                                     f"Memory text preview: {memory_text}..."
                                 )
+                    if not found_u_label:
+                        print(f"🔍 [DEBUG] mem0: No U-labeled memories found. Session '{session_id}' remains trusted.")
                 
                 return memories
             except Exception as e:
@@ -491,6 +499,33 @@ class Mem0MemoryManager:
                                 existing_texts.add(mem_text)
                                 if len(memories) >= self.top_k:
                                     break
+                    
+                    # P1: Check if any fallback memory has U label (provable_policy defense)
+                    # This is critical - fallback memories must also be checked for U labels
+                    if defense_type == "provable_policy" and session_id:
+                        from agent.agent_core import ProvablePolicyManager
+                        print(f"🔍 [DEBUG] mem0 get_context fallback: Checking {len(all_memories)} fallback memories for U labels (session_id={session_id})")
+                        found_u_label = False
+                        for i, memory_item in enumerate(all_memories):
+                            if isinstance(memory_item, dict):
+                                metadata = memory_item.get("metadata", {})
+                                label = metadata.get("label", None)
+                                memory_text = memory_item.get("memory", "")[:50]
+                                print(f"🔍 [DEBUG] mem0 Fallback Memory {i}: label={label}, text_preview='{memory_text}'")
+                                if label == "U":
+                                    print(f"🛡️ [DEBUG] mem0 fallback: Found U-labeled memory! Upgrading session '{session_id}' to UNTRUSTED")
+                                    ProvablePolicyManager.set_untrusted(session_id)
+                                    found_u_label = True
+                                    break
+                                elif label is None:
+                                    print(f"⚠️ [DEBUG] mem0 Fallback Memory {i} missing label! text_preview='{memory_text}'")
+                                    raise ValueError(
+                                        f"Mem0 fallback memory entry missing label in provable_policy defense. "
+                                        f"All memories must have 'label' metadata set to 'T' or 'U'. "
+                                        f"Memory text preview: {memory_text}..."
+                                    )
+                        if not found_u_label:
+                            print(f"🔍 [DEBUG] mem0 fallback: No U-labeled memories found. Session '{session_id}' remains trusted.")
             except Exception:
                 pass
         

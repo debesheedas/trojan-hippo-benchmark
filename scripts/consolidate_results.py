@@ -5,7 +5,7 @@ Results Consolidation Script with CSV and Plots
 Generates comprehensive CSV tables and visualizations for each test suite:
 - CSV files with success percentages for each memory backend and defense type
 - Bar charts and heatmaps showing performance across configurations
-- Separate files for each suite: benign, direct, indirect, memory_only, assistant_responses, untrusted_probe
+- Separate files for each suite: benign, direct, indirect, memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools
 
 Usage:
     python scripts/consolidate_results.py
@@ -178,7 +178,7 @@ def discover_models_and_attack_types(results_base_dir: Path) -> Tuple[List[str],
                     for defense_dir in backend_dir.iterdir():
                         if defense_dir.is_dir():
                             for attack_dir in defense_dir.iterdir():
-                                if attack_dir.is_dir() and attack_dir.name in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe"]:
+                                if attack_dir.is_dir() and attack_dir.name in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"]:
                                     attack_types.add(attack_dir.name)
     
     return (sorted(list(models)), sorted(list(attack_types)))
@@ -202,20 +202,12 @@ def collect_all_data(
     for defense_type in defense_types:
         data[defense_type] = {}
         for backend in memory_backends:
-            # For "none" backend, results are the same for all defense types
-            # (since memory is disabled, defenses don't matter)
-            # Always use results from "none/none/" folder for all defense types
-            if backend == "none":
-                passed, total, rate, has_errors = collect_results_for_combination(
-                    "none", "none", model_name, attack_type, results_base_dir
-                )
-                data[defense_type][backend] = (passed, total, rate, has_errors)
-            else:
-                # For actual memory backends, collect results for the defense type
-                passed, total, rate, has_errors = collect_results_for_combination(
-                    backend, defense_type, model_name, attack_type, results_base_dir
-                )
-                data[defense_type][backend] = (passed, total, rate, has_errors)
+            # Treat "none" backend as a regular backend - collect results for each defense type
+            # This allows provable_policy and other defenses to work correctly even without memory
+            passed, total, rate, has_errors = collect_results_for_combination(
+                backend, defense_type, model_name, attack_type, results_base_dir
+            )
+            data[defense_type][backend] = (passed, total, rate, has_errors)
     
     return data
 
@@ -467,7 +459,7 @@ def main():
     parser.add_argument(
         "--suite",
         type=str,
-        choices=["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe"],
+        choices=["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"],
         help="Specific test suite to consolidate (default: all suites)"
     )
     
@@ -587,10 +579,7 @@ def generate_error_summary(
     
     for memory_backend in memory_backends:
         for unified_defense in defense_types:
-            # Skip invalid combinations
-            if memory_backend == "none" and unified_defense != "none":
-                continue
-            
+            # Treat "none" backend as a regular backend - check all defense types
             # Check result files for execution_success flag
             results_dir = get_results_dir(memory_backend, unified_defense, model_name, attack_type, results_base_dir)
             if results_dir.exists():

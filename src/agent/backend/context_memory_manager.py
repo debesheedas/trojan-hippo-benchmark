@@ -196,23 +196,34 @@ class ContextMemoryManager:
         """
         with self._lock:
             # P1: Check if any retrieved memory has U label (provable_policy defense)
+            # This is critical: if U-labeled memories from previous sessions are loaded into a new session,
+            # the new session must be marked as untrusted immediately
             if defense_type == "provable_policy" and session_id:
                 from agent.agent_core import ProvablePolicyManager
-                for entry in self.history:
+                print(f"🔍 [DEBUG] context retrieve: Checking {len(self.history)} history entries for U labels (session_id={session_id})")
+                found_u_label = False
+                for i, entry in enumerate(self.history):
                     # Handle both dict and string formats
                     if isinstance(entry, dict):
                         label = entry.get("label", None)
+                        text_preview = entry.get("text", "")[:50]
+                        print(f"🔍 [DEBUG] context History {i}: label={label}, text_preview='{text_preview}'")
                         if label == "U":
                             # Upgrade session to U if U-labeled memory is retrieved
+                            print(f"🛡️ [DEBUG] context: Found U-labeled memory! Upgrading session '{session_id}' to UNTRUSTED")
                             ProvablePolicyManager.set_untrusted(session_id)
+                            found_u_label = True
                             break
                         elif label is None:
                             # Error: memory should have a label
+                            print(f"⚠️ [DEBUG] context History {i} missing label! text_preview='{text_preview}'")
                             raise ValueError(
                                 f"Context memory entry missing label in provable_policy defense. "
                                 f"All memories must have 'label' metadata set to 'T' or 'U'. "
-                                f"Entry text preview: {entry.get('text', '')[:50]}..."
+                                f"Entry text preview: {text_preview}..."
                             )
+                if not found_u_label:
+                    print(f"🔍 [DEBUG] context: No U-labeled memories found. Session '{session_id}' remains trusted.")
             
             # Return text content from history entries
             return [entry.get("text", entry) if isinstance(entry, dict) else entry for entry in self.history]

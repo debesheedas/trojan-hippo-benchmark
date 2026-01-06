@@ -160,6 +160,9 @@ def run_benchmark(
             config["memory"][backend_name]["enabled"] = False
         # Set backend to "none" in config
         config["memory"]["backend"] = "none"
+        # Store defense_type at top level for "none" backend (needed for provable_policy defense)
+        # This allows defenses to work even when memory is disabled
+        config["memory"]["defense_type"] = unified_defense
     else:
         # Set memory backend in config
         if "memory" not in config:
@@ -473,7 +476,7 @@ def _run_single_combination(
     # Determine attack type from test_path (needed for result paths)
     test_dir = Path("data/benchmark/tests")
     if isinstance(test_path, str):
-        if test_path in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe"]:
+        if test_path in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"]:
             attack_type = test_path
         else:
             # Try to determine from path
@@ -576,15 +579,11 @@ def run_all_combinations(
         Dictionary with results summary for all combinations
     """
     # Generate all combinations
+    # Treat "none" backend as a regular backend - run all defense types
     combinations = []
     for backend in memory_backends:
-        if backend == "none":
-            # Special case: none backend only runs with none defense (once)
-            combinations.append(("none", "none"))
-        else:
-            # Regular backends: run with all specified defenses
-            for defense in defense_types:
-                combinations.append((backend, defense))
+        for defense in defense_types:
+            combinations.append((backend, defense))
     
     total_combinations = len(combinations)
     print(f"\n{'#'*80}")
@@ -808,7 +807,7 @@ def run_all_combinations(
         model_arg = f"--model {target_model_name}" if target_model_name else ""
         
         print(f"\nTo rerun only the failed combinations, use:")
-        if "suite" in test_path or test_path in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe"]:
+        if "suite" in test_path or test_path in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"]:
             print(f"  python scripts/run_benchmark.py --suite {test_path} {model_arg} \\")
         else:
             print(f"  python scripts/run_benchmark.py --test {test_path} {model_arg} \\")
@@ -915,7 +914,7 @@ Examples:
         nargs="+",
         choices=UNIFIED_DEFENSE_TYPES,
         help="Defense type(s) to run. Can specify multiple (e.g., --defense-type none user_prompt_only). "
-             "If not specified, all defense types are used. Not used when --memory-backend is 'none'."
+             "If not specified, all defense types are used."
     )
     
     parser.add_argument(
@@ -934,8 +933,8 @@ Examples:
     parser.add_argument(
         "--suite",
         type=str,
-        choices=["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe"],
-        help="Test suite to run (benign, direct, indirect, memory_only, assistant_responses, or untrusted_probe)"
+        choices=["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"],
+        help="Test suite to run (benign, direct, indirect, memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, or memory_tools)"
     )
     
     parser.add_argument(
@@ -998,8 +997,8 @@ Examples:
     if memory_backends_specified:
         memory_backends = args.memory_backend
     else:
-        # Default: all backends
-        memory_backends = ["explicit", "mem0", "rag", "context"]
+        # Default: all backends (including "none" as a regular backend)
+        memory_backends = ["none", "explicit", "mem0", "rag", "context"]
     
     # Determine defense types to use
     if defense_types_specified:
@@ -1022,9 +1021,6 @@ Examples:
     else:
         # Single combination mode (1 backend × 1 defense = 1 combination)
         running_multiple_combinations = False
-        # Validate single combination constraints
-        if memory_backends[0] == "none" and defense_types_specified and defense_types[0] != "none":
-            parser.error("When using --memory-backend none, --defense-type must be 'none' (or omitted)")
     
     # Run benchmark(s)
     if running_multiple_combinations:
@@ -1044,12 +1040,9 @@ Examples:
         # Single combination mode
         memory_backend = memory_backends[0]
         
-        # If backend is "none", automatically set defense to "none" (no memory = no defense)
-        if memory_backend == "none":
-            defense_type = "none"
-        else:
-            # Use provided defense type or default to "none"
-            defense_type = defense_types[0] if defense_types_specified else "none"
+        # Use provided defense type or default to "none"
+        # Treat "none" backend as a regular backend - allow all defense types
+        defense_type = defense_types[0] if defense_types_specified else "none"
         
         result = run_benchmark(
             memory_backend=memory_backend,

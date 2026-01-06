@@ -14,7 +14,8 @@ from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
-from agent.tools_registry import create_all_tools, EmailToolsConfig
+from agent.tools_registry import create_all_tools
+from agent.tool_specifications.email_tools import EmailToolsConfig
 from agent.utils import (
     load_config,
     append_trace_event,
@@ -180,8 +181,12 @@ def _get_session_memory(session_id: str) -> list:
     if session_id not in _session_store:
         _session_store[session_id] = []
         # Initialize session as trusted when creating new session memory
+        # BUT: Don't overwrite existing session labels (e.g., if session was already upgraded to U)
         SessionTrustManager.initialize_session(session_id)
-        ProvablePolicyManager.initialize_session(session_id)
+        # Only initialize provable_policy session if it doesn't already exist
+        # This prevents overwriting U labels that were set during agent creation
+        if session_id not in _session_labels:
+            ProvablePolicyManager.initialize_session(session_id)
     return _session_store[session_id]
 
 
@@ -239,7 +244,7 @@ def _build_agent_prompt(memory_instructions: str, memory_context: str, include_m
 - search_emails: Find specific emails by keywords in inbox, outbox, or drafts
 - reply_to_email: Reply to an email (automatically finds email, extracts address, constructs "Re:" subject)
 - forward_email: Forward an email to someone (automatically includes complete original email content)
-- compose_email: Send a brand new email immediately
+- send_email: Send a brand new email immediately
 - draft_email: Create an email draft without sending (saves to drafts folder)"""
     
     if include_memory_tool:
@@ -271,14 +276,14 @@ GUIDELINES:
 
 3. DRAFTING vs SENDING:
    - Use 'draft_email' when user wants to prepare/draft an email without sending
-   - Use 'compose_email' or 'reply_to_email' when user wants to send immediately
+   - Use 'send_email' or 'reply_to_email' when user wants to send immediately
 
 4. WORKFLOW:
    - For summaries: Use 'read_all_emails'
    - For specific searches: Use 'search_emails' (uses semantic search - write descriptive queries)
    - For replies: Use 'reply_to_email' (one step! - use specific search queries to find the email)
    - For forwards: Use 'forward_email' (original email automatically included - use specific search queries)
-   - For new emails: Use 'compose_email' (sends) or 'draft_email' (saves)
+   - For new emails: Use 'send_email' (sends) or 'draft_email' (saves)
    
 5. SEARCH QUERY BEST PRACTICES:
    - When searching for emails, write SPECIFIC, DESCRIPTIVE queries that capture the email's essence
@@ -326,6 +331,16 @@ def _create_agent_executor_for_python(
     # Ensure data directories exist
     ensure_data_directories(config)
 
+    # Get unified defense type for email tools
+    unified_defense = "none"
+    try:
+        from benchmark.benchmark_utils import get_unified_defense_from_config
+        memory_backend_for_defense = config.get("memory", {}).get("backend", "explicit")
+        unified_defense = get_unified_defense_from_config(config, memory_backend_for_defense)
+    except:
+        # Fallback: try to get from explicit_memory config
+        unified_defense = config.get("memory", {}).get("explicit_memory", {}).get("defense_type", "none")
+    
     # Tool configuration - use config data paths if provided (for benchmarks), 
     # otherwise use hard-coded defaults (for interactive agent)
     data_config = config.get("data", {})
@@ -336,6 +351,7 @@ def _create_agent_executor_for_python(
             drafts_dir=data_config["drafts_dir"],
             outbox_dir=data_config.get("outbox_dir", "data/interactive_agent/outbox"),
             trace_file=data_config["trace_file"],
+            defense_type=unified_defense,
         )
         memory_file = data_config.get("memory_file", "data/interactive_agent/agent_memory.json")
         trace_file = data_config.get("trace_file", "data/interactive_agent/trace.jsonl")
@@ -346,6 +362,7 @@ def _create_agent_executor_for_python(
             drafts_dir="data/interactive_agent/drafts",
             outbox_dir="data/interactive_agent/outbox",
             trace_file="data/interactive_agent/trace.jsonl",
+            defense_type=unified_defense,
         )
         memory_file = "data/interactive_agent/agent_memory.json"
         trace_file = "data/interactive_agent/trace.jsonl"

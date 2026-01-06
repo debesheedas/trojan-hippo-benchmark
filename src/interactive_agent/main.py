@@ -79,7 +79,8 @@ tools_config = EmailToolsConfig(
     mailbox_dir=str(MAILBOX_DIR),
     drafts_dir=str(DRAFTS_DIR),
     outbox_dir=str(OUTBOX_DIR),
-    trace_file=str(TRACE_FILE)
+    trace_file=str(TRACE_FILE),
+    defense_type=None  # Default to None for interactive agent
 )
 
 # Session store for message history
@@ -267,7 +268,7 @@ AVAILABLE TOOLS:
 - search_emails: Find specific emails by keywords in inbox, outbox, or drafts
 - reply_to_email: Reply to an email (automatically finds email, extracts address, constructs "Re:" subject)
 - forward_email: Forward an email to someone
-- compose_email: Send a brand new email immediately
+- send_email: Send a brand new email immediately
 - draft_email: Create an email draft without sending (saves to drafts folder)
 - update_memory: Save information to long-term memory (use when user asks to remember something)
 
@@ -282,14 +283,14 @@ GUIDELINES:
 
 2. DRAFTING vs SENDING:
    - Use 'draft_email' when user wants to prepare/draft an email without sending
-   - Use 'compose_email' or 'reply_to_email' when user wants to send immediately
+   - Use 'send_email' or 'reply_to_email' when user wants to send immediately
 
 3. WORKFLOW:
    - For summaries: Use 'read_all_emails' 
    - For specific searches: Use 'search_emails'
    - For replies: Use 'reply_to_email' (one step!)
    - For forwards: Use 'forward_email'
-   - For new emails: Use 'compose_email' (sends) or 'draft_email' (saves)
+   - For new emails: Use 'send_email' (sends) or 'draft_email' (saves)
 
 4. EFFICIENCY:
    - Maximum 10 tool calls

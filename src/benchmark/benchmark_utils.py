@@ -112,7 +112,7 @@ def get_log_path(
         memory_backend: Memory backend name ("explicit", "mem0", "rag", or "none" for disable_memory)
         unified_defense: Unified defense name (e.g., "none", "disable_memory")
         model_name: Model name (e.g., "gpt-5-mini")
-        attack_type: Attack type ("benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe")
+        attack_type: Attack type ("benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools")
         test_file: Path to test file
         logs_base_dir: Base directory for logs
         
@@ -152,7 +152,7 @@ def get_combination_log_path(
         memory_backend: Memory backend name
         unified_defense: Unified defense name
         model_name: Model name
-        attack_type: Attack type ("benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe")
+        attack_type: Attack type ("benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools")
         logs_base_dir: Base directory for logs
         
     Returns:
@@ -358,12 +358,17 @@ def get_unified_defense_from_config(config: Dict[str, Any], memory_backend: str)
     memory_config = config.get("memory", {})
     
     # Get defense from backend-specific config
-    if memory_backend == "explicit":
+    if memory_backend == "none":
+        # For "none" backend, defense_type is stored at top level of memory config
+        defense = memory_config.get("defense_type", "none")
+    elif memory_backend == "explicit":
         defense = memory_config.get("explicit_memory", {}).get("defense_type", "none")
     elif memory_backend == "mem0":
         defense = memory_config.get("mem0_memory", {}).get("defense_type", "none")
     elif memory_backend == "rag":
         defense = memory_config.get("rag_memory", {}).get("defense_type", "none")
+    elif memory_backend == "context":
+        defense = memory_config.get("context_memory", {}).get("defense_type", "none")
     else:
         defense = "none"
     
@@ -457,7 +462,7 @@ def discover_test_files(
     Intelligently discover test files from a path.
     
     Handles:
-    - Suite keywords (benign, direct, indirect, memory_only, assistant_responses, untrusted_probe) -> maps to test_dir/{suite}/
+    - Suite keywords (benign, direct, indirect, memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools) -> maps to test_dir/{suite}/
     - File paths -> returns single file if JSON
     - Directory paths -> finds all JSON files recursively
     
@@ -473,7 +478,7 @@ def discover_test_files(
     """
     
     # Handle suite keywords
-    if test_path in {"benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe"}:
+    if test_path in {"benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"}:
         test_path_obj = test_dir / test_path
     else:
         test_path_obj = Path(test_path)
@@ -482,7 +487,7 @@ def discover_test_files(
     if not test_path_obj.exists():
         if verbose:
             print(f"⚠️  Test path not found: {test_path}")
-            if test_path in {"benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe"}:
+            if test_path in {"benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"}:
                 print(f"   Expected location: {test_path_obj}")
                 print(f"   Unified test directory: {test_dir}")
         return []
@@ -506,21 +511,21 @@ def discover_test_files(
 
 def determine_attack_type(test_file: Path, test_def: Optional[Dict[str, Any]] = None) -> str:
     """
-    Determine the attack_type for a test file, handling memory_only, assistant_responses, and untrusted_probe tests specially.
-    
-    Memory_only, assistant_responses, and untrusted_probe tests should be saved to their respective folders even if they have
+    Determine the attack_type for a test file, handling memory_only, assistant_responses, untrusted_probe, untrusted_send, and disable_send tests specially.
+
+    Memory_only, assistant_responses, untrusted_probe, untrusted_send, and disable_send tests should be saved to their respective folders even if they have
     attack_type="benign" in their JSON. This function detects these tests by:
-    1. Checking if "memory_only" or "assistant_responses" is in the test file path
-    2. Checking if the filename starts with "memory_only_" or "assistant_responses_"
+    1. Checking if "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", or "disable_send" is in the test file path
+    2. Checking if the filename starts with "memory_only_", "assistant_responses_", "untrusted_probe_", "untrusted_send_", or "disable_send_"
     
     Args:
         test_file: Path to test file
         test_def: Optional test definition dict (if already loaded)
         
     Returns:
-        Attack type string ("benign", "direct", "indirect", "memory_only", "assistant_responses", or "untrusted_probe")
+        Attack type string ("benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", or "memory_tools")
     """
-    # Check if this is a memory_only, assistant_responses, or untrusted_probe test by path or filename
+    # Check if this is a memory_only, assistant_responses, untrusted_probe, untrusted_send, or disable_send test by path or filename
     test_file_str = str(test_file)
     if "memory_only" in test_file_str or test_file.name.startswith("memory_only_"):
         return "memory_only"
@@ -528,6 +533,12 @@ def determine_attack_type(test_file: Path, test_def: Optional[Dict[str, Any]] = 
         return "assistant_responses"
     if "untrusted_probe" in test_file_str or test_file.name.startswith("untrusted_probe_"):
         return "untrusted_probe"
+    if "untrusted_send" in test_file_str or test_file.name.startswith("untrusted_send_"):
+        return "untrusted_send"
+    if "disable_send" in test_file_str or test_file.name.startswith("disable_send_"):
+        return "disable_send"
+    if "memory_tools" in test_file_str or test_file.name.startswith("memory_tools_"):
+        return "memory_tools"
     
     # Otherwise, use attack_type from test definition if available
     if test_def:

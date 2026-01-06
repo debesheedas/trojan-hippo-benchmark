@@ -97,7 +97,12 @@ class TestBench:
         if backend_from_config == "none":
             self.memory_backend_name = "none"
             self.memory_backend = None  # No backend when memory is disabled
-            self.unified_defense = "none"  # No memory = no defense
+            # Respect defense_type_override even when memory_backend is "none"
+            # This allows provable_policy and other defenses to work without memory
+            if defense_type_override is not None:
+                self.unified_defense = defense_type_override
+            else:
+                self.unified_defense = get_unified_defense_from_config(self.config, "none")
             # Disable all memory backends
             for backend_name in ["explicit", "mem0", "rag", "context"]:
                 if backend_name not in memory_config:
@@ -971,6 +976,67 @@ class TestBench:
                         })
                     continue
                 
+                if step_type == "insert_email":
+                    # Handle email insertion step (for benign test cases like memory_tools)
+                    print(f"📧 {step.get('description', 'Inserting email into inbox')}")
+                    
+                    # Get the email from the step
+                    email = step.get("email")
+                    if not email:
+                        print(f"⚠️ Warning: Step {i} has step_type 'insert_email' but no 'email' field. Skipping.")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_email",
+                            "description": step.get('description', 'Inserting email'),
+                            "duration_s": 0.0,
+                            "error": "Missing email field"
+                        })
+                        continue
+                    
+                    # Get inbox directory from test config
+                    inbox_dir = Path(test_config["data"]["mailbox_dir"])
+                    inbox_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Generate unique filename for email
+                    email_id = str(uuid.uuid4())[:8]
+                    email_file = inbox_dir / f"email_{email_id}.json"
+                    
+                    # Write email to inbox
+                    try:
+                        with open(email_file, 'w', encoding='utf-8') as f:
+                            json.dump(email, f, indent=2, ensure_ascii=False)
+                        
+                        print(f"✅ Added email: {email.get('subject', 'No subject')} from {email.get('from', 'Unknown sender')}")
+                        
+                        # Update state manager with new email
+                        try:
+                            current_state = self.state_manager.get_current_state()
+                            if current_state:
+                                # Add email to state's inbox_emails list
+                                current_state.inbox_emails.append(email)
+                        except Exception as e:
+                            print(f"Warning: Could not update state manager with new email: {e}")
+                        
+                        # Record this step (no success_check, so no "passed" attribute)
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_email",
+                            "description": step.get('description', 'Inserting email'),
+                            "email_subject": email.get('subject', 'No subject'),
+                            "email_from": email.get('from', 'Unknown sender'),
+                            "duration_s": 0.0
+                        })
+                    except Exception as e:
+                        print(f"❌ Error inserting email: {e}")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_email",
+                            "description": step.get('description', 'Inserting email'),
+                            "duration_s": 0.0,
+                            "error": str(e)
+                        })
+                    continue
+                
                 if step_type == "insert_benign_email":
                     # Handle benign email insertion step
                     print(f"📧 {step.get('description', 'Inserting benign email into inbox')}")
@@ -1705,6 +1771,67 @@ class TestBench:
                             "step": i,
                             "step_type": "insert_attack_email",
                             "description": step.get('description', 'Inserting attack email'),
+                            "duration_s": 0.0,
+                            "error": str(e)
+                        })
+                    continue
+                
+                if step_type == "insert_email":
+                    # Handle email insertion step (for benign test cases like memory_tools)
+                    print(f"📧 {step.get('description', 'Inserting email into inbox')}")
+                    
+                    # Get the email from the step
+                    email = step.get("email")
+                    if not email:
+                        print(f"⚠️ Warning: Step {i} has step_type 'insert_email' but no 'email' field. Skipping.")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_email",
+                            "description": step.get('description', 'Inserting email'),
+                            "duration_s": 0.0,
+                            "error": "Missing email field"
+                        })
+                        continue
+                    
+                    # Get inbox directory from test config
+                    inbox_dir = Path(test_config["data"]["mailbox_dir"])
+                    inbox_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Generate unique filename for email
+                    email_id = str(uuid.uuid4())[:8]
+                    email_file = inbox_dir / f"email_{email_id}.json"
+                    
+                    # Write email to inbox
+                    try:
+                        with open(email_file, 'w', encoding='utf-8') as f:
+                            json.dump(email, f, indent=2, ensure_ascii=False)
+                        
+                        print(f"✅ Added email: {email.get('subject', 'No subject')} from {email.get('from', 'Unknown sender')}")
+                        
+                        # Update state manager with new email
+                        try:
+                            current_state = self.state_manager.get_current_state()
+                            if current_state:
+                                # Add email to state's inbox_emails list
+                                current_state.inbox_emails.append(email)
+                        except Exception as e:
+                            print(f"Warning: Could not update state manager with new email: {e}")
+                        
+                        # Record this step (no success_check, so no "passed" attribute)
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_email",
+                            "description": step.get('description', 'Inserting email'),
+                            "email_subject": email.get('subject', 'No subject'),
+                            "email_from": email.get('from', 'Unknown sender'),
+                            "duration_s": 0.0
+                        })
+                    except Exception as e:
+                        print(f"❌ Error inserting email: {e}")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "insert_email",
+                            "description": step.get('description', 'Inserting email'),
                             "duration_s": 0.0,
                             "error": str(e)
                         })
@@ -2469,7 +2596,7 @@ class TestBench:
         print(f"Found {len(test_files)} test files")
         
         # Group tests by attack_type for better organization
-        test_groups = {"benign": [], "direct": [], "indirect": [], "memory_only": [], "assistant_responses": [], "untrusted_probe": [], "unknown": []}
+        test_groups = {"benign": [], "direct": [], "indirect": [], "memory_only": [], "assistant_responses": [], "untrusted_probe": [], "untrusted_send": [], "disable_send": [], "memory_tools": [], "unknown": []}
         for test_file in test_files:
             try:
                 with open(test_file, 'r', encoding='utf-8') as f:
@@ -2699,7 +2826,7 @@ def main():
             # No specific tests specified, run all suites by default
             print("No specific tests specified. Running all test suites...")
             all_results = []
-            for suite in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe"]:
+            for suite in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"]:
                 print(f"\n{'='*60}")
                 print(f"Running suite: {suite}")
                 print(f"{'='*60}")

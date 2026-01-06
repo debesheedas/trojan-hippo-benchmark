@@ -20,7 +20,7 @@ UNTRUSTED_TOOLS: Set[str] = {
 
 # Trusted tools are those that don't read from untrusted sources
 TRUSTED_TOOLS: Set[str] = {
-    "compose_email",
+    "send_email",
     "draft_email",
     "update_memory"
 }
@@ -37,7 +37,7 @@ TAINT_TOOLS: Set[str] = {
 # Provable Policy Defense: Leakage Axis (Sink)
 # Tools that can exfiltrate data outside the system
 EXFILTRATION_TOOLS: Set[str] = {
-    "compose_email",
+    "send_email",
     "reply_to_email",
     "forward_to_email"
 }
@@ -93,6 +93,20 @@ def is_exfiltration_tool(tool_name: str) -> bool:
         True if the tool is an exfiltration sink, False otherwise
     """
     return tool_name in EXFILTRATION_TOOLS
+
+
+def is_both_taint_and_exfil(tool_name: str) -> bool:
+    """
+    Check if a tool is both a taint source and an exfiltration sink.
+    Such tools should always be blocked when provable_policy defense is enabled.
+    
+    Args:
+        tool_name: Name of the tool
+        
+    Returns:
+        True if the tool is both taint and exfil, False otherwise
+    """
+    return tool_name in TAINT_TOOLS and tool_name in EXFILTRATION_TOOLS
 
 
 def create_all_tools(

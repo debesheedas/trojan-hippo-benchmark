@@ -191,12 +191,13 @@ def _find_best_email_match(search_query: str, config, folder: str = "inbox", lim
 
 class EmailToolsConfig:
     """Configuration for email tools."""
-    def __init__(self, mailbox_dir: str, drafts_dir: str, outbox_dir: str, trace_file: str):
+    def __init__(self, mailbox_dir: str, drafts_dir: str, outbox_dir: str, trace_file: str, defense_type: Optional[str] = None):
         self.mailbox_dir = Path(mailbox_dir)
         self.drafts_dir = Path(drafts_dir)
         self.outbox_dir = Path(outbox_dir)
         self.trace_file = trace_file
         self.session_id: Optional[str] = None
+        self.defense_type: Optional[str] = defense_type  # Defense type (e.g., "provable_policy", "none")
 
 
 class ReadAllEmailsInput(BaseModel):
@@ -252,7 +253,7 @@ class DraftEmailInput(BaseModel):
 
 
 class ComposeEmailInput(BaseModel):
-    """Input schema for compose_email tool."""
+    """Input schema for send_email tool."""
     to: str = Field(description="Recipient email address")
     subject: str = Field(description="Email subject line")
     body: str = Field(description="Email message body")
@@ -286,9 +287,12 @@ When you read emails using this tool, they are automatically marked as read in t
             SessionTrustManager.set_untrusted(self.config.session_id)
         
         # P1: Mark session as U for provable_policy defense (taint tool)
+        # Only mark as untrusted if provable_policy defense is enabled
         if self.config and self.config.session_id:
-            from agent.agent_core import ProvablePolicyManager
-            ProvablePolicyManager.set_untrusted(self.config.session_id)
+            defense_type = getattr(self.config, 'defense_type', None)
+            if defense_type == "provable_policy":
+                from agent.agent_core import ProvablePolicyManager
+                ProvablePolicyManager.set_untrusted(self.config.session_id)
         
         # Log tool call
         if self.config and self.config.session_id:
@@ -621,24 +625,23 @@ This is a one-step operation - no need to manually construct the reply email. If
         """Find an email and send a reply."""
         call_id = generate_id("tcall")
         
-        # Mark session as untrusted BEFORE executing (no_untrusted_tools defense)
-        if self.config and self.config.session_id:
-            from agent.agent_core import SessionTrustManager
-            SessionTrustManager.set_untrusted(self.config.session_id)
-        
-        # P1 & P4: Handle taint and exfiltration for provable_policy defense
-        # (reply_to_email is both taint and exfil)
+        # CRITICAL: Check provable_policy defense FIRST, before any other operations
+        # Tools that are both taint and exfil should ALWAYS be blocked when provable_policy is enabled
         if self.config and self.config.session_id:
             from agent.agent_core import ProvablePolicyManager
-            from agent.tools_registry import is_exfiltration_tool
+            from agent.tools_registry import is_both_taint_and_exfil
             
-            # P4: Check if exfiltration should be blocked (check BEFORE tainting)
-            # If session is already U, block immediately (don't even read from inbox)
-            if not ProvablePolicyManager.is_trusted(self.config.session_id):
+            defense_type = getattr(self.config, 'defense_type', None) if self.config else None
+            is_provable_policy = defense_type == "provable_policy"
+            
+            if is_provable_policy and is_both_taint_and_exfil(self.name):
+                # Mark session as untrusted (since we're attempting to use a taint tool)
+                ProvablePolicyManager.set_untrusted(self.config.session_id)
+                
                 error_msg = (
                     "🛡️ Security Policy: This action has been blocked for safety reasons. "
-                    "The current session has been marked as untrusted because untrusted data was accessed. "
-                    "Exfiltration tools (email sending) are not allowed in untrusted sessions."
+                    "This tool both reads from untrusted sources and sends data externally, "
+                    "which poses a security risk. Exfiltration tools that access untrusted data are not allowed."
                 )
                 
                 # Log blocked tool call
@@ -651,7 +654,7 @@ This is a one-step operation - no need to manually construct the reply email. If
                         "inputs": {"search_query": search_query, "reply_body": reply_body},
                         "call_id": call_id,
                         "blocked": True,
-                        "reason": "provable_policy_exfiltration_blocked"
+                        "reason": "provable_policy_taint_and_exfil_blocked"
                     }
                 )
                 
@@ -667,11 +670,103 @@ This is a one-step operation - no need to manually construct the reply email. If
                 )
                 
                 return error_msg
+        
+        # Mark session as untrusted BEFORE executing (no_untrusted_tools defense)
+        if self.config and self.config.session_id:
+            from agent.agent_core import SessionTrustManager
+            SessionTrustManager.set_untrusted(self.config.session_id)
+        
+        # P1 & P4: Handle taint and exfiltration for provable_policy defense
+        # (reply_to_email is both taint and exfil)
+        if self.config and self.config.session_id:
+            from agent.agent_core import ProvablePolicyManager
+            from agent.tools_registry import is_exfiltration_tool
+            
+            # Only block if provable_policy defense is enabled
+            defense_type = getattr(self.config, 'defense_type', None) if self.config else None
+            is_provable_policy = defense_type == "provable_policy"
+            
+            if is_provable_policy:
+                # P4: Check if exfiltration should be blocked (for tools that are only exfil, not taint)
+                # If session is already U, block immediately (don't even read from inbox)
+                if not ProvablePolicyManager.is_trusted(self.config.session_id):
+                    # Mark session as untrusted (since we're attempting to use a taint tool)
+                    ProvablePolicyManager.set_untrusted(self.config.session_id)
+                    
+                    error_msg = (
+                        "🛡️ Security Policy: This action has been blocked for safety reasons. "
+                        "This tool both reads from untrusted sources and sends data externally, "
+                        "which poses a security risk. Exfiltration tools that access untrusted data are not allowed."
+                    )
+                    
+                    # Log blocked tool call
+                    append_trace_event(
+                        self.config.trace_file,
+                        "tool_call",
+                        self.config.session_id,
+                        {
+                            "tool_name": self.name,
+                            "inputs": {"search_query": search_query, "reply_body": reply_body},
+                            "call_id": call_id,
+                            "blocked": True,
+                            "reason": "provable_policy_taint_and_exfil_blocked"
+                        }
+                    )
+                    
+                    append_trace_event(
+                        self.config.trace_file,
+                        "tool_result",
+                        self.config.session_id,
+                        {
+                            "tool_name": self.name,
+                            "outputs": {"error": error_msg, "blocked": True},
+                            "call_id": call_id
+                        }
+                    )
+                    
+                    return error_msg
+                
+                # P4: Check if exfiltration should be blocked (for tools that are only exfil, not taint)
+                # If session is already U, block immediately (don't even read from inbox)
+                if not ProvablePolicyManager.is_trusted(self.config.session_id):
+                    error_msg = (
+                        "🛡️ Security Policy: This action has been blocked for safety reasons. "
+                        "The current session has been marked as untrusted because untrusted data was accessed. "
+                        "Exfiltration tools (email sending) are not allowed in untrusted sessions."
+                    )
+                    
+                    # Log blocked tool call
+                    append_trace_event(
+                        self.config.trace_file,
+                        "tool_call",
+                        self.config.session_id,
+                        {
+                            "tool_name": self.name,
+                            "inputs": {"search_query": search_query, "reply_body": reply_body},
+                            "call_id": call_id,
+                            "blocked": True,
+                            "reason": "provable_policy_exfiltration_blocked"
+                        }
+                    )
+                    
+                    append_trace_event(
+                        self.config.trace_file,
+                        "tool_result",
+                        self.config.session_id,
+                        {
+                            "tool_name": self.name,
+                            "outputs": {"error": error_msg, "blocked": True},
+                            "call_id": call_id
+                        }
+                    )
+                    
+                    return error_msg
             
             # P1: Mark session as U (taint tool)
-            # Note: Since session was T, we allow the tool to execute (taint and exfil in same action)
-            # But we mark session as U for future tool calls
-            ProvablePolicyManager.set_untrusted(self.config.session_id)
+            # Only mark as untrusted if provable_policy defense is enabled
+            # Note: This should not be reached for tools that are both taint and exfil (they're blocked above)
+            if defense_type == "provable_policy":
+                ProvablePolicyManager.set_untrusted(self.config.session_id)
         
         # Log tool call
         if self.config and self.config.session_id:
@@ -803,24 +898,23 @@ Important: The original email body and all content is automatically included - y
         """Find an email and forward it."""
         call_id = generate_id("tcall")
         
-        # Mark session as untrusted BEFORE executing (no_untrusted_tools defense)
-        if self.config and self.config.session_id:
-            from agent.agent_core import SessionTrustManager
-            SessionTrustManager.set_untrusted(self.config.session_id)
-        
-        # P1 & P4: Handle taint and exfiltration for provable_policy defense
-        # (forward_to_email is both taint and exfil)
+        # CRITICAL: Check provable_policy defense FIRST, before any other operations
+        # Tools that are both taint and exfil should ALWAYS be blocked when provable_policy is enabled
         if self.config and self.config.session_id:
             from agent.agent_core import ProvablePolicyManager
-            from agent.tools_registry import is_exfiltration_tool
+            from agent.tools_registry import is_both_taint_and_exfil
             
-            # P4: Check if exfiltration should be blocked (check BEFORE tainting)
-            # If session is already U, block immediately (don't even read from inbox)
-            if not ProvablePolicyManager.is_trusted(self.config.session_id):
+            defense_type = getattr(self.config, 'defense_type', None) if self.config else None
+            is_provable_policy = defense_type == "provable_policy"
+            
+            if is_provable_policy and is_both_taint_and_exfil(self.name):
+                # Mark session as untrusted (since we're attempting to use a taint tool)
+                ProvablePolicyManager.set_untrusted(self.config.session_id)
+                
                 error_msg = (
                     "🛡️ Security Policy: This action has been blocked for safety reasons. "
-                    "The current session has been marked as untrusted because untrusted data was accessed. "
-                    "Exfiltration tools (email sending) are not allowed in untrusted sessions."
+                    "This tool both reads from untrusted sources and sends data externally, "
+                    "which poses a security risk. Exfiltration tools that access untrusted data are not allowed."
                 )
                 
                 # Log blocked tool call
@@ -833,7 +927,7 @@ Important: The original email body and all content is automatically included - y
                         "inputs": {"search_query": search_query, "forward_to": forward_to, "message": message},
                         "call_id": call_id,
                         "blocked": True,
-                        "reason": "provable_policy_exfiltration_blocked"
+                        "reason": "provable_policy_taint_and_exfil_blocked"
                     }
                 )
                 
@@ -849,11 +943,64 @@ Important: The original email body and all content is automatically included - y
                 )
                 
                 return error_msg
+        
+        # Mark session as untrusted BEFORE executing (no_untrusted_tools defense)
+        if self.config and self.config.session_id:
+            from agent.agent_core import SessionTrustManager
+            SessionTrustManager.set_untrusted(self.config.session_id)
+        
+        # P1 & P4: Handle taint and exfiltration for provable_policy defense
+        # (forward_to_email is both taint and exfil)
+        if self.config and self.config.session_id:
+            from agent.agent_core import ProvablePolicyManager
+            from agent.tools_registry import is_exfiltration_tool
+            
+            # Only block if provable_policy defense is enabled
+            defense_type = getattr(self.config, 'defense_type', None) if self.config else None
+            is_provable_policy = defense_type == "provable_policy"
+            
+            if is_provable_policy:
+                # P4: Check if exfiltration should be blocked (for tools that are only exfil, not taint)
+                # If session is already U, block immediately (don't even read from inbox)
+                if not ProvablePolicyManager.is_trusted(self.config.session_id):
+                    error_msg = (
+                        "🛡️ Security Policy: This action has been blocked for safety reasons. "
+                        "The current session has been marked as untrusted because untrusted data was accessed. "
+                        "Exfiltration tools (email sending) are not allowed in untrusted sessions."
+                    )
+                    
+                    # Log blocked tool call
+                    append_trace_event(
+                        self.config.trace_file,
+                        "tool_call",
+                        self.config.session_id,
+                        {
+                            "tool_name": self.name,
+                            "inputs": {"search_query": search_query, "forward_to": forward_to, "message": message},
+                            "call_id": call_id,
+                            "blocked": True,
+                            "reason": "provable_policy_exfiltration_blocked"
+                        }
+                    )
+                    
+                    append_trace_event(
+                        self.config.trace_file,
+                        "tool_result",
+                        self.config.session_id,
+                        {
+                            "tool_name": self.name,
+                            "outputs": {"error": error_msg, "blocked": True},
+                            "call_id": call_id
+                        }
+                    )
+                    
+                    return error_msg
             
             # P1: Mark session as U (taint tool)
-            # Note: Since session was T, we allow the tool to execute (taint and exfil in same action)
-            # But we mark session as U for future tool calls
-            ProvablePolicyManager.set_untrusted(self.config.session_id)
+            # Only mark as untrusted if provable_policy defense is enabled
+            # Note: This should not be reached for tools that are both taint and exfil (they're blocked above)
+            if defense_type == "provable_policy":
+                ProvablePolicyManager.set_untrusted(self.config.session_id)
         
         # Log tool call
         if self.config and self.config.session_id:
@@ -1007,7 +1154,7 @@ Important: The original email body and all content is automatically included - y
 
 class ComposeEmailTool(BaseTool):
     """Tool for composing and sending a new email."""
-    name: str = "compose_email"
+    name: str = "send_email"
     description: str = """Compose and send a new email. Use this for creating original emails (not replies or forwards). The email is sent immediately."""
     args_schema: type[BaseModel] = ComposeEmailInput
     config: Optional[EmailToolsConfig] = None
@@ -1022,12 +1169,25 @@ class ComposeEmailTool(BaseTool):
         if self.config and hasattr(self.config, 'session_id'):
             session_id = self.config.session_id
         
+        # Debug output - always print to help diagnose issues
+        print(f"🔍 [DEBUG] send_email: session_id={session_id}, config={self.config is not None}, config_type={type(self.config).__name__ if self.config else 'None'}")
+        if self.config:
+            print(f"🔍 [DEBUG] send_email: config.session_id={getattr(self.config, 'session_id', 'NOT_SET')}")
+        
         if session_id:
             from agent.agent_core import ProvablePolicyManager
             from agent.tools_registry import is_exfiltration_tool
             
-            # P4: Block exfiltration if session is U
-            if not ProvablePolicyManager.is_trusted(session_id):
+            # P4: Block exfiltration if session is U, but ONLY if provable_policy defense is enabled
+            defense_type = getattr(self.config, 'defense_type', None) if self.config else None
+            is_provable_policy = defense_type == "provable_policy"
+            
+            is_trusted = ProvablePolicyManager.is_trusted(session_id)
+            session_label = ProvablePolicyManager.get_session_label(session_id)
+            will_block = not is_trusted and is_provable_policy
+            print(f"🔍 [DEBUG] send_email: is_trusted={is_trusted}, session_label={session_label}, defense_type={defense_type}, is_provable_policy={is_provable_policy}, will_block={will_block}")
+            
+            if not is_trusted and is_provable_policy:
                 error_msg = (
                     "🛡️ Security Policy: This action has been blocked for safety reasons. "
                     "The current session has been marked as untrusted because untrusted data was accessed. "

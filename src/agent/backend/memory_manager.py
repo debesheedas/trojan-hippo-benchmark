@@ -194,22 +194,34 @@ class MemoryManager:
             # Import here to avoid circular import (agent_core imports memory_manager)
             try:
                 from agent.agent_core import ProvablePolicyManager
-                for entry in self.long_term:
+                print(f"🔍 [DEBUG] get_long_term_as_text: Checking {len(self.long_term)} memories for U labels (session_id={session_id})")
+                found_u_label = False
+                for i, entry in enumerate(self.long_term):
                     # Handle both dict and string formats
                     if isinstance(entry, dict):
                         label = entry.get("label", None)
+                        text_preview = entry.get("text", "")[:50]
+                        print(f"🔍 [DEBUG] Memory {i}: label={label}, text_preview='{text_preview}'")
                         if label == "U":
                             # Upgrade session to U if U-labeled memory is retrieved
+                            print(f"🛡️ [DEBUG] Found U-labeled memory! Upgrading session '{session_id}' to UNTRUSTED")
                             ProvablePolicyManager.set_untrusted(session_id)
+                            found_u_label = True
                             break
                         elif label is None:
                             # Error: memory should have a label when provable_policy is active
                             # This indicates a bug - all memories must have labels
+                            print(f"⚠️ [DEBUG] Memory {i} missing label! text_preview='{text_preview}'")
                             raise ValueError(
                                 f"Explicit memory entry missing label in provable_policy defense. "
                                 f"All memories must have 'label' metadata set to 'T' (Trusted) or 'U' (Untrusted). "
-                                f"Entry text preview: {entry.get('text', '')[:50]}..."
+                                f"Entry text preview: {text_preview}..."
                             )
+                    else:
+                        # Entry is a string, not a dict - this shouldn't happen with provable_policy
+                        print(f"⚠️ [DEBUG] Memory {i} is a string, not a dict: '{str(entry)[:50]}'")
+                if not found_u_label:
+                    print(f"🔍 [DEBUG] No U-labeled memories found. Session '{session_id}' remains trusted.")
             except (ImportError, AttributeError) as e:
                 # If import fails, log warning but continue (shouldn't happen in normal operation)
                 print(f"Warning: Could not import ProvablePolicyManager: {e}")
