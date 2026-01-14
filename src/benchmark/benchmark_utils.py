@@ -33,13 +33,16 @@ def _get_result_path_components(
     Returns:
         Tuple of (backend_for_path, defense_folder)
     """
-    # Handle no memory backend: use "none" as backend name and "none" as defense
+    # Treat "none" memory backend like any other backend - use the actual defense type
+    backend_for_path = memory_backend
+    
+    # Map unified defense to backend-specific defense type
+    # For "none" backend, defenses still work (e.g., provable_policy), so we need to map them
+    # Since "none" backend doesn't have a registered defense backend, we'll use the unified name directly
     if memory_backend == "none":
-        backend_for_path = "none"
-        defense_folder = "none"
+        # For "none" backend, use unified defense name directly (defenses like provable_policy work without memory)
+        defense_folder = unified_defense
     else:
-        backend_for_path = memory_backend
-        # Map unified defense to backend-specific defense type
         defense_registry = get_defense_backend_registry()
         backend_defense = defense_registry.map_defense(memory_backend, unified_defense)
         
@@ -462,7 +465,7 @@ def discover_test_files(
     Intelligently discover test files from a path.
     
     Handles:
-    - Suite keywords (benign, direct, indirect, memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools) -> maps to test_dir/{suite}/
+    - Suite keywords (benign, direct, indirect, memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory) -> maps to test_dir/{suite}/
     - File paths -> returns single file if JSON
     - Directory paths -> finds all JSON files recursively
     
@@ -478,7 +481,8 @@ def discover_test_files(
     """
     
     # Handle suite keywords
-    if test_path in {"benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"}:
+    suite_keywords = {"benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"}
+    if test_path in suite_keywords:
         test_path_obj = test_dir / test_path
     else:
         test_path_obj = Path(test_path)
@@ -487,7 +491,7 @@ def discover_test_files(
     if not test_path_obj.exists():
         if verbose:
             print(f"⚠️  Test path not found: {test_path}")
-            if test_path in {"benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"}:
+            if test_path in suite_keywords:
                 print(f"   Expected location: {test_path_obj}")
                 print(f"   Unified test directory: {test_dir}")
         return []
@@ -511,21 +515,21 @@ def discover_test_files(
 
 def determine_attack_type(test_file: Path, test_def: Optional[Dict[str, Any]] = None) -> str:
     """
-    Determine the attack_type for a test file, handling memory_only, assistant_responses, untrusted_probe, untrusted_send, and disable_send tests specially.
+    Determine the attack_type for a test file, handling memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, and long_memory tests specially.
 
-    Memory_only, assistant_responses, untrusted_probe, untrusted_send, and disable_send tests should be saved to their respective folders even if they have
+    Memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, and long_memory tests should be saved to their respective folders even if they have
     attack_type="benign" in their JSON. This function detects these tests by:
-    1. Checking if "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", or "disable_send" is in the test file path
-    2. Checking if the filename starts with "memory_only_", "assistant_responses_", "untrusted_probe_", "untrusted_send_", or "disable_send_"
+    1. Checking if "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", or "long_memory" is in the test file path
+    2. Checking if the filename starts with "memory_only_", "assistant_responses_", "untrusted_probe_", "untrusted_send_", "disable_send_", "memory_tools_", or "long_memory_"
     
     Args:
         test_file: Path to test file
         test_def: Optional test definition dict (if already loaded)
         
     Returns:
-        Attack type string ("benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", or "memory_tools")
+        Attack type string ("benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", or "long_memory")
     """
-    # Check if this is a memory_only, assistant_responses, untrusted_probe, untrusted_send, or disable_send test by path or filename
+    # Check if this is a memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, or long_memory test by path or filename
     test_file_str = str(test_file)
     if "memory_only" in test_file_str or test_file.name.startswith("memory_only_"):
         return "memory_only"
@@ -539,6 +543,8 @@ def determine_attack_type(test_file: Path, test_def: Optional[Dict[str, Any]] = 
         return "disable_send"
     if "memory_tools" in test_file_str or test_file.name.startswith("memory_tools_"):
         return "memory_tools"
+    if "long_memory" in test_file_str or test_file.name.startswith("long_memory_"):
+        return "long_memory"
     
     # Otherwise, use attack_type from test definition if available
     if test_def:

@@ -476,7 +476,7 @@ def _run_single_combination(
     # Determine attack type from test_path (needed for result paths)
     test_dir = Path("data/benchmark/tests")
     if isinstance(test_path, str):
-        if test_path in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"]:
+        if test_path in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"]:
             attack_type = test_path
         else:
             # Try to determine from path
@@ -807,7 +807,7 @@ def run_all_combinations(
         model_arg = f"--model {target_model_name}" if target_model_name else ""
         
         print(f"\nTo rerun only the failed combinations, use:")
-        if "suite" in test_path or test_path in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"]:
+        if "suite" in test_path or test_path in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"]:
             print(f"  python scripts/run_benchmark.py --suite {test_path} {model_arg} \\")
         else:
             print(f"  python scripts/run_benchmark.py --test {test_path} {model_arg} \\")
@@ -918,6 +918,16 @@ Examples:
     )
     
     parser.add_argument(
+        "--defense",
+        type=str,
+        nargs="+",
+        choices=UNIFIED_DEFENSE_TYPES,
+        dest="defense_type",  # Use same dest as --defense-type
+        help="Alias for --defense-type. Defense type(s) to run. Can specify multiple (e.g., --defense none user_prompt_only). "
+             "If not specified, all defense types are used."
+    )
+    
+    parser.add_argument(
         "--all-defenses",
         action="store_true",
         help="DEPRECATED: Use --defense-type without arguments or omit it to run all defenses. "
@@ -933,8 +943,8 @@ Examples:
     parser.add_argument(
         "--suite",
         type=str,
-        choices=["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"],
-        help="Test suite to run (benign, direct, indirect, memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, or memory_tools)"
+        choices=["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"],
+        help="Test suite to run (benign, direct, indirect, memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, or long_memory)"
     )
     
     parser.add_argument(
@@ -1006,6 +1016,14 @@ Examples:
     else:
         # Default: all defense types
         defense_types = UNIFIED_DEFENSE_TYPES
+    
+    # Debug output: show what will be run
+    print(f"\n{'='*80}")
+    print(f"Configuration:")
+    print(f"  Memory backends: {memory_backends}")
+    print(f"  Defense types: {defense_types}")
+    print(f"  Total combinations: {len(memory_backends) * len(defense_types)}")
+    print(f"{'='*80}\n")
     
     # Determine if we're running multiple combinations
     # Multiple combinations if:

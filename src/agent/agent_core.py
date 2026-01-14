@@ -8,11 +8,18 @@ remains framework-agnostic so benchmarks/tests can call it directly.
 
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
+
+# Try to import tiktoken for token counting
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    TIKTOKEN_AVAILABLE = False
 
 from agent.tools_registry import create_all_tools
 from agent.tool_specifications.email_tools import EmailToolsConfig
@@ -188,6 +195,146 @@ def _get_session_memory(session_id: str) -> list:
         if session_id not in _session_labels:
             ProvablePolicyManager.initialize_session(session_id)
     return _session_store[session_id]
+
+
+def _truncate_session_messages(
+    messages: List[Dict[str, str]],
+    model_name: str,
+    max_tokens: Optional[int] = None,
+    buffer_tokens: int = 50000
+) -> List[Dict[str, str]]:
+    """
+    Truncate session messages using LangChain's recommended approach.
+    
+    Uses LangChain's built-in `trim_messages` function from `langchain_core.messages`.
+    This is LangChain's official solution for handling token limits in conversation history.
+    
+    Raises ImportError if LangChain utilities are not available.
+    Raises RuntimeError if trim_messages fails for any reason.
+    
+    This ensures we don't exceed the model's context window when passing conversation history to LangChain.
+    LangChain's ChatOpenAI does NOT automatically truncate messages - it passes them directly to the API.
+    
+    Args:
+        messages: List of message dicts with 'role' and 'content' keys
+        model_name: Model name for tokenizer (e.g., 'gpt-5-mini')
+        max_tokens: Maximum tokens to keep (None = calculate from model context window)
+        buffer_tokens: Buffer tokens to reserve for system prompt, generation, etc.
+        
+    Returns:
+        Truncated list of messages (most recent messages that fit within token limit)
+        
+    Raises:
+        ImportError: If langchain_core.messages or tiktoken is not available
+        RuntimeError: If trim_messages fails for any reason
+    """
+    if not messages:
+        return messages
+    
+    # Calculate max tokens if not provided
+    if max_tokens is None:
+        # Model context window sizes (approximate)
+        model_context_windows = {
+            "gpt-5-mini": 400000,  # GPT-5 Mini: 400k context window
+            "gpt-4o": 128000,
+            "gpt-4o-mini": 128000,
+            "gpt-4.1-mini": 1000000,
+            "o1": 200000,
+            "o1-mini": 200000,
+            "claude-3-7-sonnet": 200000,
+            "gemini-2.0-flash": 1000000,
+        }
+        
+        # Get model's context window, default to 128000 if unknown
+        context_window = model_context_windows.get(model_name.lower(), 128000)
+        # Reserve buffer for system prompt, generation tokens, etc.
+        max_tokens = max(0, context_window - buffer_tokens)
+    
+    # Use LangChain's built-in trim_messages function (required - no fallback)
+    # This is LangChain's official solution for handling token limits
+    try:
+        from langchain_core.messages import trim_messages, HumanMessage, AIMessage, SystemMessage
+    except ImportError as e:
+        raise ImportError(
+            f"langchain_core.messages is required for message truncation. "
+            f"Install with: pip install langchain-core>=1.0.0. "
+            f"Original error: {e}"
+        ) from e
+    
+    if not TIKTOKEN_AVAILABLE:
+        raise ImportError(
+            "tiktoken is required for accurate token counting in message truncation. "
+            "Install with: pip install tiktoken"
+        )
+    
+    # Convert our dict format to LangChain message objects
+    langchain_messages = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "user":
+            langchain_messages.append(HumanMessage(content=content))
+        elif role == "assistant":
+            langchain_messages.append(AIMessage(content=content))
+        elif role == "system":
+            langchain_messages.append(SystemMessage(content=content))
+        else:
+            # Default to human message for unknown roles
+            langchain_messages.append(HumanMessage(content=content))
+    
+    # Create a token counter function using tiktoken
+    try:
+        try:
+            tokenizer = tiktoken.encoding_for_model(model_name)
+        except KeyError:
+            tokenizer = tiktoken.encoding_for_model("gpt-4o-mini")
+        
+        def token_counter(msgs):
+            """Count tokens for LangChain messages."""
+            total = 0
+            for msg in msgs:
+                # Format similar to OpenAI API
+                if hasattr(msg, 'content'):
+                    text = str(msg.content)
+                else:
+                    text = str(msg)
+                total += len(tokenizer.encode(text, disallowed_special=()))
+            return total
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to create token counter for message truncation: {e}"
+        ) from e
+    
+    # Use LangChain's trim_messages with "last" strategy (keep most recent messages)
+    # This is LangChain's recommended approach for handling token limits
+    try:
+        trimmed = trim_messages(
+            langchain_messages,
+            max_tokens=max_tokens,
+            strategy="last",  # Keep most recent messages (sliding window)
+            token_counter=token_counter,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"LangChain's trim_messages failed: {e}. "
+            f"This may indicate an issue with the message format or token counter."
+        ) from e
+    
+    # Convert back to dict format
+    result = []
+    for msg in trimmed:
+        if isinstance(msg, HumanMessage):
+            result.append({"role": "user", "content": msg.content})
+        elif isinstance(msg, AIMessage):
+            result.append({"role": "assistant", "content": msg.content})
+        elif isinstance(msg, SystemMessage):
+            result.append({"role": "system", "content": msg.content})
+    
+    if len(result) < len(messages):
+        print(f"⚠️  Trimmed session messages from {len(messages)} to {len(result)} messages using LangChain's trim_messages (max_tokens: {max_tokens})")
+    
+    # Always keep at least the last message (even if it exceeds limit)
+    return result if result else messages[-1:]
 
 
 def clear_agent_cache():
@@ -512,6 +659,12 @@ def _create_agent_executor_for_python(
                 session_id=session_id,
                 defense_type=explicit_defense_type
             )
+            # Debug: Log explicit memory loading
+            if explicit_memory_context:
+                memory_lines = explicit_memory_context.split('\n')
+                print(f"📝 Loaded {len(memory_manager.long_term)} explicit memories into system prompt ({len(explicit_memory_context)} chars, {len(memory_lines)} lines)")
+            else:
+                print(f"📝 No explicit memories loaded (memory file: {memory_file})")
         except Exception as e:
             print(f"Warning: Could not load explicit memory: {e}")
             explicit_memory_context = ""
@@ -642,8 +795,17 @@ def invoke_agent(
             if mem0_context:
                 mem0_context = "\n\n# Relevant Mem0 Memory Context\n" + mem0_context + "\n"
         except Exception as e:
-            print(f"Warning: Could not retrieve mem0 memory context: {e}")
-            mem0_context = ""
+            # Re-raise Mem0TimeoutError to ensure test results are marked as unreliable
+            from agent.backend.mem0_memory_manager import Mem0TimeoutError
+            if isinstance(e, Mem0TimeoutError):
+                # Re-raise timeout errors - these indicate unreliable results
+                print(f"❌ CRITICAL ERROR: mem0 memory retrieval timed out: {e}")
+                print(f"   Test results are UNRELIABLE - the API call was not successful.")
+                raise
+            else:
+                # For other errors, log as warning but continue (agent can function without context)
+                print(f"Warning: Could not retrieve mem0 memory context: {e}")
+                mem0_context = ""
 
     # Retrieve context memory if enabled
     context_memory_config = cfg.get("memory", {}).get("context_memory", {})
@@ -670,31 +832,19 @@ def invoke_agent(
         try:
             from agent.backend.context_memory_manager import get_context_memory_manager
             
-            # Get max_context_length from config, or calculate based on model
+            # Get max_context_length from config
+            # For context memory backend, we set max_context_length to None to allow context memory
+            # to grow freely. LangChain's trim_messages will handle ALL truncation on the combined
+            # message list (context memory + current session + current user message) using the API limit.
+            # This is cleaner and more robust - we let LangChain's built-in sliding window handle everything.
             max_context_length = context_memory_config.get("max_context_length")
             if max_context_length is None:
-                # Calculate reasonable default: model context window - buffer - generation tokens
-                # Default buffer: 50000 tokens, generation: 2000 tokens
-                # For common models:
-                model_name = cfg.get("agent", {}).get("target_model_name", "gpt-5-mini")
-                buffer_length = context_memory_config.get("buffer_length", 50000)
-                generation_max_length = cfg.get("benchmark", {}).get("dspy", {}).get("max_tokens", 2000)
-                
-                # Model context window sizes (approximate)
-                model_context_windows = {
-                    "gpt-5-mini": 400000,  # GPT-5 Mini: 400k context window
-                    "gpt-4o": 128000,
-                    "gpt-4o-mini": 128000,
-                    "gpt-4.1-mini": 1000000,
-                    "o1": 200000,
-                    "o1-mini": 200000,
-                    "claude-3-7-sonnet": 200000,
-                    "gemini-2.0-flash": 1000000,
-                }
-                
-                # Get model's context window, default to 128000 if unknown
-                context_window = model_context_windows.get(model_name.lower(), 128000)
-                max_context_length = max(0, context_window - buffer_length - generation_max_length)
+                # Set to None to allow context memory to grow freely
+                # LangChain's trim_messages will handle truncation of the entire message list
+                max_context_length = None
+                print(f"🔧 max_context_length set to None - context memory can grow freely, LangChain's trim_messages will handle truncation")
+            else:
+                print(f"🔧 Using config max_context_length: {max_context_length} tokens")
             
             context_memory_manager = get_context_memory_manager(
                 context_path=context_memory_config.get("context_path", "data/interactive_agent/context_memory.json"),
@@ -717,22 +867,144 @@ def invoke_agent(
             traceback.print_exc()
             context_memory_context = ""
     
-    # Get session history
+    # Get session history (full history - we'll truncate only when passing to agent)
     session_messages = _get_session_memory(session_id)
     
-    # Add user message to session (with RAG, mem0, and context memory if available)
-    context_parts = []
-    if rag_context:
-        context_parts.append(rag_context)
-    if mem0_context:
-        context_parts.append(mem0_context)
-    if context_memory_context:
-        context_parts.append(context_memory_context)
-    user_message = "".join(context_parts) + text if context_parts else text
-    session_messages.append({"role": "user", "content": user_message})
+    # UNIFIED TOKEN BUDGET MANAGEMENT USING LANGCHAIN'S trim_messages
+    # Instead of custom string truncation, we use LangChain's trim_messages on the ENTIRE
+    # message list (session history + current user message with context).
+    # This leverages LangChain's built-in sliding window logic for everything.
+    #
+    # This approach works for ALL memory backends because LangChain handles all truncation.
     
-    # Prepare input for the agent
-    inputs = {"messages": session_messages}
+    model_name = cfg.get("agent", {}).get("target_model_name", "gpt-5-mini")
+    
+    # API token limits (actual limits enforced by the API, may be lower than model context window)
+    # These are the actual limits we can use, not the theoretical model context windows
+    api_token_limits = {
+        "gpt-5-mini": 272000,  # API limit (lower than 400k context window)
+        "gpt-4o": 128000,
+        "gpt-4o-mini": 128000,
+        "gpt-4.1-mini": 1000000,
+        "o1": 200000,
+        "o1-mini": 200000,
+        "claude-3-7-sonnet": 200000,
+        "gemini-2.0-flash": 1000000,
+    }
+    api_limit = api_token_limits.get(model_name.lower(), 128000)
+    
+    buffer_tokens = cfg.get("memory", {}).get("context_memory", {}).get("buffer_length", 50000)
+    generation_max_length = cfg.get("benchmark", {}).get("dspy", {}).get("max_tokens", 2000)
+    
+    # Check if we're using context memory backend
+    memory_backend = cfg.get("memory", {}).get("backend", "explicit")
+    is_context_memory_backend = (memory_backend == "context")
+    
+    # For context memory backend: Structure messages so previous session memory can be evicted first,
+    # keeping current session messages (which are more relevant) and current user message.
+    if is_context_memory_backend and context_memory_context:
+        # Build user message with RAG and mem0 context (but NOT context memory - that goes separately)
+        context_parts = []
+        if rag_context:
+            context_parts.append(rag_context)
+        if mem0_context:
+            context_parts.append(mem0_context)
+        user_message = "".join(context_parts) + text if context_parts else text
+        
+        # Structure messages for context memory backend with priority order:
+        # 1. Previous session memory (from context_memory_context) - can be evicted FIRST if needed
+        # 2. Current session messages (session_messages) - should be preserved (more relevant)
+        # 3. Current user message - must be kept (most recent)
+        #
+        # LangChain's trim_messages with "last" strategy keeps messages from the END.
+        # Structure as: [context_memory_message, ...current_session, current_user]
+        # With "last" strategy, it will keep from the end: [current_user, ...all_current_session, ...some_context_memory]
+        # This ensures context memory (at the beginning) is evicted FIRST, preserving current session messages.
+        
+        # Convert context memory to a message (previous sessions) - put at the BEGINNING so it's evicted first
+        previous_session_memory_message = {"role": "system", "content": context_memory_context}
+        
+        # Build message list: context memory FIRST (will be evicted first), then current session, then current user
+        # This way "last" strategy will keep: current_user + all_current_session + as much context_memory as fits
+        all_messages = [previous_session_memory_message] + session_messages.copy()
+        all_messages.append({"role": "user", "content": user_message})
+        
+        # Debug: Log the structure for context memory backend
+        print(f"📋 Context memory backend: Structured {len(all_messages)} messages")
+        print(f"   - Previous session memory: 1 message ({len(context_memory_context)} chars)")
+        print(f"   - Current session messages: {len(session_messages)} messages")
+        print(f"   - Current user message: 1 message")
+        print(f"   - Order: [context_memory, ...current_session, current_user] (context memory will be evicted first if needed)")
+        
+        # Add current user message to session for future turns (without context memory prepended)
+        session_messages.append({"role": "user", "content": user_message})
+        
+    else:
+        # For other backends: Standard approach - add all context to user message
+        context_parts = []
+        if rag_context:
+            context_parts.append(rag_context)
+        if mem0_context:
+            context_parts.append(mem0_context)
+        if context_memory_context:
+            context_parts.append(context_memory_context)
+        user_message = "".join(context_parts) + text if context_parts else text
+        
+        # Add user message to session (full message with context)
+        session_messages.append({"role": "user", "content": user_message})
+        
+        # Use session messages as-is
+        all_messages = session_messages.copy()
+    
+    # Calculate max tokens available for ALL messages (session history + current message)
+    # Use API limit (not model context window) to ensure we don't exceed actual limits
+    # Reserve tokens for system prompt, generation, and buffer
+    system_prompt_tokens = 5000  # Approximate system prompt size
+    reserved_tokens = system_prompt_tokens + generation_max_length + buffer_tokens
+    max_tokens_for_all_messages = max(0, api_limit - reserved_tokens)
+    
+    # Use LangChain's trim_messages on the ENTIRE message list
+    # For context memory backend: This will keep context memory (first message) + most recent current session messages
+    # For other backends: Standard sliding window behavior
+    messages_for_agent = _truncate_session_messages(
+        all_messages,  # Use structured message list
+        model_name=model_name,
+        max_tokens=max_tokens_for_all_messages,
+        buffer_tokens=0  # Already accounted for above
+    )
+    
+    if len(messages_for_agent) < len(all_messages):
+        original_count = len(all_messages)
+        if is_context_memory_backend and context_memory_context:
+            # For context memory backend, all_messages includes context memory message
+            original_count = len(all_messages) - 1  # Subtract context memory message for display
+        print(f"⚠️  Trimmed messages from {original_count} to {len(messages_for_agent)} messages using LangChain's trim_messages")
+        if is_context_memory_backend and context_memory_context:
+            print(f"   (Context memory backend: previous session memory preserved, current session messages may be evicted)")
+        print(f"   Max tokens for all messages: {max_tokens_for_all_messages} (API limit: {api_limit}, reserved: {reserved_tokens})")
+        
+        # Debug: Count actual tokens in trimmed messages to verify
+        if TIKTOKEN_AVAILABLE:
+            try:
+                try:
+                    tokenizer = tiktoken.encoding_for_model(model_name)
+                except KeyError:
+                    tokenizer = tiktoken.encoding_for_model("gpt-4o-mini")
+                
+                total_tokens = 0
+                for msg in messages_for_agent:
+                    content = msg.get("content", "")
+                    total_tokens += len(tokenizer.encode(content, disallowed_special=()))
+                
+                if total_tokens > api_limit:
+                    print(f"   ⚠️  WARNING: Trimmed messages still have {total_tokens} tokens, exceeding API limit of {api_limit}")
+                else:
+                    print(f"   ✅ Trimmed messages have {total_tokens} tokens (within API limit)")
+            except Exception as e:
+                print(f"   ⚠️  Could not verify token count: {e}")
+    
+    # Prepare input for the agent (use truncated version)
+    inputs = {"messages": messages_for_agent}
     
     # Invoke the agent
     print(f"🔄 Invoking LLM agent (model: {cfg.get('agent', {}).get('target_model_name', 'unknown')})...")
@@ -1023,9 +1295,20 @@ Following is a conversation between the user and the assistant. You have to extr
                         else:
                             print(f"\n⚠️ No memories extracted from conversation")
         except Exception as e:
-            print(f"Warning: Could not store conversation in mem0 memory: {e}")
-            import traceback
-            traceback.print_exc()
+            # Re-raise Mem0TimeoutError to ensure test results are marked as unreliable
+            # This is a critical error that indicates the API call failed
+            from agent.backend.mem0_memory_manager import Mem0TimeoutError
+            if isinstance(e, Mem0TimeoutError):
+                # Re-raise timeout errors - these indicate unreliable results
+                print(f"❌ CRITICAL ERROR: mem0 memory operation timed out: {e}")
+                print(f"   Test results are UNRELIABLE - the API call was not successful.")
+                raise
+            else:
+                # For other errors, log as warning but don't fail the test
+                # (these might be non-critical issues like network hiccups)
+                print(f"Warning: Could not store conversation in mem0 memory: {e}")
+                import traceback
+                traceback.print_exc()
     
     # Store conversation in context memory if enabled
     # Skip entirely if defense_type is "disable_memory"
@@ -1049,29 +1332,16 @@ Following is a conversation between the user and the assistant. You have to extr
                 # Get context memory manager (reuse same config as retrieval)
                 from agent.backend.context_memory_manager import get_context_memory_manager
                 
-                # Get max_context_length from config, or calculate based on model
+                # Get max_context_length from config
+                # For context memory backend, we set max_context_length to None to allow context memory
+                # to grow freely. LangChain's trim_messages will handle ALL truncation on the combined
+                # message list (context memory + current session + current user message) using the API limit.
+                # This is cleaner and more robust - we let LangChain's built-in sliding window handle everything.
                 max_context_length = context_memory_config.get("max_context_length")
                 if max_context_length is None:
-                    # Calculate reasonable default: model context window - buffer - generation tokens
-                    model_name = cfg.get("agent", {}).get("target_model_name", "gpt-5-mini")
-                    buffer_length = context_memory_config.get("buffer_length", 40000)  # Default updated for GPT-5 Mini
-                    generation_max_length = cfg.get("benchmark", {}).get("dspy", {}).get("max_tokens", 2000)
-                    
-                    # Model context window sizes (approximate)
-                    model_context_windows = {
-                        "gpt-5-mini": 400000,  # GPT-5 Mini: 400k context window
-                        "gpt-4o": 128000,
-                        "gpt-4o-mini": 128000,
-                        "gpt-4.1-mini": 1000000,
-                        "o1": 200000,
-                        "o1-mini": 200000,
-                        "claude-3-7-sonnet": 200000,
-                        "gemini-2.0-flash": 1000000,
-                    }
-                    
-                    # Get model's context window, default to 128000 if unknown
-                    context_window = model_context_windows.get(model_name.lower(), 128000)
-                    max_context_length = max(0, context_window - buffer_length - generation_max_length)
+                    # Set to None to allow context memory to grow freely
+                    # LangChain's trim_messages will handle truncation of the entire message list
+                    max_context_length = None
                 
                 context_memory_manager = get_context_memory_manager(
                     context_path=context_memory_config.get("context_path", "data/interactive_agent/context_memory.json"),
@@ -1094,9 +1364,12 @@ Following is a conversation between the user and the assistant. You have to extr
         except Exception as e:
             print(f"Warning: Could not store conversation in context memory: {e}")
     
-    # Keep only last 15 messages (similar to old behavior)
-    if len(session_messages) > 15:
-        session_messages = session_messages[-15:]
+    # Note: We already truncated messages before passing to agent (token-based sliding window)
+    # No need to truncate again here - the session_messages list already contains the truncated version
+    # However, we should still limit the stored session to prevent unbounded growth
+    # Keep a reasonable maximum (but token-based truncation is the primary mechanism)
+    if len(session_messages) > 50:  # Increased from 15 to 50, but token-based truncation is primary
+        session_messages = session_messages[-50:]
 
     # Log agent response to traces (with error handling)
     try:

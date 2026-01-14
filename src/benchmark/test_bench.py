@@ -2596,7 +2596,7 @@ class TestBench:
         print(f"Found {len(test_files)} test files")
         
         # Group tests by attack_type for better organization
-        test_groups = {"benign": [], "direct": [], "indirect": [], "memory_only": [], "assistant_responses": [], "untrusted_probe": [], "untrusted_send": [], "disable_send": [], "memory_tools": [], "unknown": []}
+        test_groups = {"benign": [], "direct": [], "indirect": [], "memory_only": [], "assistant_responses": [], "untrusted_probe": [], "untrusted_send": [], "disable_send": [], "memory_tools": [], "long_memory": [], "unknown": []}
         for test_file in test_files:
             try:
                 with open(test_file, 'r', encoding='utf-8') as f:

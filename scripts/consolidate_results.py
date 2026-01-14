@@ -4,8 +4,12 @@ Results Consolidation Script with CSV and Plots
 
 Generates comprehensive CSV tables and visualizations for each test suite:
 - CSV files with success percentages for each memory backend and defense type
-- Bar charts and heatmaps showing performance across configurations
-- Separate files for each suite: benign, direct, indirect, memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools
+- Heatmaps showing performance across configurations
+- Combined heatmap with all suites as subplots
+- Average heatmap across all test suites
+- Combined CSV listing all test suites one below the other
+- Average summary CSV with all 25 combinations (5 memory backends × 5 defense types)
+- Separate files for each suite: benign, direct, indirect, memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory
 
 Usage:
     python scripts/consolidate_results.py
@@ -178,7 +182,7 @@ def discover_models_and_attack_types(results_base_dir: Path) -> Tuple[List[str],
                     for defense_dir in backend_dir.iterdir():
                         if defense_dir.is_dir():
                             for attack_dir in defense_dir.iterdir():
-                                if attack_dir.is_dir() and attack_dir.name in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"]:
+                                if attack_dir.is_dir() and attack_dir.name in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"]:
                                     attack_types.add(attack_dir.name)
     
     return (sorted(list(models)), sorted(list(attack_types)))
@@ -259,93 +263,8 @@ def generate_csv(
     return output_file
 
 
-def generate_bar_chart(
-    model_name: str,
-    attack_type: str,
-    data: Dict[str, Dict[str, Tuple[int, int, float, bool]]],
-    output_dir: Path
-) -> Path:
-    """
-    Generate a bar chart showing success rates by defense type and memory backend.
-    """
-    if not PLOTTING_AVAILABLE:
-        raise ImportError("matplotlib and seaborn are required for plotting. Install with: pip install matplotlib seaborn")
-    
-    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
-    backend_labels = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
-    defense_types = UNIFIED_DEFENSE_TYPES
-    defense_labels = [dt.replace("_", " ").title() for dt in defense_types]
-    
-    # Prepare data for plotting
-    rates = []
-    has_errors_matrix = []
-    for defense_type in defense_types:
-        rate_row = []
-        error_row = []
-        for backend in memory_backends:
-            _, _, rate, has_errors = data[defense_type][backend]
-            rate_row.append(rate)
-            error_row.append(has_errors)
-        rates.append(rate_row)
-        has_errors_matrix.append(error_row)
-    
-    rates = np.array(rates)
-    has_errors_matrix = np.array(has_errors_matrix)
-    
-    # Create figure
-    _, ax = plt.subplots(figsize=(14, 8))
-    
-    # Set up bar positions
-    x = np.arange(len(defense_types))
-    width = 0.15  # Width of bars
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
-    error_color = '#ff0000'  # Red for errors
-    
-    # Plot bars for each memory backend
-    for i, (backend, label, color) in enumerate(zip(memory_backends, backend_labels, colors)):
-        values = rates[:, i]
-        errors = has_errors_matrix[:, i]
-        # Plot normal bars (non-error cases with rate > 0)
-        normal_mask = (values > 0) & (~errors)
-        if np.any(normal_mask):
-            ax.bar(x[normal_mask] + i * width, values[normal_mask], width, label=label, color=color, alpha=0.8)
-        # Plot error bars (red, at 0 height but with "ERR" label)
-        error_mask = errors
-        if np.any(error_mask):
-            ax.bar(x[error_mask] + i * width, [0.5] * np.sum(error_mask), width, 
-                   color=error_color, alpha=0.8, edgecolor='black', linewidth=2)
-    
-    # Customize plot
-    ax.set_xlabel('Defense Type', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Success Rate (%)', fontsize=12, fontweight='bold')
-    ax.set_title(f'{model_name.upper()} - {attack_type.replace("_", " ").title()} Suite\nSuccess Rate by Defense Type and Memory Backend', 
-                 fontsize=14, fontweight='bold', pad=20)
-    ax.set_xticks(x + width * 2)  # Center ticks
-    ax.set_xticklabels(defense_labels, rotation=45, ha='right')
-    ax.set_ylim((0, 105))
-    ax.legend(loc='upper left', frameon=True, fancybox=True, shadow=True)
-    ax.grid(axis='y', alpha=0.3, linestyle='--')
-    
-    # Add value labels on bars
-    for i, defense_type in enumerate(defense_types):
-        for j, backend in enumerate(memory_backends):
-            _, _, rate, has_errors = data[defense_type][backend]
-            if has_errors:
-                # Show "ERR" for error cases
-                ax.text(i + j * width, 2, 'ERR', 
-                       ha='center', va='bottom', fontsize=8, fontweight='bold', color='red')
-            elif rate > 0:
-                ax.text(i + j * width, rate + 1, f'{rate:.1f}%', 
-                       ha='center', va='bottom', fontsize=8)
-    
-    plt.tight_layout()
-    
-    # Save figure
-    output_file = output_dir / f"{model_name}_{attack_type}_bar_chart.png"
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    return output_file
+# Bar chart generation temporarily removed per user request
+# def generate_bar_chart(...) - commented out
 
 
 def generate_heatmap(
@@ -428,6 +347,222 @@ def generate_heatmap(
     return output_file
 
 
+def generate_combined_heatmaps_subplot(
+    model_name: str,
+    all_data: Dict[str, Dict[str, Dict[str, Tuple[int, int, float, bool]]]],
+    output_dir: Path
+) -> Path:
+    """
+    Generate a combined plot with all test suites as subplots.
+    Each subplot is a heatmap for one test suite.
+    
+    Args:
+        model_name: Model name
+        all_data: Dictionary {attack_type: {defense_type: {memory_backend: (passed, total, rate, has_errors)}}}
+        output_dir: Output directory
+    """
+    if not PLOTTING_AVAILABLE:
+        raise ImportError("matplotlib and seaborn are required for plotting. Install with: pip install matplotlib seaborn")
+    
+    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
+    backend_labels = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
+    defense_types = UNIFIED_DEFENSE_TYPES
+    defense_labels = [dt.replace("_", " ").title() for dt in defense_types]
+    
+    # Get all attack types sorted
+    attack_types = sorted(all_data.keys())
+    n_suites = len(attack_types)
+    
+    # Calculate grid dimensions
+    n_cols = min(3, n_suites)  # 3 columns max
+    n_rows = (n_suites + n_cols - 1) // n_cols  # Ceiling division
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
+    if n_suites == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
+    
+    # Generate heatmap for each suite
+    for idx, attack_type in enumerate(attack_types):
+        ax = axes[idx]
+        data = all_data[attack_type]
+        
+        # Prepare data matrix
+        rates_matrix = []
+        has_errors_matrix = []
+        for defense_type in defense_types:
+            rate_row = []
+            error_row = []
+            for backend in memory_backends:
+                _, _, rate, has_errors = data[defense_type][backend]
+                rate_row.append(rate)
+                error_row.append(has_errors)
+            rates_matrix.append(rate_row)
+            has_errors_matrix.append(error_row)
+        
+        rates_matrix = np.array(rates_matrix)
+        has_errors_matrix = np.array(has_errors_matrix)
+        
+        # For error cases, set to NaN
+        display_matrix = rates_matrix.copy().astype(float)
+        display_matrix[has_errors_matrix] = np.nan
+        
+        # Create heatmap
+        sns.heatmap(display_matrix, 
+                    annot=True, 
+                    fmt='.1f',
+                    cmap='RdYlGn',
+                    vmin=0, 
+                    vmax=100,
+                    cbar_kws={'label': 'Success Rate (%)'},
+                    xticklabels=backend_labels,
+                    yticklabels=defense_labels,
+                    linewidths=0.5,
+                    linecolor='gray',
+                    ax=ax,
+                    mask=has_errors_matrix)
+        
+        # Add error annotations
+        for i in range(len(defense_types)):
+            for j in range(len(memory_backends)):
+                if has_errors_matrix[i, j]:
+                    ax.text(j + 0.5, i + 0.5, 'ERR', 
+                           ha='center', va='center', fontsize=8, fontweight='bold', 
+                           color='red', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        # Set title for subplot
+        suite_label = attack_type.replace("_", " ").title()
+        ax.set_title(f'{suite_label}', fontsize=11, fontweight='bold')
+        ax.set_xlabel('Memory Backend', fontsize=9)
+        ax.set_ylabel('Defense Type', fontsize=9)
+    
+    # Hide unused subplots
+    for idx in range(n_suites, len(axes)):
+        axes[idx].axis('off')
+    
+    # Main title
+    fig.suptitle(f'{model_name.upper()} - All Test Suites\nSuccess Rate Heatmaps', 
+                 fontsize=16, fontweight='bold', y=0.995)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.99])
+    
+    # Save figure
+    output_file = output_dir / f"{model_name}_all_suites_combined_heatmap.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    return output_file
+
+
+def generate_average_heatmap(
+    model_name: str,
+    all_data: Dict[str, Dict[str, Dict[str, Tuple[int, int, float, bool]]]],
+    output_dir: Path
+) -> Path:
+    """
+    Generate a heatmap showing average success rates across all test suites.
+    Rows: Defense types, Columns: Memory backends
+    
+    Args:
+        model_name: Model name
+        all_data: Dictionary {attack_type: {defense_type: {memory_backend: (passed, total, rate, has_errors)}}}
+        output_dir: Output directory
+    """
+    if not PLOTTING_AVAILABLE:
+        raise ImportError("matplotlib and seaborn are required for plotting. Install with: pip install matplotlib seaborn")
+    
+    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
+    backend_labels = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
+    defense_types = UNIFIED_DEFENSE_TYPES
+    defense_labels = [dt.replace("_", " ").title() for dt in defense_types]
+    
+    # Calculate averages across all suites
+    # For each defense/backend combination, average the rates (excluding error cases)
+    rates_matrix = []
+    has_errors_matrix = []
+    
+    for defense_type in defense_types:
+        rate_row = []
+        error_row = []
+        for backend in memory_backends:
+            rates = []
+            has_any_errors = False
+            
+            # Collect rates from all suites for this combination
+            for attack_type in all_data.keys():
+                _, _, rate, has_errors = all_data[attack_type][defense_type][backend]
+                if has_errors:
+                    has_any_errors = True
+                else:
+                    # Only include non-error rates in average
+                    rates.append(rate)
+            
+            if has_any_errors:
+                # If any suite has errors, mark as error
+                avg_rate = 0.0
+                error_row.append(True)
+            elif len(rates) > 0:
+                avg_rate = np.mean(rates)
+                error_row.append(False)
+            else:
+                avg_rate = 0.0
+                error_row.append(False)
+            
+            rate_row.append(avg_rate)
+        
+        rates_matrix.append(rate_row)
+        has_errors_matrix.append(error_row)
+    
+    rates_matrix = np.array(rates_matrix)
+    has_errors_matrix = np.array(has_errors_matrix)
+    
+    # Create heatmap
+    _, ax = plt.subplots(figsize=(10, 8))
+    
+    # For error cases, set to NaN
+    display_matrix = rates_matrix.copy().astype(float)
+    display_matrix[has_errors_matrix] = np.nan
+    
+    # Create heatmap
+    sns.heatmap(display_matrix, 
+                annot=True, 
+                fmt='.1f',
+                cmap='RdYlGn',
+                vmin=0, 
+                vmax=100,
+                cbar_kws={'label': 'Average Success Rate (%)'},
+                xticklabels=backend_labels,
+                yticklabels=defense_labels,
+                linewidths=1,
+                linecolor='gray',
+                ax=ax,
+                mask=has_errors_matrix)
+    
+    # Add error annotations
+    for i in range(len(defense_types)):
+        for j in range(len(memory_backends)):
+            if has_errors_matrix[i, j]:
+                ax.text(j + 0.5, i + 0.5, 'ERR', 
+                       ha='center', va='center', fontsize=10, fontweight='bold', 
+                       color='red', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    ax.set_xlabel('Memory Backend', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Defense Type', fontsize=12, fontweight='bold')
+    ax.set_title(f'{model_name.upper()} - Average Across All Test Suites\nSuccess Rate Heatmap', 
+                 fontsize=14, fontweight='bold', pad=20)
+    
+    plt.tight_layout()
+    
+    # Save figure
+    output_file = output_dir / f"{model_name}_average_heatmap.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    return output_file
+
+
 def main():
     """Main function to consolidate all results."""
     import argparse
@@ -459,7 +594,7 @@ def main():
     parser.add_argument(
         "--suite",
         type=str,
-        choices=["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"],
+        choices=["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"],
         help="Specific test suite to consolidate (default: all suites)"
     )
     
@@ -503,12 +638,18 @@ def main():
     plot_files = []
     error_summaries = []
     
+    # Store all data for combined visualizations (only when processing all suites)
+    all_models_data = {}
+    
     for model_name in models_to_process:
+        all_suites_data = {}
+        
         for attack_type in attack_types_to_process:
             print(f"Processing: {model_name} / {attack_type}")
             
             # Collect data
             data = collect_all_data(model_name, attack_type, results_base_dir)
+            all_suites_data[attack_type] = data
             
             # Generate CSV
             csv_file = generate_csv(model_name, attack_type, data, output_dir)
@@ -524,20 +665,58 @@ def main():
             else:
                 print(f"  ✅ No execution errors found - all results are reliable")
             
-            # Generate plots
+            # Generate individual heatmap plots
             if not args.no_plots:
                 if not PLOTTING_AVAILABLE:
                     print(f"  ⚠️  Skipping plots: matplotlib/seaborn not installed")
                     print(f"     Install with: pip install matplotlib seaborn")
                 else:
                     try:
-                        bar_file = generate_bar_chart(model_name, attack_type, data, output_dir)
                         heatmap_file = generate_heatmap(model_name, attack_type, data, output_dir)
-                        plot_files.extend([bar_file, heatmap_file])
-                        print(f"  ✅ Bar Chart: {bar_file.name}")
+                        plot_files.append(heatmap_file)
                         print(f"  ✅ Heatmap: {heatmap_file.name}")
                     except Exception as e:
-                        print(f"  ⚠️  Error generating plots: {e}")
+                        print(f"  ⚠️  Error generating heatmap: {e}")
+        
+        # Store data for this model
+        all_models_data[model_name] = all_suites_data
+        
+        # Generate combined visualizations if processing all suites (or multiple suites)
+        if len(attack_types_to_process) > 1 and not args.no_plots:
+            if PLOTTING_AVAILABLE:
+                print(f"\nGenerating combined visualizations for {model_name}...")
+                try:
+                    # Combined heatmaps subplot
+                    combined_heatmap_file = generate_combined_heatmaps_subplot(
+                        model_name, all_suites_data, output_dir
+                    )
+                    plot_files.append(combined_heatmap_file)
+                    print(f"  ✅ Combined Heatmaps: {combined_heatmap_file.name}")
+                    
+                    # Average heatmap
+                    avg_heatmap_file = generate_average_heatmap(
+                        model_name, all_suites_data, output_dir
+                    )
+                    plot_files.append(avg_heatmap_file)
+                    print(f"  ✅ Average Heatmap: {avg_heatmap_file.name}")
+                except Exception as e:
+                    print(f"  ⚠️  Error generating combined visualizations: {e}")
+        
+        # Generate combined CSV files if processing multiple suites
+        if len(attack_types_to_process) > 1:
+            print(f"\nGenerating combined CSV files for {model_name}...")
+            try:
+                # Combined CSV with all suites
+                combined_csv_file = generate_combined_csv(model_name, all_suites_data, output_dir)
+                csv_files.append(combined_csv_file)
+                print(f"  ✅ Combined CSV: {combined_csv_file.name}")
+                
+                # Average summary CSV
+                avg_csv_file = generate_average_summary_csv(model_name, all_suites_data, output_dir)
+                csv_files.append(avg_csv_file)
+                print(f"  ✅ Average Summary CSV: {avg_csv_file.name}")
+            except Exception as e:
+                print(f"  ⚠️  Error generating combined CSV files: {e}")
     
     print(f"\n{'='*80}")
     print(f"✅ Consolidation complete!")
@@ -554,6 +733,117 @@ def main():
     print(f"{'='*80}\n")
     
     return 0
+
+
+def generate_combined_csv(
+    model_name: str,
+    all_data: Dict[str, Dict[str, Dict[str, Tuple[int, int, float, bool]]]],
+    output_dir: Path
+) -> Path:
+    """
+    Generate a combined CSV file listing all test suites one below the other, clearly labeled.
+    
+    Args:
+        model_name: Model name
+        all_data: Dictionary {attack_type: {defense_type: {memory_backend: (passed, total, rate, has_errors)}}}
+        output_dir: Output directory
+    """
+    output_file = output_dir / f"{model_name}_all_suites_combined.csv"
+    
+    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
+    defense_types = UNIFIED_DEFENSE_TYPES
+    
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        
+        # Header row
+        header = ["Test Suite", "Defense Type"]
+        for backend in memory_backends:
+            backend_label = "No Memory" if backend == "none" else backend.capitalize()
+            header.append(f"{backend_label} (%)")
+        writer.writerow(header)
+        
+        # Write data for each suite
+        for idx, attack_type in enumerate(sorted(all_data.keys())):
+            suite_label = attack_type.replace("_", " ").title()
+            data = all_data[attack_type]
+            
+            # Write a separator row (empty row before each suite, except the first)
+            if idx > 0:
+                writer.writerow([])
+            
+            # Write data rows for this suite
+            for defense_type in defense_types:
+                row = [suite_label, defense_type.replace("_", " ").title()]
+                for backend in memory_backends:
+                    _, total_steps, rate, has_errors = data[defense_type][backend]
+                    if has_errors:
+                        row.append("ERR")
+                    elif total_steps > 0:
+                        row.append(f"{rate:.1f}%")
+                    else:
+                        row.append("-")
+                writer.writerow(row)
+    
+    return output_file
+
+
+def generate_average_summary_csv(
+    model_name: str,
+    all_data: Dict[str, Dict[str, Dict[str, Tuple[int, int, float, bool]]]],
+    output_dir: Path
+) -> Path:
+    """
+    Generate a CSV file with average scores for all 25 combinations (5 memory backends × 5 defense types).
+    Same numbers as the averaged heatmap.
+    
+    Args:
+        model_name: Model name
+        all_data: Dictionary {attack_type: {defense_type: {memory_backend: (passed, total, rate, has_errors)}}}
+        output_dir: Output directory
+    """
+    output_file = output_dir / f"{model_name}_average_summary.csv"
+    
+    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
+    defense_types = UNIFIED_DEFENSE_TYPES
+    
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        
+        # Header row
+        header = ["Defense Type"]
+        for backend in memory_backends:
+            backend_label = "No Memory" if backend == "none" else backend.capitalize()
+            header.append(f"{backend_label} (%)")
+        writer.writerow(header)
+        
+        # Calculate averages and write rows
+        for defense_type in defense_types:
+            row = [defense_type.replace("_", " ").title()]
+            for backend in memory_backends:
+                rates = []
+                has_any_errors = False
+                
+                # Collect rates from all suites for this combination
+                for attack_type in all_data.keys():
+                    _, _, rate, has_errors = all_data[attack_type][defense_type][backend]
+                    if has_errors:
+                        has_any_errors = True
+                    else:
+                        # Only include non-error rates in average
+                        rates.append(rate)
+                
+                if has_any_errors:
+                    row.append("ERR")
+                elif len(rates) > 0:
+                    avg_rate = sum(rates) / len(rates)
+                    row.append(f"{avg_rate:.1f}%")
+                else:
+                    row.append("-")
+            
+            writer.writerow(row)
+    
+    return output_file
 
 
 def generate_error_summary(

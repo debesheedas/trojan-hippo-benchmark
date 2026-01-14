@@ -257,11 +257,14 @@ class ContextMemoryManager:
         # Apply sliding window truncation if max_context_length is set
         if self.max_context_length is not None and self.max_context_length > 0:
             # Add debug output for large contexts
+            original_length = len(context_string)
             if len(context_string) > 100000:  # If context is > 100k chars, warn
-                print(f"⚠️  Large context detected ({len(context_string)} chars), truncating...")
+                print(f"⚠️  Large context detected ({len(context_string)} chars), checking truncation...")
             context_string = self._truncate_context(context_string)
-            if len(context_string) > 100000:
-                print(f"⚠️  After truncation: {len(context_string)} chars")
+            if len(context_string) != original_length:
+                print(f"⚠️  Context memory truncated: {original_length} → {len(context_string)} chars")
+            elif len(context_string) > 100000:
+                print(f"ℹ️  Context memory: {len(context_string)} chars (no truncation needed)")
         
         return context_string
     
@@ -291,15 +294,18 @@ class ContextMemoryManager:
                 
                 # If within limit, return as-is
                 if token_count <= self.max_context_length:
+                    if len(context) > 100000:
+                        print(f"ℹ️  Context memory: {token_count} tokens (within limit of {self.max_context_length} tokens, no truncation needed)")
                     return context
                 
                 # Truncate to keep most recent tokens (sliding window from end)
                 if len(context) > 100000:
-                    print(f"🔄 Truncating from {token_count} to {self.max_context_length} tokens...")
+                    print(f"🔄 Truncating context memory from {token_count} to {self.max_context_length} tokens (keeping most recent, evicting oldest)...")
                 truncated_encoded = encoded[-self.max_context_length:]
                 result = self.tokenizer.decode(truncated_encoded)
                 if len(context) > 100000:
-                    print(f"✅ Truncation complete ({len(result)} chars)")
+                    result_tokens = len(self.tokenizer.encode(result, disallowed_special=()))
+                    print(f"✅ Truncation complete: {len(result)} chars ({result_tokens} tokens), evicted {token_count - result_tokens} tokens from beginning")
                 return result
             except Exception as e:
                 print(f"Warning: Error during token-based truncation: {e}")

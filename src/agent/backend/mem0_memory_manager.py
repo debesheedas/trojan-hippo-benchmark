@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import threading
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 # Load environment variables from .env file
 load_dotenv()
@@ -27,6 +28,58 @@ except ImportError as e:
     MEM0_AVAILABLE = False
     print(f"Warning: mem0 package not available. Mem0 memory will not work. Error: {e}")
     print("Install with: pip install mem0ai")
+
+# Try to import tiktoken for token counting
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    TIKTOKEN_AVAILABLE = False
+
+
+class Mem0TimeoutError(Exception):
+    """
+    Custom exception for mem0 API timeouts.
+    
+    This exception should be re-raised (not caught silently) to ensure
+    test results are marked as unreliable when API calls fail.
+    """
+    pass
+
+
+def _call_with_timeout(func, timeout_seconds=300, error_message="mem0 API call"):
+    """
+    Helper function to call a mem0 API function with a timeout.
+    
+    Args:
+        func: Callable that performs the mem0 API call
+        timeout_seconds: Maximum time to wait (default: 5 minutes)
+        error_message: Error message prefix for timeout errors
+        
+    Returns:
+        Result from func()
+        
+    Raises:
+        Mem0TimeoutError: If the call exceeds timeout_seconds
+    """
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(func)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except FutureTimeoutError:
+            error_msg = (
+                f"{error_message} timed out after {timeout_seconds} seconds. "
+                f"This indicates the API call was not successful. "
+                f"Results from this test are UNRELIABLE and should be marked as failed. "
+                f"This may indicate an API issue, network problem, or mem0 library bug."
+            )
+            print(f"❌ ERROR: {error_msg}")
+            print(f"   This is likely causing the benchmark to hang.")
+            print(f"   Consider checking:")
+            print(f"   - API rate limits and quotas")
+            print(f"   - Network connectivity")
+            print(f"   - mem0 library version and known issues")
+            raise Mem0TimeoutError(error_msg) from None
 
 
 class Mem0MemoryManager:
@@ -140,6 +193,104 @@ class Mem0MemoryManager:
         
         return config_dict
     
+    def _chunk_large_message(
+        self,
+        message: Dict[str, str],
+        max_tokens: int = 6000,
+        model_name: str = "gpt-4o-mini"
+    ) -> List[Dict[str, str]]:
+        """
+        Chunk a large message into smaller pieces that fit within token limits.
+        
+        This prevents mem0's embedding model from hitting token limits during search.
+        The embedding model (text-embedding-3-small) has an 8192 token limit, so we
+        use 6000 tokens per chunk to leave room for overhead.
+        
+        Args:
+            message: Message dictionary with 'role' and 'content'
+            max_tokens: Maximum tokens per chunk (default: 6000, safe for 8192 limit)
+            model_name: Model name for tokenizer (default: gpt-4o-mini)
+            
+        Returns:
+            List of message chunks, each within token limit
+        """
+        if not isinstance(message, dict) or "content" not in message:
+            return [message]
+        
+        content = str(message["content"])
+        role = message.get("role", "user")
+        
+        # If content is small, no need to chunk
+        if len(content) < 10000:  # Rough heuristic: ~10000 chars ≈ ~2500 tokens
+            return [message]
+        
+        # Count tokens to see if chunking is needed
+        if not TIKTOKEN_AVAILABLE:
+            # Fallback: use character-based estimation (rough: 1 token ≈ 4 chars)
+            estimated_tokens = len(content) // 4
+            if estimated_tokens <= max_tokens:
+                return [message]
+            # Chunk by characters
+            chunk_size_chars = max_tokens * 4
+            chunks = []
+            for i in range(0, len(content), chunk_size_chars):
+                chunk_content = content[i:i + chunk_size_chars]
+                chunks.append({
+                    "role": role,
+                    "content": chunk_content,
+                    "chunk_index": i // chunk_size_chars,
+                    "total_chunks": (len(content) + chunk_size_chars - 1) // chunk_size_chars
+                })
+            return chunks
+        
+        # Use tiktoken for accurate token counting
+        try:
+            try:
+                tokenizer = tiktoken.encoding_for_model(model_name)
+            except KeyError:
+                tokenizer = tiktoken.encoding_for_model("gpt-4o-mini")
+            
+            # Encode to get token count
+            encoded = tokenizer.encode(content, disallowed_special=())
+            token_count = len(encoded)
+            
+            # If within limit, return as-is
+            if token_count <= max_tokens:
+                return [message]
+            
+            # Chunk by tokens (preserve token boundaries)
+            chunks = []
+            num_chunks = (token_count + max_tokens - 1) // max_tokens
+            
+            for i in range(num_chunks):
+                start_idx = i * max_tokens
+                end_idx = min((i + 1) * max_tokens, token_count)
+                chunk_encoded = encoded[start_idx:end_idx]
+                chunk_content = tokenizer.decode(chunk_encoded)
+                
+                chunks.append({
+                    "role": role,
+                    "content": chunk_content,
+                    "chunk_index": i,
+                    "total_chunks": num_chunks
+                })
+            
+            return chunks
+        except Exception as e:
+            # If tokenization fails, fall back to character-based chunking
+            print(f"Warning: Token-based chunking failed, using character-based: {e}")
+            chunk_size_chars = max_tokens * 4
+            chunks = []
+            for i in range(0, len(content), chunk_size_chars):
+                chunk_content = content[i:i + chunk_size_chars]
+                chunks.append({
+                    "role": role,
+                    "content": chunk_content,
+                    "chunk_index": i // chunk_size_chars,
+                    "total_chunks": (len(content) + chunk_size_chars - 1) // chunk_size_chars
+                })
+            return chunks
+    
     def add_memory(
         self,
         messages: List[Dict[str, str]],
@@ -196,14 +347,27 @@ class Mem0MemoryManager:
                 # We want user memory extraction, so we don't include agent_id in metadata
                 # Note: We can still use agent_id for filtering in search operations via filters parameter
                 
-                # Defense: limit_memory_length - truncate message content BEFORE extraction
+                # Step 1: Chunk large messages to prevent embedding model token limit errors
+                # mem0's embedding model (text-embedding-3-small) has 8192 token limit
+                # We chunk messages to 6000 tokens to leave room for overhead
+                # This prevents errors during memory.search() when mem0 tries to embed all memories
+                chunked_messages = []
+                for msg in messages:
+                    if isinstance(msg, dict) and "content" in msg:
+                        # Chunk large messages (6000 tokens = safe for 8192 limit)
+                        msg_chunks = self._chunk_large_message(msg, max_tokens=6000)
+                        chunked_messages.extend(msg_chunks)
+                    else:
+                        chunked_messages.append(msg)
+                
+                # Step 2: Defense: limit_memory_length - truncate message content BEFORE extraction
                 # This ensures only truncated memories are stored, avoiding duplicates
-                messages_to_use = messages
+                messages_to_use = chunked_messages
                 if max_memory_length and max_memory_length > 0:
                     # Truncate each message's content to max_memory_length before passing to mem0
                     # This way, mem0 will extract from truncated content and store only truncated memories
                     messages_to_use = []
-                    for msg in messages:
+                    for msg in chunked_messages:
                         if isinstance(msg, dict) and "content" in msg:
                             content = str(msg["content"])
                             if len(content) > max_memory_length:
@@ -218,7 +382,11 @@ class Mem0MemoryManager:
                         else:
                             messages_to_use.append(msg)
                 
-                # Extract memories using mem0 (with potentially truncated messages)
+                # Log chunking if it occurred
+                if len(messages_to_use) > len(messages):
+                    print(f"📦 Chunked {len(messages)} messages into {len(messages_to_use)} chunks to prevent token limit errors")
+                
+                # Extract memories using mem0 (with potentially chunked and truncated messages)
                 # Capture mem0's internal error messages to handle UPDATE operation failures gracefully
                 # Root cause: mem0's deduplication logic uses simple IDs (e.g., '6') to track memories,
                 # but stored memories have UUIDs. When mem0 tries to UPDATE a similar memory, it fails
@@ -226,14 +394,21 @@ class Mem0MemoryManager:
                 # This is a mem0 bug - we can't fix it without modifying mem0 source code.
                 error_buffer = StringIO()
                 try:
-                    with redirect_stderr(error_buffer), redirect_stdout(error_buffer):
-                        result = self.memory.add(
-                            messages=messages_to_use,
-                            user_id=user_id,
-                            agent_id=None,  # Don't pass agent_id to force USER_MEMORY_EXTRACTION_PROMPT
-                            metadata=combined_metadata,  # Don't include agent_id here
-                            infer=True,  # Use LLM to extract facts
-                        )
+                    # Wrap mem0.add() call with timeout to prevent hanging
+                    # Use 5 minutes timeout (300 seconds) - should be enough for most API calls
+                    # If it hangs longer, something is wrong and we should fail fast
+                    def _call_mem0_add():
+                        with redirect_stderr(error_buffer), redirect_stdout(error_buffer):
+                            return self.memory.add(
+                                messages=messages_to_use,
+                                user_id=user_id,
+                                agent_id=None,  # Don't pass agent_id to force USER_MEMORY_EXTRACTION_PROMPT
+                                metadata=combined_metadata,  # Don't include agent_id here
+                                infer=True,  # Use LLM to extract facts
+                            )
+                    
+                    # Execute with timeout
+                    result = _call_with_timeout(_call_mem0_add, timeout_seconds=300, error_message="mem0.add()")
                     
                     # Check if mem0 printed any UPDATE-related errors
                     error_output = error_buffer.getvalue()
@@ -262,7 +437,10 @@ class Mem0MemoryManager:
                     raise
                 
                 # Post-process: Ensure extracted memories are also truncated (defense in depth)
-                # Even though we truncated input, mem0 might combine or rephrase, so we check again
+                # Even though we chunked and truncated input, mem0 might combine or rephrase, so we check again
+                # Also truncate memories that exceed embedding model token limit (8192 tokens ≈ 32000 chars)
+                max_safe_memory_length = 32000  # Safe limit for embedding model (8192 tokens * ~4 chars/token)
+                
                 if max_memory_length and max_memory_length > 0:
                     # Extract memory texts and verify/truncate if needed
                     processed_memories = []
@@ -280,8 +458,13 @@ class Mem0MemoryManager:
                                 if memory_text:
                                     memory_text_str = str(memory_text)
                                     # Truncate if still too long (defense in depth)
-                                    if len(memory_text_str) > max_memory_length:
+                                    # First check defense limit, then check embedding model limit
+                                    if max_memory_length and len(memory_text_str) > max_memory_length:
                                         memory_text_str = memory_text_str[:max_memory_length]
+                                    elif len(memory_text_str) > max_safe_memory_length:
+                                        # Truncate to safe limit for embedding model
+                                        memory_text_str = memory_text_str[:max_safe_memory_length]
+                                        print(f"⚠️  Truncated extracted memory from {len(str(memory_text))} to {max_safe_memory_length} chars to prevent embedding model errors")
                                     # Update the memory item with truncated text
                                     # Find which key was used and update it
                                     for key in ["memory", "memories", "text", "content", "fact"]:
@@ -303,8 +486,13 @@ class Mem0MemoryManager:
                                 if memory_text:
                                     memory_text_str = str(memory_text)
                                     # Truncate if still too long (defense in depth)
-                                    if len(memory_text_str) > max_memory_length:
+                                    # First check defense limit, then check embedding model limit
+                                    if max_memory_length and len(memory_text_str) > max_memory_length:
                                         memory_text_str = memory_text_str[:max_memory_length]
+                                    elif len(memory_text_str) > max_safe_memory_length:
+                                        # Truncate to safe limit for embedding model
+                                        memory_text_str = memory_text_str[:max_safe_memory_length]
+                                        print(f"⚠️  Truncated extracted memory from {len(str(memory_text))} to {max_safe_memory_length} chars to prevent embedding model errors")
                                     # Update the memory item with truncated text
                                     for key in ["memory", "memories", "text", "content", "fact"]:
                                         if key in memory_item:
@@ -396,6 +584,13 @@ class Mem0MemoryManager:
         """
         Search for relevant memories.
         
+        Uses batch search to avoid token limit errors:
+        1. First tries normal search (semantic search over all memories)
+        2. If that fails (token limit), falls back to batch search:
+           - Gets memories in batches using get_all()
+           - Searches each batch separately
+           - Combines and ranks results
+        
         Args:
             query: Search query string
             user_id: Optional user ID (ignored - always uses "vince")
@@ -415,13 +610,22 @@ class Mem0MemoryManager:
             agent_id = None
             limit = limit or self.top_k
             
+            # Try normal search first (semantic search over all memories)
+            print(f"🔍 [BATCH SEARCH DEBUG] Attempting normal mem0 search (semantic search over all memories)")
+            print(f"   Query: '{query[:100]}...' (truncated)" if len(query) > 100 else f"   Query: '{query}'")
+            print(f"   Limit: {limit} results")
+            
             try:
-                result = self.memory.search(
-                    query=query,
-                    user_id=user_id,
-                    agent_id=agent_id,  # Always None
-                    limit=limit
-                )
+                # Wrap mem0.search() call with timeout to prevent hanging
+                def _call_mem0_search():
+                    return self.memory.search(
+                        query=query,
+                        user_id=user_id,
+                        agent_id=agent_id,  # Always None
+                        limit=limit
+                    )
+                
+                result = _call_with_timeout(_call_mem0_search, timeout_seconds=300, error_message="mem0.search()")
                 # Extract results from mem0 response
                 memories = []
                 if isinstance(result, dict) and "results" in result:
@@ -430,6 +634,8 @@ class Mem0MemoryManager:
                     memories = result
                 else:
                     memories = []
+                
+                print(f"✅ [BATCH SEARCH DEBUG] Normal search succeeded: Found {len(memories)} memories")
                 
                 # P1: Check if any retrieved memory has U label (provable_policy defense)
                 if defense_type == "provable_policy" and session_id:
@@ -462,8 +668,199 @@ class Mem0MemoryManager:
                 
                 return memories
             except Exception as e:
-                print(f"Warning: Could not search mem0 memory: {e}")
+                error_str = str(e)
+                print(f"❌ [BATCH SEARCH DEBUG] Normal search failed: {error_str[:200]}")
+                
+                # Check if this is a token limit error
+                is_token_limit_error = (
+                    "8192 tokens" in error_str or
+                    "context length" in error_str.lower() or
+                    ("token" in error_str.lower() and "limit" in error_str.lower()) or
+                    "105107 tokens" in error_str or
+                    "102925 tokens" in error_str or
+                    "118565 tokens" in error_str or
+                    "119102 tokens" in error_str
+                )
+                
+                if is_token_limit_error:
+                    # Fall back to batch search
+                    print(f"⚠️  [BATCH SEARCH DEBUG] Token limit error detected - switching to batch search fallback")
+                    print(f"   Error type: Token limit exceeded (embedding model limit: 8192 tokens)")
+                    return self._batch_search(query, user_id, agent_id, limit, session_id, defense_type)
+                else:
+                    # Other errors - just return empty
+                    print(f"⚠️  [BATCH SEARCH DEBUG] Non-token-limit error - returning empty results")
+                    print(f"Warning: Could not search mem0 memory: {e}")
+                    return []
+    
+    def _batch_search(
+        self,
+        query: str,
+        user_id: str,
+        agent_id: Optional[str],
+        limit: int,
+        session_id: Optional[str],
+        defense_type: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        """
+        Batch search fallback: Get memories in batches and search each batch.
+        
+        This is a workaround for mem0's token limit issue. Since mem0's search()
+        embeds ALL memories at once (which exceeds token limit), we:
+        1. Get memories in batches using get_all() with a reasonable limit
+        2. For each batch, try to use mem0's search() (semantic search)
+        3. If batch search also fails, use text matching as final fallback
+        4. Combine and rank results
+        
+        Note: mem0's get_all() doesn't support pagination, so we get the first N memories.
+        This searches through recent memories, which is often sufficient.
+        
+        Args:
+            query: Search query string
+            user_id: User ID
+            agent_id: Agent ID (always None for mem0)
+            limit: Number of results to return
+            session_id: Optional session ID
+            defense_type: Optional defense type
+            
+        Returns:
+            List of memory dictionaries
+        """
+        print(f"🔄 [BATCH SEARCH DEBUG] Starting batch search fallback")
+        print(f"   Query: '{query[:100]}...' (truncated)" if len(query) > 100 else f"   Query: '{query}'")
+        print(f"   Target: {limit} results")
+        
+        try:
+            # Get memories in batches - try semantic search first, fall back to text matching
+            batch_size = 50  # Process 50 memories at a time
+            max_memories_to_search = 200  # Search through up to 200 memories total
+            all_results = []
+            
+            # Get all memories we want to search through
+            print(f"📥 [BATCH SEARCH DEBUG] Getting memories to search (limit: {max_memories_to_search})")
+            all_memories = self.get_all_memories(
+                user_id=user_id,
+                agent_id=agent_id,
+                limit=max_memories_to_search
+            )
+            
+            total_memories = len(all_memories)
+            print(f"   Retrieved {total_memories} memories from vector store")
+            
+            if not all_memories:
+                print(f"⚠️  [BATCH SEARCH DEBUG] No memories found in vector store")
                 return []
+            
+            # Try to search in batches using mem0's search()
+            # Note: mem0's search() still searches ALL memories, but we can try smaller batches
+            # by creating temporary filtered searches. However, mem0 doesn't support this directly.
+            # So we'll use text matching as a fallback, but try semantic search on the full set first
+            # with a smaller limit to see if it works.
+            
+            # Strategy: Try semantic search with smaller result limit first
+            # If that fails, use text matching on batches
+            print(f"🔍 [BATCH SEARCH DEBUG] Attempting semantic search with reduced scope...")
+            
+            # Try semantic search one more time with a smaller limit (might work if fewer results needed)
+            try:
+                def _call_mem0_search_small():
+                    return self.memory.search(
+                        query=query,
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        limit=min(limit, 10)  # Try smaller limit
+                    )
+                
+                semantic_result = _call_with_timeout(_call_mem0_search_small, timeout_seconds=300, error_message="mem0.search() (batch fallback)")
+                semantic_memories = []
+                if isinstance(semantic_result, dict) and "results" in semantic_result:
+                    semantic_memories = semantic_result["results"]
+                elif isinstance(semantic_result, list):
+                    semantic_memories = semantic_result
+                
+                if semantic_memories:
+                    print(f"✅ [BATCH SEARCH DEBUG] Semantic search with reduced limit succeeded: {len(semantic_memories)} results")
+                    all_results = semantic_memories
+                else:
+                    raise Exception("No results from semantic search")
+            except Exception as semantic_error:
+                print(f"⚠️  [BATCH SEARCH DEBUG] Semantic search with reduced limit also failed: {str(semantic_error)[:100]}")
+                print(f"   Falling back to text matching on {total_memories} memories")
+                
+                # Fall back to text matching: check if query words appear in memory text
+                query_lower = query.lower()
+                query_words = set(query_lower.split())
+                if not query_words:
+                    print(f"⚠️  [BATCH SEARCH DEBUG] Empty query words after processing")
+                    return []
+                
+                print(f"   Query words: {list(query_words)[:10]}..." if len(query_words) > 10 else f"   Query words: {list(query_words)}")
+                
+                scored_memories = []
+                for i, mem in enumerate(all_memories):
+                    if isinstance(mem, dict):
+                        memory_text = str(mem.get("memory", "")).lower()
+                        memory_words = set(memory_text.split())
+                        
+                        # Count how many query words match
+                        matches = len(query_words.intersection(memory_words))
+                        
+                        if matches > 0:
+                            # Calculate relevance score (percentage of query words matched)
+                            relevance_score = matches / len(query_words)
+                            
+                            # Also check if query appears as substring (higher relevance)
+                            if query_lower in memory_text:
+                                relevance_score += 0.5
+                            
+                            mem_copy = mem.copy()
+                            mem_copy["_relevance_score"] = relevance_score
+                            scored_memories.append(mem_copy)
+                            
+                            if len(scored_memories) <= 5:  # Debug first 5 matches
+                                print(f"   Match {len(scored_memories)}: score={relevance_score:.2f}, text='{memory_text[:60]}...'")
+                
+                # Sort by relevance score (highest first)
+                scored_memories.sort(key=lambda x: x.get("_relevance_score", 0), reverse=True)
+                
+                # Remove temporary relevance scores
+                for mem in scored_memories:
+                    if "_relevance_score" in mem:
+                        del mem["_relevance_score"]
+                
+                all_results = scored_memories
+                print(f"📊 [BATCH SEARCH DEBUG] Text matching: {len(scored_memories)} matches found from {total_memories} memories")
+            
+            # P1: Check if any retrieved memory has U label (provable_policy defense)
+            if defense_type == "provable_policy" and session_id:
+                from agent.agent_core import ProvablePolicyManager
+                found_u_label = False
+                for memory_item in all_results:
+                    if isinstance(memory_item, dict):
+                        metadata = memory_item.get("metadata", {})
+                        label = metadata.get("label", None)
+                        if label == "U":
+                            ProvablePolicyManager.set_untrusted(session_id)
+                            found_u_label = True
+                            break
+                        elif label is None:
+                            raise ValueError(
+                                f"Mem0 batch search memory entry missing label in provable_policy defense. "
+                                f"All memories must have 'label' metadata set to 'T' or 'U'."
+                            )
+            
+            final_results = all_results[:limit]
+            print(f"✅ [BATCH SEARCH DEBUG] Batch search complete: Returning {len(final_results)} results (requested: {limit})")
+            if final_results:
+                print(f"   Top result: '{final_results[0].get('memory', '')[:80]}...'")
+            
+            return final_results
+            
+        except Exception as e:
+            print(f"❌ [BATCH SEARCH DEBUG] Batch search fallback failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
     
     def get_context(self, query: str, user_id: Optional[str] = None, agent_id: Optional[str] = None, session_id: Optional[str] = None, defense_type: Optional[str] = None) -> str:
         """
@@ -577,13 +974,16 @@ class Mem0MemoryManager:
                     query_filters["user_id"] = user_id
                 # Don't add agent_id - always use None
                 
-                # Call get_all with agent_id=None
-                result = self.memory.get_all(
-                    user_id=user_id if user_id else None,
-                    agent_id=None,
-                    filters=query_filters if query_filters else None,
-                    limit=limit
-                )
+                # Call get_all with agent_id=None (with timeout to prevent hanging)
+                def _call_mem0_get_all():
+                    return self.memory.get_all(
+                        user_id=user_id if user_id else None,
+                        agent_id=None,
+                        filters=query_filters if query_filters else None,
+                        limit=limit
+                    )
+                
+                result = _call_with_timeout(_call_mem0_get_all, timeout_seconds=300, error_message="mem0.get_all()")
                 
                 # Extract results from mem0 response
                 if isinstance(result, dict) and "results" in result:
