@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-Pure-Python Test Bench for Email Agent
-
-This test bench runs the same tests as test_suite.py but uses the pure-Python
-agent core (no HTTP) for maximum speed and reliability.
-
+Test Bench for Email Agent
 Test Structure:
 - Each test is a JSON file with a series of user queries
 - Agent is loaded fresh for each test with clean session history
@@ -33,6 +29,8 @@ load_dotenv()
 
 from agent.agent_core import invoke_agent, clear_session_agent, clear_agent_cache
 from agent.utils import read_trace_events, load_config, ensure_data_directories, set_global_seeds
+from agent.utils import debug_info, debug_debug, debug_print_exception, debug_print_long_content, set_debug_level, DebugLevel, get_debug_level
+import os
 from benchmark.test_validators import create_validator, CompositeValidator
 from agent.colored_trace_printer import get_colored_printer
 from benchmark.memory_backend import get_memory_backend_registry
@@ -77,10 +75,17 @@ class TestBench:
         # Track execution errors for this benchmark run (simple flag, no complex tracker)
         self.execution_errors = []  # List of error messages
         self.execution_success = True  # Set to False if any execution errors occur
+        self._last_test_result = None  # Store last test result for terminal summary
         
         # Set global seed for reproducibility
         global_seed = self.config.get("seed", 42)
         set_global_seeds(global_seed)
+        
+        # Initialize debug level from environment (set by run_benchmark.py)
+        # This ensures debug level is consistent across all processes
+        debug_level_env = os.getenv("DEBUG_LEVEL", "INFO").upper()
+        debug_level = DebugLevel.DEBUG if debug_level_env == "DEBUG" else DebugLevel.INFO
+        set_debug_level(debug_level)
         
         # Read model name strictly from agent_config.yaml
         self.model_name = self.config.get("agent", {}).get("target_model_name")
@@ -227,7 +232,7 @@ class TestBench:
             return
         
         try:
-            from agent.backend.mem0_memory_manager import get_mem0_memory_manager
+            from agent.backend.mem0_memory import get_mem0_memory_manager
             from pathlib import Path
             
             mem0_config = test_config.get("memory", {}).get("mem0_memory", {})
@@ -291,13 +296,13 @@ class TestBench:
                     users = mem0_manager.get_users()
                     print(f"\nDebug: get_users() returned: {users}")
                 except Exception as e:
-                    print(f"\nDebug: Could not get users: {e}")
+                    debug_debug("Could not get users from mem0")
+                    debug_print_exception(e, context="Getting users from mem0 for debug printing", include_traceback=True)
             
             print(f"{'='*80}\n")
         except Exception as e:
-            print(f"\n⚠️ DEBUG: Could not print initial mem0 memories: {e}")
-            import traceback
-            traceback.print_exc()
+            debug_info("Could not print initial mem0 memories")
+            debug_print_exception(e, context="Printing initial mem0 memories", include_traceback=True)
     
     def _print_mem0_memories(self, test_config: Dict[str, Any], user_message: Optional[str] = None):
         """Print mem0 memory contents and context if mem0_print is enabled."""
@@ -309,7 +314,7 @@ class TestBench:
             return
         
         try:
-            from agent.backend.mem0_memory_manager import get_mem0_memory_manager
+            from agent.backend.mem0_memory import get_mem0_memory_manager
             from agent.agent_core import _build_agent_prompt
             
             mem0_config = test_config.get("memory", {}).get("mem0_memory", {})
@@ -362,7 +367,7 @@ class TestBench:
                     # Skip RAG context retrieval if no memory backend is enabled
                     if rag_memory_enabled and self.memory_backend_name != "none" and rag_defense_type != "disable_memory":
                         try:
-                            from agent.backend.rag_memory_manager import get_rag_memory_manager
+                            from agent.backend.rag_memory import get_rag_memory_manager
                             rag_config = memory_config.get("rag_memory", {})
                             rag_memory_manager = get_rag_memory_manager(
                                 embedding_model=rag_config.get("embedding_model", "text-embedding-3-small"),
@@ -379,8 +384,9 @@ class TestBench:
                             if rag_context:
                                 rag_context = "\n\n# Relevant Memory Context\n" + rag_context + "\n"
                                 context_parts.append(rag_context)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            debug_info("Could not retrieve RAG memory context")
+                            debug_print_exception(e, context="Retrieving RAG memory context", include_traceback=True)
                     
                     # Get mem0 context
                     mem0_context = mem0_manager.get_context(user_message, user_id=user_id)
@@ -402,7 +408,8 @@ class TestBench:
                     print(final_user_message)
                     print("=" * 80)
                 except Exception as e:
-                    print(f"\n⚠️ Warning: Could not retrieve mem0 context: {e}")
+                    debug_info("Could not retrieve mem0 context for debug printing")
+                    debug_print_exception(e, context="Retrieving mem0 context for debug printing", include_traceback=True)
                     print("\n💬 Final User Message Sent to Model:")
                     print("=" * 80)
                     print(user_message)
@@ -429,7 +436,7 @@ class TestBench:
                     
                     # Try to load explicit memory context
                     try:
-                        from agent.backend.memory_manager import get_memory_manager
+                        from agent.backend.explicit_memory import get_memory_manager
                         memory_file = memory_config.get("explicit_memory", {}).get("memory_file", 
                             test_config.get("data", {}).get("memory_file", "data/interactive_agent/agent_memory.json"))
                         memory_manager = get_memory_manager(memory_file=memory_file)
@@ -453,10 +460,12 @@ class TestBench:
                     print(explicit_memory_context)
                     print("-" * 80)
             except Exception as e:
-                print(f"\n⚠️ Warning: Could not print system prompt: {e}")
+                debug_info("Could not print system prompt")
+                debug_print_exception(e, context="Printing system prompt", include_traceback=True)
                 
         except Exception as e:
-            print(f"\n⚠️ Warning: Could not print mem0 memories: {e}")
+            debug_info("Could not print mem0 memories")
+            debug_print_exception(e, context="Printing mem0 memories", include_traceback=True)
     
     def _setup_optimizer_logging(self):
         """Initialize a file logger for optimization runs when using TestBench."""
@@ -483,7 +492,8 @@ class TestBench:
             self.logger.addHandler(console_handler)
             self.logger.info("Logging initialized from TestBench. Detailed logs: %s", log_file)
         except Exception as e:
-            print(f"Warning: Failed to initialize optimizer logging: {e}")
+            debug_info("Failed to initialize optimizer logging")
+            debug_print_exception(e, context="Initializing optimizer logging", include_traceback=True)
 
     def create_test_environment(self, test_name: str, initial_data: Dict[str, str] = None) -> Dict[str, str]:
         """
@@ -571,9 +581,9 @@ class TestBench:
                     shutil.copy2(email_file, inbox_dir)
         
         # Initialize memory using unified backend
-        # Skip loading initial memory set if no backend enabled
+        # All tests start with empty memory - memory is built during test execution
         if self.memory_backend_name == "none":
-            print(f"🛡️ No memory backend enabled (memory_backend: none) - skipping initial memory set loading")
+            print(f"🛡️ No memory backend enabled (memory_backend: none) - skipping memory initialization")
             # Still create empty memory file for compatibility
             memory_file = test_dir / "agent_memory.json"
             if not memory_file.exists():
@@ -581,35 +591,9 @@ class TestBench:
                 with open(memory_file, 'w', encoding='utf-8') as f:
                     json.dump(empty_memory, f, indent=2)
         else:
-            # Get memory set from initial_data (unified format)
-            memory_set = None
-            if initial_data:
-                # Check for unified format first
-                if "memory" in initial_data and isinstance(initial_data["memory"], dict):
-                    memory_set = initial_data["memory"].get("set")
-                # Check for simple memory_set format (e.g., "memory_set": "0")
-                elif "memory_set" in initial_data:
-                    memory_set = initial_data["memory_set"]
-                # Fallback: check for old backend-specific formats (for backward compatibility)
-                elif "mem0_memory_set" in initial_data:
-                    memory_set = initial_data["mem0_memory_set"]
-                elif "rag_memory_set" in initial_data:
-                    memory_set = initial_data["rag_memory_set"]
-            
-            if memory_set:
-                # Normalize memory_set to extract just the number
-                # Handles formats like: "0", "1", "memory_set_3", "mem0_memory_set_1", etc.
-                import re
-                match = re.search(r'(\d+)$', str(memory_set))
-                if match:
-                    normalized_memory_set = match.group(1)  # Just the number
-                else:
-                    normalized_memory_set = str(memory_set)  # Fallback to original
-                
-                # Use memory backend to initialize with normalized set number
-                # This must succeed - if it fails, the test cannot proceed
-                self.memory_backend.initialize(normalized_memory_set, test_dir, self.config)
-                print(f"✅ Loaded {self.memory_backend_name} memory set: {normalized_memory_set}")
+            # Initialize empty memory backend - memory will be built during test execution
+            # Backends will create empty stores on first use, no initialization needed
+            print(f"✅ Initialized {self.memory_backend_name} memory backend (empty - memory built during test)")
             
             # Still create empty memory file for compatibility (for explicit backend)
             if self.memory_backend_name == "explicit":
@@ -711,11 +695,17 @@ class TestBench:
                 print(f"✅ Cleaned up test environment: {test_dir.name}")
             except Exception as e:
                 # Log error but don't fail - we'll clean up later if needed
-                print(f"⚠️  Warning: Failed to clean up test environment {test_dir.name}: {e}")
+                debug_info(f"Failed to clean up test environment {test_dir.name}")
+                debug_print_exception(e, context=f"Cleaning up test environment {test_dir.name}", include_traceback=True)
                 logging.warning(f"Failed to clean up test environment {test_dir}: {e}")
         
     def run_test_from_file(self, test_file: Path) -> Dict[str, Any]:
         """Run a single test from a JSON file (adaptive or static based on config)."""
+        # DEBUG: Print to original stdout before redirecting (helps diagnose if we get here)
+        import sys
+        original_stdout_before_redirect = sys.stdout
+        debug_debug(f"run_test_from_file() called for test_file={test_file}", file=original_stdout_before_redirect)
+        
         # Load test definition to determine attack_type for log path
         with open(test_file, 'r', encoding='utf-8') as f:
             test_def = json.load(f)
@@ -745,6 +735,11 @@ class TestBench:
         sys.stdout = log_file
         sys.stderr = log_file
         
+        # Write initial debug message to log file immediately
+        debug_info(f"Log file opened: {log_path}")
+        debug_info(f"Starting test: {test_file.name}")
+        debug_info(f"Memory backend: {self.memory_backend_name}, Defense: {self.unified_defense}")
+        
         try:
             if self.adaptive_enabled:
                 return self._run_adaptive_test_from_file(test_file)
@@ -757,6 +752,24 @@ class TestBench:
             sys.stdout = original_stdout
             sys.stderr = original_stderr
             log_file.close()
+            
+            # Print summary to terminal (original stdout) after log file is closed
+            # This ensures all detailed errors are in the log file, only summary goes to terminal
+            if self._last_test_result:
+                try:
+                    all_passed = self._last_test_result.get("overall_success", False)
+                    total_user_steps = self._last_test_result.get("total_user_steps", 0)
+                    total_successful_user_steps = self._last_test_result.get("total_successful_user_steps", 0)
+                    execution_errors = self._last_test_result.get("execution_errors", [])
+                    
+                    # Print brief summary to terminal
+                    status = "✓ PASSED" if all_passed else "✗ FAILED"
+                    print(f"Test: {test_file.name} - {status} ({total_successful_user_steps}/{total_user_steps} steps)", file=original_stdout, flush=True)
+                    if execution_errors:
+                        print(f"  ⚠️  {len(execution_errors)} execution error(s) - see log file for details", file=original_stdout, flush=True)
+                except Exception:
+                    # If we can't get the result, just skip summary
+                    pass
     
     def _run_static_test_from_file(self, test_file: Path) -> Dict[str, Any]:
         # Reset execution error tracking at start of each test
@@ -819,7 +832,8 @@ class TestBench:
                 
                 return existing_result
             except Exception as e:
-                print(f"⚠️  Warning: Could not load existing result: {e}")
+                debug_info("Could not load existing result (will run test anyway)")
+                debug_print_exception(e, context="Loading existing test result", include_traceback=True)
                 # Continue to run the test
         
         print(f"Test: {test_name}")
@@ -834,7 +848,9 @@ class TestBench:
         _session_store.clear()  # Clear all session memories for deterministic runs
         
         # Create isolated test environment
+        debug_debug(f"About to create test environment for test: {test_name}")
         test_config = self.create_test_environment(test_name, initial_data)
+        debug_debug("Test environment created successfully")
         test_dir = Path(test_config["data"]["mailbox_dir"]).parent
 
         # Debug: Print all initial mem0 memories loaded in the vectorstore
@@ -861,7 +877,8 @@ class TestBench:
             session_history = []  # Track session history
             
             for i, step in enumerate(steps, 1):
-                print(f"\n--- Step {i}/{len(steps)} ---")
+                print(f"\n--- Step {i}/{len(steps)} ---", flush=True)
+                sys.stdout.flush()
                 
                 # Check if this is a special step type
                 step_type = step.get("step_type", "user_message")
@@ -879,7 +896,8 @@ class TestBench:
                             "traces": current_traces
                         })
                     except Exception as e:
-                        print(f"Warning: Could not save session history: {e}")
+                        debug_info("Could not save session history")
+                        debug_print_exception(e, context="Saving session history", include_traceback=True)
                     
                     # Start new session - use deterministic ID based on test and step
                     old_session_id = session_id
@@ -966,7 +984,8 @@ class TestBench:
                             "duration_s": 0.0
                         })
                     except Exception as e:
-                        print(f"❌ Error inserting attack email: {e}")
+                        debug_info("Error inserting attack email")
+                        debug_print_exception(e, context="Inserting attack email", include_traceback=True)
                         step_results.append({
                             "step": i,
                             "step_type": "insert_attack_email",
@@ -1015,7 +1034,8 @@ class TestBench:
                                 # Add email to state's inbox_emails list
                                 current_state.inbox_emails.append(email)
                         except Exception as e:
-                            print(f"Warning: Could not update state manager with new email: {e}")
+                            debug_info("Could not update state manager with new email")
+                            debug_print_exception(e, context="Updating state manager with new email", include_traceback=True)
                         
                         # Record this step (no success_check, so no "passed" attribute)
                         step_results.append({
@@ -1027,7 +1047,8 @@ class TestBench:
                             "duration_s": 0.0
                         })
                     except Exception as e:
-                        print(f"❌ Error inserting email: {e}")
+                        debug_info("Error inserting email")
+                        debug_print_exception(e, context="Inserting email", include_traceback=True)
                         step_results.append({
                             "step": i,
                             "step_type": "insert_email",
@@ -1079,7 +1100,8 @@ class TestBench:
                             "duration_s": 0.0
                         })
                     except Exception as e:
-                        print(f"❌ Error inserting benign email: {e}")
+                        debug_info("Error inserting benign email")
+                        debug_print_exception(e, context="Inserting benign email", include_traceback=True)
                         step_results.append({
                             "step": i,
                             "step_type": "insert_benign_email",
@@ -1099,7 +1121,8 @@ class TestBench:
                 print(f"Expected: {step['expected_behavior']}")
                 
                 # Invoke agent (pure Python, no HTTP)
-                print(f"🔄 Calling invoke_agent...")
+                print(f"🔄 Calling invoke_agent...", flush=True)
+                sys.stdout.flush()
                 start_time = time.time()
                 
                 # Initialize is_attack_bench before try block so it's available in except block
@@ -1112,7 +1135,8 @@ class TestBench:
                         config=test_config
                     )
                     duration = time.time() - start_time
-                    print(f"✅ invoke_agent returned (took {duration:.2f}s)")
+                    print(f"✅ invoke_agent returned (took {duration:.2f}s)", flush=True)
+                    sys.stdout.flush()
                     
                     response = result["response"]
                     
@@ -1125,8 +1149,10 @@ class TestBench:
                             # Skip user_input and agent_response as we print them separately
                             if event_type in ['tool_call', 'tool_result']:
                                 printer.print_trace_event(trace_event)
+                        sys.stdout.flush()  # Flush after reading traces
                     except Exception as e:
-                        print(f"Warning: Could not read traces for step: {e}")
+                        debug_info("Could not read traces for step")
+                        debug_print_exception(e, context="Reading traces for step", include_traceback=True)
                         step_traces = []
                     
                     # Print agent response with color
@@ -1134,11 +1160,13 @@ class TestBench:
                         "event_type": "agent_response",
                         "payload": {"text": response},
                         "ts": ""
-                    }))
-                    print(f"Duration: {duration:.2f}s")
+                    }), flush=True)
+                    print(f"Duration: {duration:.2f}s", flush=True)
+                    sys.stdout.flush()  # Ensure all output is flushed before potentially blocking operations
                     
                     # Print mem0 memories if enabled
                     self._print_mem0_memories(test_config, user_message=step['user_message'])
+                    sys.stdout.flush()  # Flush after mem0 memories in case it blocks
                     
                     # Run dual evaluation system (user_goal and attack_goal)
                     user_goal_passed = None
@@ -1182,8 +1210,9 @@ class TestBench:
                                                         "passed": user_goal_passed
                                                     }
                                                 )
-                                        except Exception:
-                                            pass
+                                        except Exception as e:
+                                            debug_debug("Could not add user goal validator result to trace")
+                                            debug_print_exception(e, context="Adding user goal validator result to trace", include_traceback=True)
                                 else:
                                     # String-based check function (legacy support)
                                     check_function = user_goal_check
@@ -1194,7 +1223,8 @@ class TestBench:
                                         print(f"Warning: User goal check function 'check_{check_function}' not found")
                                         user_goal_passed = None
                             except Exception as e:
-                                print(f"User Goal Check Error: {e}")
+                                debug_info("User Goal Check Error")
+                                debug_print_exception(e, context="Executing user goal check", include_traceback=True)
                                 user_goal_passed = False
                         
                         if "attack_goal" in step and step["attack_goal"]:
@@ -1228,13 +1258,16 @@ class TestBench:
                                                         "passed": attack_goal_passed
                                                     }
                                                 )
-                                        except Exception:
-                                            pass
+                                        except Exception as e:
+                                            debug_debug("Could not add user goal validator result to trace")
+                                            debug_print_exception(e, context="Adding user goal validator result to trace", include_traceback=True)
                                     
                                     # compute partial score if available
                                     try:
                                         partial_attack_score = float(validator.score(response, session_id, step_traces))
-                                    except Exception:
+                                    except Exception as e:
+                                        debug_debug("Could not compute partial attack score, using default")
+                                        debug_print_exception(e, context="Computing partial attack score", include_traceback=True)
                                         partial_attack_score = 1.0 if attack_goal_passed else 0.0
                                 else:
                                     # String-based check function (legacy support)
@@ -1246,7 +1279,8 @@ class TestBench:
                                         print(f"Warning: Attack goal check function 'check_{check_function}' not found")
                                         attack_goal_passed = None
                             except Exception as e:
-                                print(f"Attack Goal Check Error: {e}")
+                                debug_info("Attack Goal Check Error")
+                                debug_print_exception(e, context="Executing attack goal check", include_traceback=True)
                                 attack_goal_passed = False
                                 partial_attack_score = 0.0
                         
@@ -1300,8 +1334,9 @@ class TestBench:
                                                         "passed": step_passed
                                                     }
                                                 )
-                                        except Exception:
-                                            pass
+                                        except Exception as e:
+                                            debug_debug("Could not add user goal validator result to trace")
+                                            debug_print_exception(e, context="Adding user goal validator result to trace", include_traceback=True)
                                 else:
                                     # String-based check function (legacy support)
                                     check_function = step["success_check"]
@@ -1314,7 +1349,8 @@ class TestBench:
                                         print(f"Warning: Check function 'check_{check_function}' not found")
                                         step_passed = None  # Unknown
                             except Exception as e:
-                                print(f"Check Error: {e}")
+                                debug_info("Step Check Error")
+                                debug_print_exception(e, context="Executing step check", include_traceback=True)
                                 step_passed = False
                     
                     if step_passed is False:
@@ -1354,7 +1390,9 @@ class TestBench:
                     step_results.append(step_result)
                     
                 except Exception as e:
-                    print(f"Error: {e}")
+                    # Log error to log file (stdout is redirected)
+                    debug_info(f"Error in step {i}: {e}")
+                    debug_print_exception(e, context=f"Step {i} execution", include_traceback=True)
                     all_passed = False
                     
                     # Track execution exception
@@ -1406,7 +1444,8 @@ class TestBench:
                         "traces": final_traces
                     })
             except Exception as e:
-                print(f"Warning: Could not save final session history: {e}")
+                debug_info("Could not save final session history")
+                debug_print_exception(e, context="Saving final session history", include_traceback=True)
             
             # Extract all traces from session_history for backward compatibility
             all_traces = []
@@ -1491,6 +1530,9 @@ class TestBench:
             if failed_user_steps > 0:
                 print(f"  - {total_successful_user_steps} passed, {failed_user_steps} failed")
             print(f"Result saved to: {result_file}")
+            
+            # Store result for terminal summary (after log file is closed)
+            self._last_test_result = test_result
             
             return test_result
             
@@ -1672,7 +1714,8 @@ class TestBench:
                                 "traces": current_traces
                             })
                     except Exception as e:
-                        print(f"Warning: Could not save session history: {e}")
+                        debug_info("Could not save session history")
+                        debug_print_exception(e, context="Saving session history", include_traceback=True)
                     
                     # Start a new session and clear old session agent cache
                     old_session_id = session_id
@@ -1703,7 +1746,8 @@ class TestBench:
                             }
                         )
                     except Exception as e:
-                        print(f"Warning: Could not log session change event: {e}")
+                        debug_info("Could not log session change event")
+                        debug_print_exception(e, context="Logging session change event", include_traceback=True)
                     # Record this step (no success_check, so no "passed" attribute)
                     step_results.append({
                         "step": i,
@@ -1754,7 +1798,8 @@ class TestBench:
                                 # Add email to state's inbox_emails list
                                 current_state.inbox_emails.append(attack_email)
                         except Exception as e:
-                            print(f"Warning: Could not update state manager with new email: {e}")
+                            debug_info("Could not update state manager with new email")
+                            debug_print_exception(e, context="Updating state manager with new email", include_traceback=True)
                         
                         # Record this step (no success_check, so no "passed" attribute)
                         step_results.append({
@@ -1766,7 +1811,8 @@ class TestBench:
                             "duration_s": 0.0
                         })
                     except Exception as e:
-                        print(f"❌ Error inserting attack email: {e}")
+                        debug_info("Error inserting attack email")
+                        debug_print_exception(e, context="Inserting attack email", include_traceback=True)
                         step_results.append({
                             "step": i,
                             "step_type": "insert_attack_email",
@@ -1815,7 +1861,8 @@ class TestBench:
                                 # Add email to state's inbox_emails list
                                 current_state.inbox_emails.append(email)
                         except Exception as e:
-                            print(f"Warning: Could not update state manager with new email: {e}")
+                            debug_info("Could not update state manager with new email")
+                            debug_print_exception(e, context="Updating state manager with new email", include_traceback=True)
                         
                         # Record this step (no success_check, so no "passed" attribute)
                         step_results.append({
@@ -1827,7 +1874,8 @@ class TestBench:
                             "duration_s": 0.0
                         })
                     except Exception as e:
-                        print(f"❌ Error inserting email: {e}")
+                        debug_info("Error inserting email")
+                        debug_print_exception(e, context="Inserting email", include_traceback=True)
                         step_results.append({
                             "step": i,
                             "step_type": "insert_email",
@@ -1876,7 +1924,8 @@ class TestBench:
                                 # Add email to state's inbox_emails list
                                 current_state.inbox_emails.append(benign_email)
                         except Exception as e:
-                            print(f"Warning: Could not update state manager with new email: {e}")
+                            debug_info("Could not update state manager with new email")
+                            debug_print_exception(e, context="Updating state manager with new email", include_traceback=True)
                         
                         # Record this step (no success_check, so no "passed" attribute)
                         step_results.append({
@@ -1888,7 +1937,8 @@ class TestBench:
                             "duration_s": 0.0
                         })
                     except Exception as e:
-                        print(f"❌ Error inserting benign email: {e}")
+                        debug_info("Error inserting benign email")
+                        debug_print_exception(e, context="Inserting benign email", include_traceback=True)
                         step_results.append({
                             "step": i,
                             "step_type": "insert_benign_email",
@@ -1920,12 +1970,14 @@ class TestBench:
                                 try:
                                     step_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
                                     current_state.update_step_data(i, step_traces)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    debug_debug(f"Could not read traces from file for step {i}, continuing without traces")
+                                    debug_print_exception(e, context=f"Reading traces for step {i} in adaptive test", include_traceback=True)
                             # Update session ID
                             current_state.session_id = session_id
                     except Exception as e:
-                        print(f"Warning: Could not update environment state after step {i}: {e}")
+                        debug_info(f"Could not update environment state after step {i}")
+                        debug_print_exception(e, context=f"Updating environment state after step {i}", include_traceback=True)
                     
                     # Check if attack failed
                     attack_goal_passed = step_result.get("attack_goal", {}).get("passed")
@@ -2056,12 +2108,14 @@ class TestBench:
                                 try:
                                     step_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
                                     current_state.update_step_data(i, step_traces)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    debug_debug(f"Could not read traces from file for step {i}, continuing without traces")
+                                    debug_print_exception(e, context=f"Reading traces for step {i} in adaptive test", include_traceback=True)
                             # Update session ID
                             current_state.session_id = session_id
                     except Exception as e:
-                        print(f"Warning: Could not update environment state after step {i}: {e}")
+                        debug_info(f"Could not update environment state after step {i}")
+                        debug_print_exception(e, context=f"Updating environment state after step {i}", include_traceback=True)
                     
                     step_results.append(step_result)
                     
@@ -2089,7 +2143,8 @@ class TestBench:
                         "traces": final_traces
                     })
             except Exception as e:
-                print(f"Warning: Could not save final session history: {e}")
+                debug_info("Could not save final session history")
+                debug_print_exception(e, context="Saving final session history", include_traceback=True)
             
             # Get description from test_def
             description = test_def.get("description", "")
@@ -2161,16 +2216,18 @@ class TestBench:
             if recent_chunks_file.exists():
                 try:
                     recent_chunks_file.unlink()
-                except Exception:
-                    pass  # Silently fail if we can't delete
+                except Exception as e:
+                    debug_debug(f"Could not delete {recent_chunks_file} (non-critical cleanup)")
+                    debug_print_exception(e, context=f"Deleting RAG recent chunks file {recent_chunks_file}", include_traceback=True)
             
             # Clear mem0 recent memories
             recent_memories_file = test_dir / "mem0_recent_memories.json"
             if recent_memories_file.exists():
                 try:
                     recent_memories_file.unlink()
-                except Exception:
-                    pass  # Silently fail if we can't delete
+                except Exception as e:
+                    debug_debug(f"Could not delete {recent_memories_file} (non-critical cleanup)")
+                    debug_print_exception(e, context=f"Deleting mem0 recent memories file {recent_memories_file}", include_traceback=True)
         
         # If we have an optimized attack email, we need to update the test environment
         if optimized_attack_email:
@@ -2201,7 +2258,8 @@ class TestBench:
             try:
                 step_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
             except Exception as e:
-                print(f"Warning: Could not read traces: {e}")
+                debug_info("Could not read traces")
+                debug_print_exception(e, context="Reading traces", include_traceback=True)
                 step_traces = []
             
             # Evaluate both user and attack goals
@@ -2228,7 +2286,9 @@ class TestBench:
                         attack_goal_passed = validator.validate(response, session_id, step_traces)
                         try:
                             partial_attack_score = float(validator.score(response, session_id, step_traces))
-                        except Exception:
+                        except Exception as e:
+                            debug_debug("Could not compute partial attack score, using default")
+                            debug_print_exception(e, context="Computing partial attack score", include_traceback=True)
                             partial_attack_score = 1.0 if attack_goal_passed else 0.0
                     status = '✓ PASSED' if attack_goal_passed else '✗ FAILED'
                     pas = f"{partial_attack_score:.2f}" if isinstance(partial_attack_score, float) else "n/a"
@@ -2295,16 +2355,18 @@ class TestBench:
             if recent_chunks_file.exists():
                 try:
                     recent_chunks_file.unlink()
-                except Exception:
-                    pass  # Silently fail if we can't delete
+                except Exception as e:
+                    debug_debug(f"Could not delete {recent_chunks_file} (non-critical cleanup)")
+                    debug_print_exception(e, context=f"Deleting RAG recent chunks file {recent_chunks_file}", include_traceback=True)
             
             # Clear mem0 recent memories
             recent_memories_file = test_dir / "mem0_recent_memories.json"
             if recent_memories_file.exists():
                 try:
                     recent_memories_file.unlink()
-                except Exception:
-                    pass  # Silently fail if we can't delete
+                except Exception as e:
+                    debug_debug(f"Could not delete {recent_memories_file} (non-critical cleanup)")
+                    debug_print_exception(e, context=f"Deleting mem0 recent memories file {recent_memories_file}", include_traceback=True)
         
         start_time = time.time()
         try:
@@ -2322,8 +2384,9 @@ class TestBench:
             try:
                 step_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
             except Exception as e:
-                # Ignore trace reading errors for regular steps
-                pass
+                # Ignore trace reading errors for regular steps (non-critical)
+                debug_debug("Could not read traces for regular step (non-critical)")
+                debug_print_exception(e, context="Reading traces for regular step", include_traceback=True)
             
             # Print mem0 memories if enabled
             self._print_mem0_memories(test_config, user_message=step['user_message'])
@@ -2349,7 +2412,8 @@ class TestBench:
                     step_passed = validator.validate(response, session_id, step_traces)
                     result["passed"] = step_passed
                 except Exception as e:
-                    print(f"Warning: Could not evaluate success_check: {e}")
+                    debug_info("Could not evaluate success_check")
+                    debug_print_exception(e, context="Evaluating success_check", include_traceback=True)
                     result["passed"] = False
             else:
                 # No success_check, so no "passed" attribute
@@ -2585,7 +2649,9 @@ class TestBench:
                     if test_def.get("attack_type") in ["direct", "indirect"]:
                         is_attack_bench = True
                         break
-            except Exception:
+            except Exception as e:
+                debug_debug(f"Could not parse test file {test_file} to determine attack type, skipping")
+                debug_print_exception(e, context=f"Parsing test file {test_file} to determine attack type", include_traceback=True)
                 continue
         
         bench_type = "ATTACK BENCHMARK" if is_attack_bench else "TEST BENCH"
@@ -2692,8 +2758,9 @@ class TestBench:
                         test_def = json.load(f)
                     # Use helper function to determine attack_type (handles memory_only tests)
                     attack_type = determine_attack_type(test_file, test_def)
-            except Exception:
-                pass
+            except Exception as e:
+                debug_debug(f"Could not parse test file {test_file} to determine attack type for result grouping")
+                debug_print_exception(e, context=f"Parsing test file {test_file} for result grouping", include_traceback=True)
             if attack_type in attack_type_groups:
                 attack_type_groups[attack_type].append(result)
         

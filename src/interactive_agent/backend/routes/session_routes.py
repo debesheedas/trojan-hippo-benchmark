@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Path
 from pydantic import BaseModel
 from typing import List, Optional
 
-from agent.backend.session_manager import get_session_manager, Session
+from ..session_manager import get_session_manager, Session
 
 router = APIRouter()
 session_manager = get_session_manager()

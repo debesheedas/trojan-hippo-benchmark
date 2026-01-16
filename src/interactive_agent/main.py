@@ -37,7 +37,7 @@ from agent.utils import (
     generate_id,
     set_global_seeds,
 )
-from agent.backend.memory_manager import get_memory_manager
+from agent.backend.explicit_memory import get_memory_manager
 from interactive_agent.backend.routes.memory_routes import router as memory_router
 
 # Load environment variables

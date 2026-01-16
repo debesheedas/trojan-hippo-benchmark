@@ -7,8 +7,11 @@ import json
 import uuid
 import yaml
 import os
+import sys
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+from enum import Enum
 from typing import Optional, Dict, Any, Literal
 from dotenv import load_dotenv
 
@@ -17,6 +20,169 @@ load_dotenv()
 
 # Global constants
 USER_EMAIL = "vince.j.kaminski@enron.com"  # User's email address - change this to update user email globally
+
+
+# ============================================================================
+# Debug Utility Functions
+# ============================================================================
+
+class DebugLevel(Enum):
+    """Debug verbosity levels."""
+    INFO = 1   # Standard operational messages (always shown)
+    DEBUG = 2  # Detailed debug messages (can be toggled)
+
+
+# Global debug level (defaults to INFO, can be overridden by environment variable)
+_current_debug_level = None
+
+
+def _get_initial_debug_level() -> DebugLevel:
+    """Get initial debug level from environment or default to INFO."""
+    debug_env = os.getenv("DEBUG_LEVEL", "INFO").upper()
+    if debug_env == "DEBUG":
+        return DebugLevel.DEBUG
+    return DebugLevel.INFO
+
+
+def set_debug_level(level: DebugLevel) -> None:
+    """Set the global debug level."""
+    global _current_debug_level
+    _current_debug_level = level
+
+
+def get_debug_level() -> DebugLevel:
+    """Get the current debug level."""
+    global _current_debug_level
+    if _current_debug_level is None:
+        _current_debug_level = _get_initial_debug_level()
+    return _current_debug_level
+
+
+def debug_print(
+    message: str,
+    level: DebugLevel = DebugLevel.INFO,
+    truncate: bool = True,
+    max_length: int = 200,
+    prefix: str = "",
+    file=sys.stdout,
+    flush: bool = True
+) -> None:
+    """
+    Print debug message with optional truncation.
+    
+    Args:
+        message: Message to print
+        level: Debug level (INFO or DEBUG)
+        truncate: Whether to truncate long messages
+        max_length: Maximum length before truncation (default: 200)
+        prefix: Optional prefix to add before message
+        file: File to write to (default: stdout)
+        flush: Whether to flush output immediately
+    """
+    current_level = get_debug_level()
+    if level.value > current_level.value:
+        return
+    
+    if truncate and len(message) > max_length:
+        message = message[:max_length] + "..."
+    
+    output = f"{prefix}{message}" if prefix else message
+    print(output, file=file, flush=flush)
+
+
+def debug_info(message: str, truncate: bool = True, max_length: int = 200, **kwargs) -> None:
+    """Print INFO level message (always shown)."""
+    debug_print(message, level=DebugLevel.INFO, truncate=truncate, max_length=max_length, **kwargs)
+
+
+def debug_debug(message: str, truncate: bool = True, max_length: int = 200, **kwargs) -> None:
+    """Print DEBUG level message (only shown if DEBUG level is enabled)."""
+    debug_print(message, level=DebugLevel.DEBUG, truncate=truncate, max_length=max_length, **kwargs)
+
+
+def debug_print_memory(
+    memory_text: str,
+    memory_id: Optional[str] = None,
+    level: DebugLevel = DebugLevel.DEBUG,
+    max_length: int = 100
+) -> None:
+    """
+    Print memory debug with automatic truncation.
+    
+    Args:
+        memory_text: Memory text to print
+        memory_id: Optional memory ID
+        level: Debug level
+        max_length: Maximum length for memory text preview
+    """
+    current_level = get_debug_level()
+    if level.value > current_level.value:
+        return
+    
+    preview = memory_text[:max_length] + "..." if len(memory_text) > max_length else memory_text
+    if memory_id:
+        debug_print(f"Memory ID: {memory_id}, Text: {preview}", level=level, truncate=False)
+    else:
+        debug_print(f"Memory Text: {preview}", level=level, truncate=False)
+
+
+def debug_print_exception(
+    exception: Exception,
+    context: str = "",
+    level: DebugLevel = DebugLevel.INFO,
+    include_traceback: bool = True
+) -> None:
+    """
+    Print exception with optional traceback.
+    
+    Args:
+        exception: Exception to print
+        context: Optional context string
+        level: Debug level
+        include_traceback: Whether to include full traceback
+    """
+    current_level = get_debug_level()
+    if level.value > current_level.value:
+        return
+    
+    error_msg = f"{type(exception).__name__}: {str(exception)}"
+    if context:
+        error_msg = f"{context} - {error_msg}"
+    
+    if include_traceback:
+        traceback_str = traceback.format_exc()
+        if len(traceback_str) > 1000:
+            traceback_str = traceback_str[:1000] + "..."
+        debug_print(f"ERROR: {error_msg}\n{traceback_str}", level=level, truncate=False)
+    else:
+        debug_print(f"ERROR: {error_msg}", level=level, truncate=False)
+
+
+def debug_print_long_content(
+    content: str,
+    label: str = "Content",
+    level: DebugLevel = DebugLevel.DEBUG,
+    max_length: int = 500
+) -> None:
+    """
+    Print long content with truncation and length info.
+    
+    Args:
+        content: Content to print
+        label: Label for the content
+        level: Debug level
+        max_length: Maximum length to show
+    """
+    current_level = get_debug_level()
+    if level.value > current_level.value:
+        return
+    
+    content_length = len(content)
+    if content_length > max_length:
+        preview = content[:max_length] + "..."
+        debug_print(f"{label} ({content_length} chars): {preview}", level=level, truncate=False)
+    else:
+        debug_print(f"{label} ({content_length} chars): {content}", level=level, truncate=False)
 
 
 def set_global_seeds(seed: int = 42) -> None:

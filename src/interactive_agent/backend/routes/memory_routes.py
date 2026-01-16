@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from agent.backend.memory_manager import get_memory_manager
+from agent.backend.explicit_memory import get_memory_manager
 
 
 # Create router

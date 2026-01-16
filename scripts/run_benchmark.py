@@ -25,6 +25,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 import multiprocessing
 import sys
+import signal
 
 # Add src to path
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -514,6 +515,13 @@ def _run_single_combination(
         print(f"Tests run: {result.get('tests_run', 0)}, Passed: {result.get('tests_passed', 0)}, Failed: {result.get('tests_failed', 0)}", flush=True)
         print(f"{'='*80}", flush=True)
         
+    except KeyboardInterrupt:
+        # Re-raise KeyboardInterrupt so it propagates to the main process
+        # This allows the signal handler to properly clean up all processes
+        print(f"\n{'='*80}", flush=True)
+        print(f"[PID {process_id}] INTERRUPTED in {memory_backend} + {unified_defense}", flush=True)
+        print(f"{'='*80}", flush=True)
+        raise  # Re-raise to propagate to main process
     except Exception as e:
         # Catch any exceptions and return error result
         import traceback
@@ -549,6 +557,40 @@ def _run_single_combination(
     return (memory_backend, unified_defense, result)
 
 
+# Global flag to track if we've been interrupted
+_interrupted = False
+_executor_ref = None  # Reference to executor for cleanup on interrupt
+_futures_ref = None  # Reference to all futures for cancellation
+
+
+def _signal_handler(signum, frame):
+    """Handle SIGINT (Ctrl+C) and SIGTERM signals."""
+    global _interrupted, _executor_ref, _futures_ref
+    _interrupted = True
+    print(f"\n\n{'='*80}", flush=True)
+    print(f"⚠️  INTERRUPTED: Received signal {signum}. Shutting down gracefully...", flush=True)
+    print(f"{'='*80}\n", flush=True)
+    
+    # Cancel all pending futures if they exist
+    if _futures_ref is not None:
+        print("Cancelling pending tasks...", flush=True)
+        cancelled_count = 0
+        for future in _futures_ref:
+            if not future.done():
+                future.cancel()
+                cancelled_count += 1
+        if cancelled_count > 0:
+            print(f"Cancelled {cancelled_count} pending task(s).", flush=True)
+    
+    # Shutdown executor immediately if it exists
+    if _executor_ref is not None:
+        print("Terminating worker processes...", flush=True)
+        _executor_ref.shutdown(wait=False, cancel_futures=True)
+    
+    # Re-raise KeyboardInterrupt so the script exits properly
+    raise KeyboardInterrupt("Benchmark interrupted by user")
+
+
 def run_all_combinations(
     memory_backends: List[str],
     defense_types: List[str],
@@ -578,6 +620,7 @@ def run_all_combinations(
     Returns:
         Dictionary with results summary for all combinations
     """
+    global _interrupted, _executor_ref
     # Generate all combinations
     # Treat "none" backend as a regular backend - run all defense types
     combinations = []
@@ -618,65 +661,101 @@ def run_all_combinations(
         for backend, defense in combinations
     ]
     
+    # Set up signal handlers for graceful shutdown (works for both serial and parallel)
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+    
     # Run combinations in parallel or serial
     if num_workers == 1:
         # Serial execution (easier debugging, no multiprocessing overhead)
         print("Running combinations serially...\n")
-        for i, args_tuple in enumerate(args_list, 1):
-            backend, defense = args_tuple[0], args_tuple[1]
-            print(f"[{i}/{total_combinations}] {backend.upper()} + {defense}")
-            print("-" * 80)
-            
-            backend_key, defense_key, result = _run_single_combination(args_tuple)
-            
-            # Check for errors in result
-            has_error, has_connection_error, has_rate_limit_error = _check_result_for_errors(
-                result, backend_key, defense_key, summary
-            )
-            
-            all_results[f"{backend_key}_{defense_key}"] = result
-            
-            if result.get("success"):
-                if not result.get("skipped"):
-                    summary["combinations"][f"{backend_key}_{defense_key}"] = {
-                        "tests_run": result.get("tests_run", 0),
-                        "tests_passed": result.get("tests_passed", 0),
-                        "tests_failed": result.get("tests_failed", 0),
-                        "has_errors": has_error or has_connection_error or has_rate_limit_error
-                    }
-                    summary["total_tests"] += result.get("tests_run", 0)
-                    summary["total_passed"] += result.get("tests_passed", 0)
-                    summary["total_failed"] += result.get("tests_failed", 0)
-                    summary["successful_combinations"] += 1
-                else:
-                    summary["combinations"][f"{backend_key}_{defense_key}"] = {"skipped": True}
-                    summary["successful_combinations"] += 1
-            else:
-                summary["combinations"][f"{backend_key}_{defense_key}"] = {
-                    "error": result.get("error", "Unknown error"),
-                    "tests_run": result.get("tests_run", 0),
-                    "has_errors": True
-                }
-                summary["failed_combinations"] += 1
-            
-            print()  # Blank line between combinations
+        print(f"TIP: Press Ctrl+C to interrupt and exit gracefully.\n")
+        try:
+            for i, args_tuple in enumerate(args_list, 1):
+                # Check if we've been interrupted
+                if _interrupted:
+                    print("\n⚠️  Interrupt detected. Stopping execution...", flush=True)
+                    break
+                
+                backend, defense = args_tuple[0], args_tuple[1]
+                print(f"[{i}/{total_combinations}] {backend.upper()} + {defense}")
+                print("-" * 80)
+                
+                try:
+                    backend_key, defense_key, result = _run_single_combination(args_tuple)
+                    
+                    # Check for errors in result
+                    has_error, has_connection_error, has_rate_limit_error = _check_result_for_errors(
+                        result, backend_key, defense_key, summary
+                    )
+                    
+                    all_results[f"{backend_key}_{defense_key}"] = result
+                    
+                    if result.get("success"):
+                        if not result.get("skipped"):
+                            summary["combinations"][f"{backend_key}_{defense_key}"] = {
+                                "tests_run": result.get("tests_run", 0),
+                                "tests_passed": result.get("tests_passed", 0),
+                                "tests_failed": result.get("tests_failed", 0),
+                                "has_errors": has_error or has_connection_error or has_rate_limit_error
+                            }
+                            summary["total_tests"] += result.get("tests_run", 0)
+                            summary["total_passed"] += result.get("tests_passed", 0)
+                            summary["total_failed"] += result.get("tests_failed", 0)
+                            summary["successful_combinations"] += 1
+                        else:
+                            summary["combinations"][f"{backend_key}_{defense_key}"] = {"skipped": True}
+                            summary["successful_combinations"] += 1
+                    else:
+                        summary["combinations"][f"{backend_key}_{defense_key}"] = {
+                            "error": result.get("error", "Unknown error"),
+                            "tests_run": result.get("tests_run", 0),
+                            "has_errors": True
+                        }
+                        summary["failed_combinations"] += 1
+                    
+                    print()  # Blank line between combinations
+                except KeyboardInterrupt:
+                    print("\n⚠️  KeyboardInterrupt received. Stopping execution...", flush=True)
+                    raise
+        except KeyboardInterrupt:
+            print("\n⚠️  Benchmark interrupted by user. Exiting...", flush=True)
+            raise
     else:
         # Parallel execution using ProcessPoolExecutor
         print(f"Running combinations in parallel with {num_workers} workers...\n")
         print(f"NOTE: Each combination runs in a separate Python process for complete isolation.\n")
         print(f"WARNING: With {num_workers} workers, ensure you have sufficient API rate limits.\n")
         print(f"         If you see rate limit errors, reduce --num-workers.\n")
+        print(f"TIP: Press Ctrl+C once to gracefully shutdown all processes.\n")
         
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Set up signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+        
+        executor = ProcessPoolExecutor(max_workers=num_workers)
+        _executor_ref = executor  # Store reference for signal handler
+        
+        try:
             # Submit all jobs
             future_to_combo = {
                 executor.submit(_run_single_combination, args_tuple): (args_tuple[0], args_tuple[1])
                 for args_tuple in args_list
             }
+            _futures_ref = list(future_to_combo.keys())  # Store reference for signal handler
             
             # Process results as they complete
             completed = 0
             for future in as_completed(future_to_combo):
+                # Check if we've been interrupted
+                if _interrupted:
+                    print("\n⚠️  Interrupt detected. Cancelling remaining tasks...", flush=True)
+                    # Cancel all remaining futures
+                    for remaining_future in future_to_combo:
+                        if not remaining_future.done():
+                            remaining_future.cancel()
+                    break
+                
                 backend, defense = future_to_combo[future]
                 completed += 1
                 
@@ -753,6 +832,10 @@ def run_all_combinations(
                     if (backend, defense) not in summary["combinations_with_errors"]:
                         summary["combinations_with_errors"].append((backend, defense))
                     # Error is logged to individual log file - no need for shared error.log
+                except KeyboardInterrupt:
+                    # Re-raise KeyboardInterrupt to propagate it up
+                    print(f"\n⚠️  KeyboardInterrupt received. Shutting down...", flush=True)
+                    raise
                 except Exception as e:
                     error_str = str(e)
                     print(f"[{completed}/{total_combinations}] ❌ {backend.upper()} + {defense} - Exception: {error_str}")
@@ -775,8 +858,23 @@ def run_all_combinations(
                         pass
             
             # Explicitly shutdown executor to ensure all processes are cleaned up
-            # This prevents hanging if any child processes are stuck
-            executor.shutdown(wait=True, cancel_futures=False)
+            # If interrupted, cancel pending futures and don't wait
+            if _interrupted:
+                print("Terminating executor and all worker processes...", flush=True)
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                # Normal shutdown - wait for all processes to finish
+                executor.shutdown(wait=True, cancel_futures=False)
+        except KeyboardInterrupt:
+            # Ensure executor is shut down even if we catch KeyboardInterrupt
+            print("\n⚠️  KeyboardInterrupt caught. Forcing shutdown of all processes...", flush=True)
+            executor.shutdown(wait=False, cancel_futures=True)
+            _executor_ref = None
+            raise  # Re-raise to exit the script
+        finally:
+            # Clear executor and futures references
+            _executor_ref = None
+            _futures_ref = None
     
     # Print final summary
     print(f"\n{'='*80}", flush=True)
@@ -981,7 +1079,20 @@ Examples:
              "When multiple backends/defenses are specified or defaults are used, combinations run in parallel."
     )
     
+    parser.add_argument(
+        "--debug-level",
+        type=str,
+        choices=["INFO", "DEBUG"],
+        default="INFO",
+        help="Debug verbosity level: INFO (standard messages) or DEBUG (detailed debug messages). Default: INFO"
+    )
+    
     args = parser.parse_args()
+    
+    # Set debug level globally
+    from agent.utils import set_debug_level, DebugLevel
+    debug_level = DebugLevel.DEBUG if args.debug_level == "DEBUG" else DebugLevel.INFO
+    set_debug_level(debug_level)
     
     # Validate arguments
     if args.num_workers < 1:
@@ -1040,6 +1151,11 @@ Examples:
         # Single combination mode (1 backend × 1 defense = 1 combination)
         running_multiple_combinations = False
     
+    # Set debug level in config for TestBench
+    # This ensures debug level is available in all subprocesses
+    import os
+    os.environ["DEBUG_LEVEL"] = args.debug_level
+    
     # Run benchmark(s)
     if running_multiple_combinations:
         # Multiple combinations mode - use parallel execution
@@ -1061,6 +1177,10 @@ Examples:
         # Use provided defense type or default to "none"
         # Treat "none" backend as a regular backend - allow all defense types
         defense_type = defense_types[0] if defense_types_specified else "none"
+        
+        # Set debug level in environment for subprocesses
+        import os
+        os.environ["DEBUG_LEVEL"] = args.debug_level
         
         result = run_benchmark(
             memory_backend=memory_backend,

@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 import numpy as np
 
 from agent.utils import generate_id, get_timestamp, append_trace_event, USER_EMAIL
+from agent.utils import debug_info, debug_debug, debug_print_exception
 
 # Try to import OpenAI for embeddings, but make it optional
 try:
@@ -84,7 +85,9 @@ def _get_embedding(text: str, api_key: Optional[str] = None) -> Optional[List[fl
             input=text
         )
         return response.data[0].embedding
-    except Exception:
+    except Exception as e:
+        debug_debug("Could not get embedding (falling back to keyword search)")
+        debug_print_exception(e, context="Getting embedding for email search", include_traceback=True)
         return None
 
 def _cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
@@ -173,7 +176,9 @@ def _find_best_email_match(search_query: str, config, folder: str = "inbox", lim
         try:
             from datetime import datetime
             return datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
-        except:
+        except Exception as e:
+            debug_debug("Could not parse timestamp, using 0.0")
+            debug_print_exception(e, context="Parsing timestamp", include_traceback=True)
             return 0.0
     
     # Sort: Primary by relevance (descending, so highest relevance first)
@@ -313,8 +318,9 @@ When you read emails using this tool, they are automatically marked as read in t
             from agent.utils import load_config
             config = load_config()
             page_size = config.get("agent", {}).get("email_reading", {}).get("page_size", 20000)
-        except:
-            pass
+        except Exception as e:
+            debug_debug("Could not load config for page_size, using default")
+            debug_print_exception(e, context="Loading config for email reading page_size", include_traceback=True)
         
         try:
             # Get all emails from inbox directory
@@ -344,7 +350,9 @@ When you read emails using this tool, they are automatically marked as read in t
                         
                         email['_file_path'] = str(file_path)
                         emails.append(email)
-                except Exception:
+                except Exception as e:
+                    debug_debug(f"Could not process email file, skipping")
+                    debug_print_exception(e, context="Processing email file in email tools", include_traceback=True)
                     continue
             
             if not emails:

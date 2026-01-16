@@ -256,8 +256,7 @@ memory-agent-security-benchmark/
 │   │   │   ├── email_tools.py   # Email management tools
 │   │   │   └── memory_tools.py # Memory management tools
 │   │   └── backend/             # Backend services
-│   │       ├── memory_manager.py
-│   │       └── session_manager.py
+│   │       └── memory_manager.py
 │   ├── benchmark/               # Benchmarking system
 │   │   ├── test_bench.py        # Main benchmark entry point
 │   │   ├── test_validators.py  # Test validation logic
@@ -276,7 +275,9 @@ memory-agent-security-benchmark/
 │       ├── main.py              # FastAPI application
 │       ├── frontend/            # React frontend components
 │       ├── static/              # Static HTML/JS files
-│       └── backend/routes/      # API routes
+│       └── backend/             # Backend services
+│           ├── session_manager.py  # Session management
+│           └── routes/          # API routes
 ├── scripts/                     # Utility scripts
 │   ├── run_benchmark.py        # Unified benchmark runner
 │   ├── consolidate_results.py  # Unified results consolidation
@@ -535,9 +536,6 @@ Tests are defined as JSON files with a **unified format** that works with all me
     "inbox_set": "inbox_set_1",
     "outbox_set": "outbox_set_1",
     "drafts_set": "drafts_set_1",
-    "memory": {
-      "set": "memory_set_0"  // Unified format - works for all backends
-    },
     "session_set": "session_set_1"  // Optional: initial session state
   },
   "steps": [
@@ -576,36 +574,9 @@ Tests are defined as JSON files with a **unified format** that works with all me
 }
 ```
 
-### Unified Memory Format
+### Memory Initialization
 
-**New Format (Recommended)**:
-```json
-"initial_data": {
-  "memory": {
-    "set": "memory_set_0"  // Works for all backends
-  }
-}
-```
-
-**Old Formats (Auto-Normalized)**:
-```json
-// Explicit memory
-"initial_data": {
-  "memory_set": "memory_set_0"
-}
-
-// Mem0 memory
-"initial_data": {
-  "mem0_memory_set": "mem0_memory_set_0"
-}
-
-// RAG memory
-"initial_data": {
-  "rag_memory_set": "rag_memory_set_0"
-}
-```
-
-The system automatically converts old formats to the unified format when loading test cases.
+All tests start with **empty memory** - memory is built during test execution through user interactions. No initial memory configuration is needed or supported. Memory backends will create empty stores on first use.
 
 ### Validator Types
 

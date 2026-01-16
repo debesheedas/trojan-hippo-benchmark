@@ -7,7 +7,7 @@ from langchain.tools import BaseTool
 from typing import Optional
 from pydantic import BaseModel, Field
 
-from agent.backend.memory_manager import get_memory_manager
+from agent.backend.explicit_memory import get_memory_manager
 from agent.utils import append_trace_event, generate_id
 
 

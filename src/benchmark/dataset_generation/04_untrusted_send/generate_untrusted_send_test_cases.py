@@ -872,7 +872,6 @@ def convert_test_case_to_format(
             "inbox_set": defaults_config.get('default_inbox_set', 'inbox_set_1'),
             "outbox_set": defaults_config.get('default_outbox_set', 'outbox_set_1'),
             "drafts_set": defaults_config.get('default_drafts_set', 'drafts_set_1'),
-            "memory_set": "0"  # Empty initial memory - memory is built during test case execution
         },
         "steps": steps
     }

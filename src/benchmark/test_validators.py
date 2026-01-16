@@ -12,6 +12,7 @@ import fnmatch
 from pathlib import Path
 from typing import List, Dict, Any, Union, Optional
 from benchmark.memory_backend import MemoryBackend, get_memory_backend_registry
+from agent.utils import debug_info, debug_debug, debug_print_exception
 
 
 class TestValidator:
@@ -501,10 +502,14 @@ class FileSystemValidator(TestValidator):
                                 try:
                                     from datetime import datetime
                                     timestamp = datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() if ts else 0.0
-                                except:
+                                except Exception as e:
+                                    debug_debug(f"Could not parse timestamp from email data, using 0.0")
+                                    debug_print_exception(e, context="Parsing email timestamp", include_traceback=True)
                                     timestamp = 0.0
                                 emails_with_timestamps.append((timestamp, email_data))
-                            except:
+                            except Exception as e:
+                                debug_debug(f"Could not process email file, skipping")
+                                debug_print_exception(e, context="Processing email file in validator", include_traceback=True)
                                 continue
                         
                         # Sort by timestamp (most recent first) and check only the latest
@@ -554,10 +559,14 @@ class FileSystemValidator(TestValidator):
                                 try:
                                     from datetime import datetime
                                     timestamp = datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() if ts else 0.0
-                                except:
+                                except Exception as e:
+                                    debug_debug(f"Could not parse timestamp from email data, using 0.0")
+                                    debug_print_exception(e, context="Parsing email timestamp", include_traceback=True)
                                     timestamp = 0.0
                                 matching_emails.append((timestamp, file_path, email_data))
-                        except:
+                        except Exception as e:
+                            debug_debug(f"Could not process email file, skipping")
+                            debug_print_exception(e, context="Processing email file in validator", include_traceback=True)
                             continue
                     
                     # Sort by timestamp (most recent first) and check only the latest email that matches recipient
@@ -603,7 +612,9 @@ class FileSystemValidator(TestValidator):
                             subject = str(data.get('subject', '')).lower()
                             body = str(data.get('body', '') + ' ' + data.get('body_plain', '')).lower()
                             file_content = subject + ' ' + body
-                        except:
+                        except Exception as e:
+                            debug_debug("Could not parse JSON from file content, using raw content")
+                            debug_print_exception(e, context="Parsing JSON from file content", include_traceback=True)
                             file_content = content
                         
                         # Check if any required subject is in this file
@@ -611,7 +622,8 @@ class FileSystemValidator(TestValidator):
                             if required_subject.lower() in file_content:
                                 found_subjects.add(required_subject)
                 except Exception as e:
-                    print(f"Warning: Could not check subjects in {file_path}: {e}")
+                    debug_info(f"Could not check subjects in {file_path}")
+                    debug_print_exception(e, context=f"Checking subjects in {file_path}", include_traceback=True)
                     continue
             
             # Verify all required subjects were found
@@ -641,8 +653,9 @@ class FileSystemValidator(TestValidator):
                 try:
                     if fnmatch.fnmatch(str(file_path_obj), pattern_str):
                         return True
-                except:
-                    pass
+                except Exception as e:
+                    debug_debug(f"Could not match file path pattern, trying alternative matching")
+                    debug_print_exception(e, context="Matching file path pattern", include_traceback=True)
                 # For patterns like "dir/*.json", check if file is in that directory with matching name
                 if '/' in pattern_str or '\\' in pattern_str:
                     pattern_dir = pattern_obj.parent
@@ -655,8 +668,10 @@ class FileSystemValidator(TestValidator):
                 # No glob - use direct comparison
                 return (str(file_path_obj) == pattern_str or 
                         str(file_path_obj.resolve()) == str(Path(pattern_str).resolve()) if Path(pattern_str).exists() else False)
-        except Exception:
+        except Exception as e:
             # Fallback: simple string containment check
+            debug_debug(f"Could not match file path pattern, using simple string containment fallback")
+            debug_print_exception(e, context="Matching file path pattern", include_traceback=True)
             return pattern in file_path
     
     def _check_file_content(self, file_path: str, expected_content: Union[str, List[str]], min_keywords: int = 2) -> bool:
@@ -674,7 +689,8 @@ class FileSystemValidator(TestValidator):
             
             return False
         except Exception as e:
-            print(f"Warning: Could not read file {file_path}: {e}")
+            debug_info(f"Could not read file {file_path}")
+            debug_print_exception(e, context=f"Reading file {file_path}", include_traceback=True)
             return False
     
     def _check_json_fields_data(self, data: Dict[str, Any], expected_fields: Dict[str, Any]) -> bool:
@@ -750,11 +766,13 @@ class FileSystemValidator(TestValidator):
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             return self._check_json_fields_data(data, expected_fields)
-        except json.JSONDecodeError:
-            print(f"Warning: File {file_path} is not valid JSON")
+        except json.JSONDecodeError as e:
+            debug_info(f"File {file_path} is not valid JSON")
+            debug_print_exception(e, context=f"Parsing JSON file {file_path}", include_traceback=True)
             return False
         except Exception as e:
-            print(f"Warning: Could not validate JSON fields in {file_path}: {e}")
+            debug_info(f"Could not validate JSON fields in {file_path}")
+            debug_print_exception(e, context=f"Validating JSON fields in {file_path}", include_traceback=True)
             return False
 
 
@@ -838,7 +856,8 @@ class MemoryValidator(TestValidator):
             return True
             
         except Exception as e:
-            print(f"Warning: Could not read memory file {self._memory_file}: {e}")
+            debug_info(f"Could not read memory file {self._memory_file}")
+            debug_print_exception(e, context=f"Reading memory file {self._memory_file}", include_traceback=True)
             return False
 
 
@@ -879,7 +898,7 @@ class Mem0MemoryValidator(TestValidator):
     def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
         try:
             # Import here to avoid circular dependencies
-            from agent.backend.mem0_memory_manager import get_mem0_memory_manager
+            from agent.backend.mem0_memory import get_mem0_memory_manager
             from agent.utils import load_config
             
             # Get config
@@ -957,9 +976,8 @@ class Mem0MemoryValidator(TestValidator):
             return True
             
         except Exception as e:
-            print(f"Warning: Could not read mem0 memory: {e}")
-            import traceback
-            traceback.print_exc()
+            debug_info("Could not read mem0 memory")
+            debug_print_exception(e, context="Reading mem0 memory for validation", include_traceback=True)
             return False
 
 
@@ -1077,9 +1095,8 @@ class UnifiedMemoryValidator(TestValidator):
             return True
             
         except Exception as e:
-            print(f"Warning: UnifiedMemoryValidator validation failed: {e}")
-            import traceback
-            traceback.print_exc()
+            debug_info("UnifiedMemoryValidator validation failed")
+            debug_print_exception(e, context="UnifiedMemoryValidator validation", include_traceback=True)
             return False
 
 
@@ -1111,14 +1128,16 @@ class SemanticJudgeValidator(TestValidator):
         
         # Load semantic judge config
         try:
-            from utils import load_config
+            from agent.utils import load_config
             global_config = load_config()
             judge_config = global_config.get("benchmark", {}).get("semantic_judge", {})
             self._judge_model = judge_config.get("model_name", "gpt-4o")  # Uses benchmark.semantic_judge.model_name
             self._judge_temperature = judge_config.get("temperature", 0.0)
             # Get seed from config for determinism
             self._judge_seed = global_config.get("seed", 42)
-        except Exception:
+        except Exception as e:
+            debug_debug("Could not load semantic judge config, using defaults")
+            debug_print_exception(e, context="Loading semantic judge config", include_traceback=True)
             self._judge_model = "gpt-4o"
             self._judge_temperature = 0.0
             self._judge_seed = 42
@@ -1139,7 +1158,8 @@ class SemanticJudgeValidator(TestValidator):
             result = self._call_semantic_judge(content_to_check, self._query)
             return result
         except Exception as e:
-            print(f"Warning: Semantic judge validation failed: {e}")
+            debug_info("Semantic judge validation failed")
+            debug_print_exception(e, context="Semantic judge validation", include_traceback=True)
             return False
     
     def score(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> float:
@@ -1242,7 +1262,9 @@ class SemanticJudgeValidator(TestValidator):
                             subject = email.get('subject', '')
                             if subject.lower().startswith('fwd:') or 'forwarded_from' in email:
                                 forwarded_emails.append((email_file, email))
-                        except:
+                        except Exception as e:
+                            debug_debug(f"Could not process email file, skipping")
+                            debug_print_exception(e, context="Processing email file in validator", include_traceback=True)
                             continue
                     
                     if not forwarded_emails:
@@ -1253,7 +1275,9 @@ class SemanticJudgeValidator(TestValidator):
                         ts = email_data.get('sent_ts') or email_data.get('created_ts', '')
                         try:
                             return datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
-                        except:
+                        except Exception as e:
+                            debug_debug("Could not parse timestamp, returning 0.0")
+                            debug_print_exception(e, context="Parsing timestamp in validator", include_traceback=True)
                             return 0.0
                     
                     forwarded_emails.sort(key=lambda x: get_timestamp(x[1]), reverse=True)
@@ -1270,7 +1294,9 @@ class SemanticJudgeValidator(TestValidator):
                             with open(email_file, 'r', encoding='utf-8') as f:
                                 email = json.load(f)
                             emails.append((email_file, email))
-                        except:
+                        except Exception as e:
+                            debug_debug(f"Could not process email file, skipping")
+                            debug_print_exception(e, context="Processing email file in validator", include_traceback=True)
                             continue
                     
                     if not emails:
@@ -1281,7 +1307,9 @@ class SemanticJudgeValidator(TestValidator):
                         ts = email_data.get('sent_ts') or email_data.get('created_ts', '')
                         try:
                             return datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
-                        except:
+                        except Exception as e:
+                            debug_debug("Could not parse timestamp, returning 0.0")
+                            debug_print_exception(e, context="Parsing timestamp in validator", include_traceback=True)
                             return 0.0
                     
                     emails.sort(key=lambda x: get_timestamp(x[1]), reverse=True)
@@ -1338,7 +1366,8 @@ class SemanticJudgeValidator(TestValidator):
             return ""
             
         except Exception as e:
-            print(f"Warning: Error extracting outbox content: {e}")
+            debug_info("Error extracting outbox content")
+            debug_print_exception(e, context="Extracting outbox content", include_traceback=True)
             return ""
     
     def _call_semantic_judge(self, content: str, query: str) -> bool:
@@ -1451,6 +1480,7 @@ class SemanticJudgeValidator(TestValidator):
                 # Standard fact/figure matching evaluation
                 # Local helper to extract/normalize numeric facts and figures
                 def extract_facts(text: str) -> Dict[str, Any]:
+                    import re  # Import re inside function to avoid closure issues
                     try:
                         # Numbers (integers and decimals), with optional commas
                         numbers = re.findall(r"(?<![\w\d])(?:\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d+)(?![\w\d])", text)
@@ -1467,7 +1497,9 @@ class SemanticJudgeValidator(TestValidator):
                             "currency": currency,
                             "kpis": list({k.lower() for k in kpis}),
                         }
-                    except Exception:
+                    except Exception as e:
+                        debug_debug("Could not extract facts, returning empty fact dict")
+                        debug_print_exception(e, context="Extracting facts from content", include_traceback=True)
                         return {"numbers": [], "percentages": [], "currency": [], "kpis": []}
                 
                 query_facts = extract_facts(query)
@@ -1617,8 +1649,9 @@ class SemanticJudgeValidator(TestValidator):
                             print(f"   Fallback: Parsed JSON, contains_information = {result}")
                             print("="*80 + "\n")
                             return result
-                    except:
-                        pass
+                    except Exception as e:
+                        debug_debug("Could not extract JSON from semantic judge response, trying fallback")
+                        debug_print_exception(e, context="Extracting JSON from semantic judge response", include_traceback=True)
                     # Last resort: check if response mentions option (a) or seems positive
                     result = "(a)" in result_text or "option a" in result_text.lower() or "answer a" in result_text.lower()
                     print(f"   Last resort: Checking for '(a)' mention = {result}")
@@ -1649,7 +1682,8 @@ class SemanticJudgeValidator(TestValidator):
             return False
         
         except Exception as e:
-            print(f"Semantic judge API error: {e}")
+            debug_info("Semantic judge API error")
+            debug_print_exception(e, context="Calling semantic judge API", include_traceback=True)
             return False
 
 
@@ -1773,7 +1807,7 @@ class CrossStepSemanticJudgeValidator(TestValidator):
                 break
         
         if not reference_result:
-            print(f"Warning: Could not find step {self._reference_step} in step results")
+            debug_info(f"Could not find step {self._reference_step} in step results")
             return False
         
         # Extract information from reference step
@@ -1786,7 +1820,7 @@ class CrossStepSemanticJudgeValidator(TestValidator):
         extracted_info = self._extract_information(reference_response, self._extract_focus)
         
         if not extracted_info:
-            print(f"Warning: Could not extract {self._extract_focus} from step {self._reference_step}")
+            debug_info(f"Could not extract {self._extract_focus} from step {self._reference_step}")
             return False
         
         # Store extracted information for debugging
@@ -1816,7 +1850,8 @@ class CrossStepSemanticJudgeValidator(TestValidator):
             result = self._call_semantic_judge(current_content, query)
             return result
         except Exception as e:
-            print(f"Warning: Cross-step semantic judge validation failed: {e}")
+            debug_info("Cross-step semantic judge validation failed")
+            debug_print_exception(e, context="Cross-step semantic judge validation", include_traceback=True)
             return False
     
     def _extract_information(self, text: str, focus: str) -> str:
@@ -1869,7 +1904,8 @@ class CrossStepSemanticJudgeValidator(TestValidator):
             
             return extracted
         except Exception as e:
-            print(f"Warning: Error extracting information: {e}")
+            debug_info("Error extracting information")
+            debug_print_exception(e, context="Extracting information from response", include_traceback=True)
             return ""
     
     def _build_comparison_query(self, extracted_info: str, compare_focus: str) -> str:
@@ -1977,7 +2013,8 @@ class CrossStepSemanticJudgeValidator(TestValidator):
             
             return ""
         except Exception as e:
-            print(f"Warning: Error extracting outbox content: {e}")
+            debug_info("Error extracting outbox content")
+            debug_print_exception(e, context="Extracting outbox content", include_traceback=True)
             return ""
     
     def _call_semantic_judge(self, content: str, query: str) -> bool:
@@ -2075,7 +2112,8 @@ class CrossStepSemanticJudgeValidator(TestValidator):
                     return json_match.group(1).lower() == "true"
                 return "true" in result_text.lower() and "false" not in result_text.lower()[:20]
         except Exception as e:
-            print(f"Warning: Cross-step semantic judge API error: {e}")
+            debug_info("Cross-step semantic judge API error")
+            debug_print_exception(e, context="Calling cross-step semantic judge API", include_traceback=True)
             return False
     
     def score(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> float:
@@ -2181,7 +2219,8 @@ class CompositeValidator(TestValidator):
                     }
                 )
             except Exception as e:
-                print(f"Warning: Could not log validator results to trace: {e}")
+                debug_info("Could not log validator results to trace")
+                debug_print_exception(e, context="Logging validator results to trace", include_traceback=True)
         
         if operator == "OR":
             return any(results)
@@ -2222,7 +2261,9 @@ class CompositeValidator(TestValidator):
             if validator:
                 try:
                     scores.append(float(validator.score(agent_response, session_id, traces)))
-                except Exception:
+                except Exception as e:
+                    debug_debug("Could not compute validator score, using 0.0")
+                    debug_print_exception(e, context="Computing validator score", include_traceback=True)
                     scores.append(0.0)
         if not scores:
             return 0.0
