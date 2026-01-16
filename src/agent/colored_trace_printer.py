@@ -79,7 +79,7 @@ class ColoredTracePrinter:
                         args_str = json.dumps(args, indent=2) if args else "{}"
                         # args_str = self._truncate(args_str)
                         return self._colorize(
-                            f"🔧 Tool Call: {tool_name}\n{self.BOLD}Inputs:{self.RESET} {args_str}",
+                            f"Tool Call: {tool_name}\n{self.BOLD}Inputs:{self.RESET} {args_str}",
                             self.TOOL_CALL
                         )
                 
@@ -89,7 +89,7 @@ class ColoredTracePrinter:
                     if content.strip():
                         # Don't truncate agent responses - show full content
                         return self._colorize(
-                            f"🤖 Agent: {content}",
+                            f"Agent: {content}",
                             self.AGENT_RESPONSE
                         )
         
@@ -104,7 +104,7 @@ class ColoredTracePrinter:
                         content = str(msg.content)
                         content = self._truncate(content)
                         return self._colorize(
-                            f"✅ Tool Result ({tool_name}): {content}",
+                            f"Tool Result ({tool_name}): {content}",
                             self.TOOL_RESULT
                         )
         
@@ -121,7 +121,7 @@ class ColoredTracePrinter:
                             args_str = json.dumps(args, indent=2) if args else "{}"
                             # args_str = self._truncate(args_str)
                             return self._colorize(
-                                f"🔧 Tool Call: {tool_name}\n{self.BOLD}Inputs:{self.RESET} {args_str}",
+                                f"Tool Call: {tool_name}\n{self.BOLD}Inputs:{self.RESET} {args_str}",
                                 self.TOOL_CALL
                             )
                     elif hasattr(msg, 'content') and msg.content:
@@ -129,7 +129,7 @@ class ColoredTracePrinter:
                         if content.strip():
                             # Don't truncate agent responses - show full content
                             return self._colorize(
-                                f"🤖 Agent: {content}",
+                                f"Agent: {content}",
                                 self.AGENT_RESPONSE
                             )
         
@@ -152,7 +152,7 @@ class ColoredTracePrinter:
             text = payload.get('text', '')
             text = self._truncate(text)
             return self._colorize(
-                f"👤 User: {text}",
+                f"User: {text}",
                 self.USER_INPUT
             )
         
@@ -160,7 +160,7 @@ class ColoredTracePrinter:
             text = payload.get('text', '')
             # Don't truncate agent responses - show full content
             return self._colorize(
-                f"🤖 Agent: {text}",
+                f"Agent: {text}",
                 self.AGENT_RESPONSE
             )
         
@@ -170,7 +170,7 @@ class ColoredTracePrinter:
             inputs_str = json.dumps(inputs, indent=2) if inputs else "{}"
             inputs_str = self._truncate(inputs_str)
             return self._colorize(
-                f"🔧 Tool Call: {tool_name}\n{self.BOLD}Inputs:{self.RESET} {inputs_str}",
+                f"Tool Call: {tool_name}\n{self.BOLD}Inputs:{self.RESET} {inputs_str}",
                 self.TOOL_CALL
             )
         
@@ -182,21 +182,21 @@ class ColoredTracePrinter:
                 error = str(outputs['error'])
                 error = self._truncate(error)
                 return self._colorize(
-                    f"❌ Tool Error ({tool_name}): {error}",
+                    f"Tool Error ({tool_name}): {error}",
                     self.ERROR
                 )
             elif 'result' in outputs:
                 result = str(outputs['result'])
                 result = self._truncate(result)
                 return self._colorize(
-                    f"✅ Tool Result ({tool_name}): {result}",
+                    f"Tool Result ({tool_name}): {result}",
                     self.TOOL_RESULT
                 )
             else:
                 outputs_str = json.dumps(outputs, indent=2)
                 outputs_str = self._truncate(outputs_str)
                 return self._colorize(
-                    f"✅ Tool Result ({tool_name}): {outputs_str}",
+                    f"Tool Result ({tool_name}): {outputs_str}",
                     self.TOOL_RESULT
                 )
         
@@ -230,7 +230,7 @@ class ColoredTracePrinter:
             event_str = json.dumps(payload, indent=2)
             event_str = self._truncate(event_str)
             return self._colorize(
-                f"ℹ️  {event_type}: {event_str}",
+                f"{event_type}: {event_str}",
                 self.INFO
             )
     

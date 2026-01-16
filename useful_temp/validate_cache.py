@@ -14,7 +14,7 @@ import os
 BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR / "src"))
 
-from agent.utils import validate_cache_integrity, print_cache_validation_report
+from agent.attack_utils import validate_cache_integrity, print_cache_validation_report
 
 
 def main():

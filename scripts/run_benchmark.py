@@ -229,7 +229,7 @@ def run_benchmark(
         verbose=False
     )
     if not test_files:
-        print(f"⚠️  No test files found for path: {test_path}")
+        print(f"WARNING: No test files found for path: {test_path}")
         return {
             "success": False,
             "error": "No test files found",
@@ -252,7 +252,7 @@ def run_benchmark(
     )
     
     if all_exist and not force:
-        print(f"✅ All results already exist for {memory_backend}/{unified_defense}")
+        print(f"All results already exist for {memory_backend}/{unified_defense}")
         print(f"   Use --force to overwrite")
         return {
             "success": True,
@@ -263,7 +263,7 @@ def run_benchmark(
         }
     
     if missing and not force:
-        print(f"⏭️  {len(missing)} test(s) already have results, {len(test_files) - len(missing)} will run")
+        print(f"SKIPPED: {len(missing)} test(s) already have results, {len(test_files) - len(missing)} will run")
     
     # Initialize TestBench with config dict directly (no temp file needed)
     bench = TestBench(config=config, defense_type_override=unified_defense, force=force)
@@ -363,11 +363,11 @@ def run_all_defenses(
     print(f"{'='*80}")
     for defense_type, stats in summary["defenses"].items():
         if stats.get("skipped"):
-            status = "⏭️  SKIPPED"
+            status = "SKIPPED"
         elif stats.get("tests_passed", 0) == stats.get("tests_run", 0):
-            status = "✅ PASSED"
+            status = "PASSED"
         else:
-            status = "❌ FAILED"
+            status = "FAILED"
         print(f"{defense_type:20s}: {status}", end="")
         if not stats.get("skipped"):
             print(f" ({stats.get('tests_passed', 0)}/{stats.get('tests_run', 0)} tests)")
@@ -539,9 +539,9 @@ def _run_single_combination(
     finally:
         # Print completion status to terminal
         if result and result.get("success"):
-            status = "✅"
+            status = "OK"
         else:
-            status = "❌"
+            status = "ERROR"
         print(f"{status} {memory_backend.upper()} + {unified_defense} - See individual test logs in data/benchmark/logs/{target_model_name or 'unknown'}/{memory_backend}/{unified_defense}/{attack_type}/", flush=True)
     
     # Ensure result is never None
@@ -568,7 +568,7 @@ def _signal_handler(signum, frame):
     global _interrupted, _executor_ref, _futures_ref
     _interrupted = True
     print(f"\n\n{'='*80}", flush=True)
-    print(f"⚠️  INTERRUPTED: Received signal {signum}. Shutting down gracefully...", flush=True)
+    print(f"INTERRUPTED: Received signal {signum}. Shutting down gracefully...", flush=True)
     print(f"{'='*80}\n", flush=True)
     
     # Cancel all pending futures if they exist
@@ -674,7 +674,7 @@ def run_all_combinations(
             for i, args_tuple in enumerate(args_list, 1):
                 # Check if we've been interrupted
                 if _interrupted:
-                    print("\n⚠️  Interrupt detected. Stopping execution...", flush=True)
+                    print("\nWARNING: Interrupt detected. Stopping execution...", flush=True)
                     break
                 
                 backend, defense = args_tuple[0], args_tuple[1]
@@ -716,10 +716,10 @@ def run_all_combinations(
                     
                     print()  # Blank line between combinations
                 except KeyboardInterrupt:
-                    print("\n⚠️  KeyboardInterrupt received. Stopping execution...", flush=True)
+                    print("\nWARNING: KeyboardInterrupt received. Stopping execution...", flush=True)
                     raise
         except KeyboardInterrupt:
-            print("\n⚠️  Benchmark interrupted by user. Exiting...", flush=True)
+            print("\nWARNING: Benchmark interrupted by user. Exiting...", flush=True)
             raise
     else:
         # Parallel execution using ProcessPoolExecutor
@@ -749,7 +749,7 @@ def run_all_combinations(
             for future in as_completed(future_to_combo):
                 # Check if we've been interrupted
                 if _interrupted:
-                    print("\n⚠️  Interrupt detected. Cancelling remaining tasks...", flush=True)
+                    print("\nWARNING: Interrupt detected. Cancelling remaining tasks...", flush=True)
                     # Cancel all remaining futures
                     for remaining_future in future_to_combo:
                         if not remaining_future.done():
@@ -778,9 +778,9 @@ def run_all_combinations(
                         api_error_count += 1
                     
                     # Print result with error indicators
-                    status = "✅" if result.get("success") else "❌"
+                    status = "OK" if result.get("success") else "ERROR"
                     if result.get("skipped"):
-                        status = "⏭️"
+                        status = "SKIPPED"
                     
                     error_indicator = ""
                     if has_rate_limit_error:
@@ -820,7 +820,7 @@ def run_all_combinations(
                         summary["failed_combinations"] += 1
                 except FutureTimeoutError:
                     error_str = f"Process timed out after 10 minutes - may be stuck"
-                    print(f"[{completed}/{total_combinations}] ❌ {backend.upper()} + {defense} - TIMEOUT: {error_str}")
+                    print(f"[{completed}/{total_combinations}] ERROR: {backend.upper()} + {defense} - TIMEOUT: {error_str}")
                     # Try to cancel the future
                     future.cancel()
                     summary["combinations"][f"{backend}_{defense}"] = {
@@ -834,11 +834,11 @@ def run_all_combinations(
                     # Error is logged to individual log file - no need for shared error.log
                 except KeyboardInterrupt:
                     # Re-raise KeyboardInterrupt to propagate it up
-                    print(f"\n⚠️  KeyboardInterrupt received. Shutting down...", flush=True)
+                    print(f"\nWARNING: KeyboardInterrupt received. Shutting down...", flush=True)
                     raise
                 except Exception as e:
                     error_str = str(e)
-                    print(f"[{completed}/{total_combinations}] ❌ {backend.upper()} + {defense} - Exception: {error_str}")
+                    print(f"[{completed}/{total_combinations}] ERROR: {backend.upper()} + {defense} - Exception: {error_str}")
                     
                     # Track this as a failed combination with error
                     summary["combinations"][f"{backend}_{defense}"] = {
@@ -867,7 +867,7 @@ def run_all_combinations(
                 executor.shutdown(wait=True, cancel_futures=False)
         except KeyboardInterrupt:
             # Ensure executor is shut down even if we catch KeyboardInterrupt
-            print("\n⚠️  KeyboardInterrupt caught. Forcing shutdown of all processes...", flush=True)
+            print("\nWARNING: KeyboardInterrupt caught. Forcing shutdown of all processes...", flush=True)
             executor.shutdown(wait=False, cancel_futures=True)
             _executor_ref = None
             raise  # Re-raise to exit the script
@@ -890,9 +890,9 @@ def run_all_combinations(
     
     # Report combinations with errors
     if summary["combinations_with_errors"]:
-        print(f"\n{'⚠️' * 40}")
-        print("⚠️  COMBINATIONS WITH ERRORS - RESULTS MAY BE INCORRECT ⚠️")
-        print(f"{'⚠️' * 40}")
+        print(f"\n{'WARNING' * 40}")
+        print("WARNING: COMBINATIONS WITH ERRORS - RESULTS MAY BE INCORRECT")
+        print(f"{'WARNING' * 40}")
         print(f"\nThe following {len(summary['combinations_with_errors'])} combination(s) had errors:")
         print("You should rerun these to get reliable results:\n")
         
@@ -916,20 +916,20 @@ def run_all_combinations(
     
     # Report specific error types
     if summary["combinations_with_connection_errors"]:
-        print(f"⚠️  Connection errors detected in {len(summary['combinations_with_connection_errors'])} combination(s)")
+        print(f"WARNING: Connection errors detected in {len(summary['combinations_with_connection_errors'])} combination(s)")
         print(f"   These may have incomplete results due to network issues")
         print(f"   Affected: {', '.join([f'{b}+{d}' for b, d in summary['combinations_with_connection_errors']])}")
         print()
     
     if summary["combinations_with_rate_limit_errors"]:
-        print(f"⚠️  Rate limit errors detected in {len(summary['combinations_with_rate_limit_errors'])} combination(s)")
+        print(f"WARNING: Rate limit errors detected in {len(summary['combinations_with_rate_limit_errors'])} combination(s)")
         print(f"   Consider reducing --num-workers or adding delays")
         print(f"   Affected: {', '.join([f'{b}+{d}' for b, d in summary['combinations_with_rate_limit_errors']])}")
         print()
     
     # Report general API issues
     if rate_limit_count > 0 or api_error_count > 0:
-        print(f"⚠️  API ISSUES DETECTED:")
+        print(f"WARNING: API ISSUES DETECTED:")
         if rate_limit_count > 0:
             print(f"   Rate limit errors: {rate_limit_count}")
         if api_error_count > 0:
@@ -939,10 +939,10 @@ def run_all_combinations(
     
     # Final status
     if summary["combinations_with_errors"] or summary["failed_combinations"] > 0:
-        print(f"{'❌' * 40}")
-        print("❌  WARNING: Some combinations had EXECUTION ERRORS. Results may be unreliable!")
-        print(f"{'❌' * 40}")
-        print(f"\n⚠️  Remember: Test failures (some tests passing, some failing) are EXPECTED")
+        print(f"{'ERROR' * 40}")
+        print("ERROR: WARNING: Some combinations had EXECUTION ERRORS. Results may be unreliable!")
+        print(f"{'ERROR' * 40}")
+        print(f"\nWARNING: Remember: Test failures (some tests passing, some failing) are EXPECTED")
         print(f"   and are what we're measuring. Execution errors (API failures, connection")
         print(f"   errors, exceptions) are NOT expected and indicate problems running the benchmark.")
         if summary["combinations_with_errors"]:
@@ -950,9 +950,9 @@ def run_all_combinations(
         if summary["failed_combinations"] > 0:
             print(f"\n{summary['failed_combinations']} combination(s) failed completely (could not run).")
     else:
-        print(f"{'✅' * 40}")
-        print("✅  All combinations completed without EXECUTION ERRORS. Results are reliable!")
-        print(f"{'✅' * 40}")
+        print(f"{'SUCCESS' * 40}")
+        print("SUCCESS: All combinations completed without EXECUTION ERRORS. Results are reliable!")
+        print(f"{'SUCCESS' * 40}")
         print(f"\nNote: Test failures (some tests passing, some failing) are expected and normal.")
         print(f"      Only execution errors (API failures, connection errors, etc.) are reported here.")
     

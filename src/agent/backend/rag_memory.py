@@ -29,21 +29,11 @@ from typing import List, Dict, Any, Optional
 import threading
 import json
 from datetime import datetime, timezone
+from pydantic import SecretStr
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
 from agent.utils import debug_info, debug_debug, debug_print_exception
-
-try:
-    from langchain_openai import OpenAIEmbeddings
-    from langchain_community.vectorstores import FAISS
-    try:
-        from langchain_core.documents import Document
-    except ImportError:
-        # Fallback for older langchain versions
-        from langchain.schema import Document
-    LANGCHAIN_AVAILABLE = True
-except ImportError as e:
-    LANGCHAIN_AVAILABLE = False
-    print(f"Warning: langchain packages not available. RAG memory will not work. Error: {e}")
-    print("Install with: pip install langchain langchain-openai langchain-community langchain-core faiss-cpu")
 
 
 class RAGDefenseManager:
@@ -170,11 +160,6 @@ class RAGMemoryManager:
             vectorstore_path: Optional path to persist vector store
             api_key: Optional OpenAI API key (uses env var if not provided)
         """
-        if not LANGCHAIN_AVAILABLE:
-            raise ImportError(
-                "langchain packages required for RAG memory. "
-                "Install with: pip install langchain langchain-openai langchain-community faiss-cpu"
-            )
         
         self.embedding_model = embedding_model
         self.top_k = top_k
@@ -189,7 +174,7 @@ class RAGMemoryManager:
         
         self.embeddings = OpenAIEmbeddings(
             model=embedding_model,
-            api_key=api_key
+            api_key=SecretStr(api_key)
         )
         
         # Initialize vector store

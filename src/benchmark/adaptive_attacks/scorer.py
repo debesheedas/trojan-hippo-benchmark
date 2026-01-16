@@ -254,7 +254,7 @@ class AttackScorer:
             from pathlib import Path as PathLib
             
             # Clear previous injected emails
-            inbox_dir = PathLib(test_config.get("data", {}).get("mailbox_dir", "data/interactive_agent/mailbox"))
+            inbox_dir = PathLib(test_config.get("data", {}).get("mailbox_dir", "data/agent/mailbox"))
             if inbox_dir.exists():
                 for f in inbox_dir.glob("attack_*.json"):
                     try:
@@ -875,7 +875,7 @@ Output format (include ALL required parameters):
                 
                 if validation_passed:
                     if self.logger:
-                        self.logger.info(f"[ideal_tool_calls] ✅ Successfully generated {len(ideal_calls)} ideal tool calls")
+                        self.logger.info(f"[ideal_tool_calls] Successfully generated {len(ideal_calls)} ideal tool calls")
                         for call in ideal_calls:
                             self.logger.info(f"[ideal_tool_calls]    - {call}")
                     

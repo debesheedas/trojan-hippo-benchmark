@@ -2,18 +2,22 @@
 Utility functions for the email agent MVP.
 Provides helpers for ID generation, timestamps, trace logging, config loading, and LLM initialization.
 """
-
-import json
-import uuid
-import yaml
 import os
 import sys
+import json
+import uuid
 import traceback
+import time
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 from enum import Enum
 from typing import Optional, Dict, Any, Literal
+import yaml
 from dotenv import load_dotenv
+import numpy as np
+from openai import OpenAI
+import google.generativeai as genai
 
 # Load environment variables
 load_dotenv()
@@ -191,24 +195,17 @@ def set_global_seeds(seed: int = 42) -> None:
     
     This sets seeds for:
     - Python's random module
-    - NumPy's random module (if available)
+    - NumPy's random module
     - PYTHONHASHSEED environment variable
     
     Args:
         seed: Integer seed value (default: 42)
     """
-    import os
-    import random
-    
     # Set Python random seed
     random.seed(seed)
     
-    # Set NumPy random seed if available
-    try:
-        import numpy as np
-        np.random.seed(seed)
-    except ImportError:
-        pass
+    # Set NumPy random seed
+    np.random.seed(seed)
     
     # Set hash seed for dictionary ordering (Python 3.3+)
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -235,6 +232,52 @@ def load_config(config_path: str = "agent_config.yaml") -> dict:
     
     with open(config_file, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+    
+    # Ensure config is a dict
+    if not isinstance(config, dict):
+        raise ValueError(f"Configuration file must contain a dictionary, got {type(config)}")
+    
+    # Look up context window and API token limits for the model and add them to config
+    model_context_windows = {
+        "gpt-5-mini": 400000,
+        "gpt-4o": 128000,
+        "gpt-4o-mini": 128000,
+        "gpt-4.1-mini": 1000000,
+        "o1": 200000,
+        "o1-mini": 200000,
+        "claude-3-7-sonnet": 200000,
+        "gemini-2.0-flash": 1000000,
+    }
+    
+    api_token_limits = {
+        "gpt-5-mini": 272000,
+        "gpt-4o": 128000,
+        "gpt-4o-mini": 128000,
+        "gpt-4.1-mini": 1000000,
+        "o1": 200000,
+        "o1-mini": 200000,
+        "claude-3-7-sonnet": 200000,
+        "gemini-2.0-flash": 1000000,
+    }
+    
+    # Get model name and set context window, API token limit, and provider in config
+    agent_config = config.get("agent", {})
+    if isinstance(agent_config, dict):
+        model_name = agent_config.get("target_model_name")
+        if model_name:
+            context_window = model_context_windows.get(model_name.lower(), 128000)
+            api_token_limit = api_token_limits.get(model_name.lower(), 128000)
+            
+            # Detect provider if not already set in config
+            provider = agent_config.get("provider")
+            if provider is None:
+                provider = detect_provider(model_name)
+            
+            if "agent" not in config:
+                config["agent"] = {}
+            config["agent"]["context_window"] = context_window
+            config["agent"]["api_token_limit"] = api_token_limit
+            config["agent"]["provider"] = provider
     
     return config
 
@@ -322,231 +365,24 @@ def ensure_data_directories(config: dict) -> None:
     data_config = config.get("data", {})
     
     # Create mailbox directory
-    mailbox_dir = Path(data_config.get("mailbox_dir", "data/interactive_agent/mailbox"))
+    mailbox_dir = Path(data_config.get("mailbox_dir", "data/agent/mailbox"))
     mailbox_dir.mkdir(parents=True, exist_ok=True)
     
     # Create drafts directory
-    drafts_dir = Path(data_config.get("drafts_dir", "data/interactive_agent/drafts"))
+    drafts_dir = Path(data_config.get("drafts_dir", "data/agent/drafts"))
     drafts_dir.mkdir(parents=True, exist_ok=True)
     
     # Create outbox directory
-    outbox_dir = Path(data_config.get("outbox_dir", "data/interactive_agent/outbox"))
+    outbox_dir = Path(data_config.get("outbox_dir", "data/agent/outbox"))
     outbox_dir.mkdir(parents=True, exist_ok=True)
     
     # Create trace file parent directory
-    trace_file = Path(data_config.get("trace_file", "data/interactive_agent/trace.jsonl"))
+    trace_file = Path(data_config.get("trace_file", "data/agent/trace.jsonl"))
     trace_file.parent.mkdir(parents=True, exist_ok=True)
     
     # Initialize trace file if it doesn't exist
     if not trace_file.exists():
         trace_file.touch()
-
-
-def compare_attack_bench_files(original_file: Path, cached_file: Path) -> Dict[str, Any]:
-    """
-    Compare attack benchmark files to ensure only attack_emails differ.
-    
-    This function verifies that cached files only differ from original files
-    in the attack_emails attribute, ensuring the caching system works correctly.
-    
-    Args:
-        original_file: Path to the original attack benchmark file
-        cached_file: Path to the cached attack benchmark file
-    
-    Returns:
-        Dictionary with comparison results:
-        - valid: bool - True if files are valid (only attack_emails differ)
-        - attack_emails_differ: bool - True if attack_emails are different
-        - differences: List[str] - List of field names that differ
-        - summary: str - Human-readable summary
-    """
-    result = {
-        "valid": True,
-        "attack_emails_differ": False,
-        "differences": [],
-        "summary": ""
-    }
-    
-    try:
-        # Load both files
-        with open(original_file, 'r', encoding='utf-8') as f:
-            original_data = json.load(f)
-        
-        with open(cached_file, 'r', encoding='utf-8') as f:
-            cached_data = json.load(f)
-        
-        # Compare all keys and values except attack_emails
-        for key in original_data:
-            if key == "attack_emails":
-                # Check if attack_emails differ
-                if original_data[key] != cached_data.get(key):
-                    result["attack_emails_differ"] = True
-                continue
-            
-            # For all other keys, they must be identical
-            if key not in cached_data:
-                result["valid"] = False
-                result["differences"].append(f"{key} (missing in cached)")
-            elif original_data[key] != cached_data[key]:
-                result["valid"] = False
-                result["differences"].append(key)
-        
-        # Check for extra keys in cached file (excluding optimization_metadata)
-        for key in cached_data:
-            if key not in original_data and key != "optimization_metadata":
-                result["valid"] = False
-                result["differences"].append(f"{key} (extra in cached)")
-        
-        # Generate summary
-        if result["valid"] and result["attack_emails_differ"]:
-            result["summary"] = "✅ Files are identical except for attack_emails (as expected)"
-        elif result["valid"] and not result["attack_emails_differ"]:
-            result["summary"] = "✅ Files are completely identical"
-        else:
-            result["summary"] = f"❌ Files differ in fields: {', '.join(result['differences'])}"
-        
-        return result
-        
-    except Exception as e:
-        return {
-            "valid": False,
-            "attack_emails_differ": False,
-            "differences": [f"Error: {e}"],
-            "summary": f"❌ Error comparing files: {e}"
-        }
-
-
-def validate_cache_integrity(cache_dir: str = "data/benchmark/attack_bench_cache", 
-                           original_dir: str = "data/benchmark/attack_bench") -> Dict[str, Any]:
-    """
-    Validate the integrity of all cached attack benchmark files.
-    
-    This function compares all cached files with their original counterparts
-    to ensure the caching system is working correctly.
-    
-    Args:
-        cache_dir: Directory containing cached files
-        original_dir: Directory containing original files
-    
-    Returns:
-        Dictionary with validation results:
-        - total_files: int - Total number of files compared
-        - valid_files: int - Number of files that are correctly cached
-        - invalid_files: int - Number of files with issues
-        - results: List[Dict] - Detailed results for each file
-        - summary: str - Overall validation summary
-    """
-    cache_path = Path(cache_dir)
-    original_path = Path(original_dir)
-    
-    if not cache_path.exists():
-        return {
-            "total_files": 0,
-            "valid_files": 0,
-            "invalid_files": 0,
-            "results": [],
-            "summary": "❌ Cache directory does not exist"
-        }
-    
-    # Find all cached files
-    cached_files = list(cache_path.rglob("*.json"))
-    results = []
-    valid_files = 0
-    invalid_files = 0
-    
-    for cached_file in cached_files:
-        # Find corresponding original file
-        relative_path = cached_file.relative_to(cache_path)
-        original_file = original_path / relative_path
-        
-        if not original_file.exists():
-            results.append({
-                "cached_file": str(cached_file),
-                "original_file": str(original_file),
-                "status": "missing_original",
-                "result": {
-                    "identical": False,
-                    "summary": "❌ Original file not found"
-                }
-            })
-            invalid_files += 1
-            continue
-        
-        # Compare files
-        comparison_result = compare_attack_bench_files(original_file, cached_file)
-        
-        # Use the simplified valid flag
-        is_valid = comparison_result["valid"]
-        
-        if is_valid:
-            valid_files += 1
-        else:
-            invalid_files += 1
-        
-        results.append({
-            "cached_file": str(cached_file),
-            "original_file": str(original_file),
-            "status": "valid" if is_valid else "invalid",
-            "result": comparison_result
-        })
-    
-    total_files = len(cached_files)
-    
-    # Generate summary
-    if invalid_files == 0:
-        summary = f"✅ All {total_files} cached files are valid"
-    else:
-        summary = f"⚠️ {valid_files}/{total_files} cached files are valid, {invalid_files} have issues"
-    
-    return {
-        "total_files": total_files,
-        "valid_files": valid_files,
-        "invalid_files": invalid_files,
-        "results": results,
-        "summary": summary
-    }
-
-
-def print_cache_validation_report(validation_result: Dict[str, Any]) -> None:
-    """
-    Print a formatted validation report for cache integrity.
-    
-    Args:
-        validation_result: Result from validate_cache_integrity()
-    """
-    print("=" * 80)
-    print("CACHE INTEGRITY VALIDATION REPORT")
-    print("=" * 80)
-    print(f"Total files: {validation_result['total_files']}")
-    print(f"Valid files: {validation_result['valid_files']}")
-    print(f"Invalid files: {validation_result['invalid_files']}")
-    print(f"Summary: {validation_result['summary']}")
-    print()
-    
-    if validation_result['invalid_files'] > 0:
-        print("INVALID FILES:")
-        print("-" * 40)
-        for result in validation_result['results']:
-            if result['status'] == 'invalid':
-                print(f"❌ {result['cached_file']}")
-                print(f"   Original: {result['original_file']}")
-                print(f"   Issue: {result['result']['summary']}")
-                if result['result']['differences']:
-                    print("   Differences:")
-                    for diff in result['result']['differences']:
-                        print(f"     - {diff}")
-                print()
-    
-    print("VALID FILES:")
-    print("-" * 40)
-    for result in validation_result['results']:
-        if result['status'] == 'valid':
-            print(f"✅ {result['cached_file']}")
-            if result['result']['attack_emails_differ']:
-                print("   (attack_emails differ as expected)")
-            else:
-                print("   (completely identical)")
-    print("=" * 80)
 
 
 # ============================================================================
@@ -585,8 +421,6 @@ def get_openai_client(api_key: Optional[str] = None):
     Returns:
         OpenAI client instance
     """
-    from openai import OpenAI
-    
     if api_key is None:
         api_key = os.getenv("OPENAI_API_KEY")
     
@@ -606,14 +440,6 @@ def get_gemini_client(api_key: Optional[str] = None):
     Returns:
         Google Generative AI client instance
     """
-    try:
-        import google.generativeai as genai
-    except ImportError:
-        raise ImportError(
-            "google-generativeai package is required for Gemini models. "
-            "Install it with: pip install google-generativeai"
-        )
-    
     if api_key is None:
         api_key = os.getenv("GEMINI_API_KEY")
     
@@ -680,9 +506,6 @@ def call_openai_chat_completion(
     if seed is not None:
         params["seed"] = seed
     
-    import time
-    import random
-    
     max_retries = 5
     base_delay = 1.0  # Start with 1 second
     
@@ -708,21 +531,19 @@ def call_openai_chat_completion(
             if (is_rate_limit or is_connection_error) and attempt < max_retries - 1:
                 # Exponential backoff with jitter
                 delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
-                import sys
                 error_type_display = "RATE LIMIT" if is_rate_limit else "CONNECTION"
-                print(f"⚠️  {error_type_display} ERROR (attempt {attempt + 1}/{max_retries}): {e}", file=sys.stderr, flush=True)
+                print(f"WARNING: {error_type_display} ERROR (attempt {attempt + 1}/{max_retries}): {e}", file=sys.stderr, flush=True)
                 print(f"   Retrying in {delay:.2f}s...", file=sys.stderr, flush=True)
                 time.sleep(delay)
                 continue
             else:
                 # Log non-retryable errors or final failure
-                import sys
                 if is_rate_limit:
-                    print(f"⚠️  RATE LIMIT ERROR (final after {max_retries} attempts): {e}", file=sys.stderr, flush=True)
+                    print(f"WARNING: RATE LIMIT ERROR (final after {max_retries} attempts): {e}", file=sys.stderr, flush=True)
                 elif is_connection_error:
-                    print(f"⚠️  CONNECTION ERROR (final after {max_retries} attempts): {e}", file=sys.stderr, flush=True)
+                    print(f"WARNING: CONNECTION ERROR (final after {max_retries} attempts): {e}", file=sys.stderr, flush=True)
                 else:
-                    print(f"⚠️  API ERROR (non-retryable): {e}", file=sys.stderr, flush=True)
+                    print(f"WARNING: API ERROR (non-retryable): {e}", file=sys.stderr, flush=True)
                 # Re-raise the exception (this will be caught by test_bench and tracked)
                 raise
 
@@ -747,8 +568,6 @@ def call_gemini_chat_completion(
     Returns:
         Response object from Gemini API (wrapped to be OpenAI-compatible)
     """
-    import google.generativeai as genai
-    
     # Extract system instruction from messages
     system_instruction = None
     chat_messages = []

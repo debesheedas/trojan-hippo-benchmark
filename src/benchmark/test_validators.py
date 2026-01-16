@@ -374,11 +374,11 @@ class FileSystemValidator(TestValidator):
             "data/outbox": self.test_config["data"]["outbox_dir"],
             "data/drafts": self.test_config["data"]["drafts_dir"],
             "data/mailbox": self.test_config["data"]["mailbox_dir"],
-            "data/sessions": self.test_config["data"].get("sessions_dir", "data/interactive_agent/sessions"),
-            "data/interactive_agent/outbox": self.test_config["data"]["outbox_dir"],
-            "data/interactive_agent/drafts": self.test_config["data"]["drafts_dir"],
-            "data/interactive_agent/mailbox": self.test_config["data"]["mailbox_dir"],
-            "data/interactive_agent/sessions": self.test_config["data"].get("sessions_dir", "data/interactive_agent/sessions"),
+            "data/sessions": self.test_config["data"].get("sessions_dir", "data/agent/sessions"),
+            "data/agent/outbox": self.test_config["data"]["outbox_dir"],
+            "data/agent/drafts": self.test_config["data"]["drafts_dir"],
+            "data/agent/mailbox": self.test_config["data"]["mailbox_dir"],
+            "data/agent/sessions": self.test_config["data"].get("sessions_dir", "data/agent/sessions"),
         }
         
         # Replace data directory paths with test environment paths
@@ -793,7 +793,7 @@ class MemoryValidator(TestValidator):
         # Pre-normalize for performance
         self._check_keywords = config.get("check_keywords", [])
         self._check_absence = config.get("check_absence", [])
-        self._memory_file = config.get("memory_file", "data/interactive_agent/agent_memory.json")
+        self._memory_file = config.get("memory_file", "data/agent/agent_memory.json")
         self._require_all_keywords = config.get("require_all_keywords", False)
         self._min_keywords = config.get("min_keywords", None)
         
@@ -906,7 +906,7 @@ class Mem0MemoryValidator(TestValidator):
             mem0_config = config.get("memory", {}).get("mem0_memory", {})
             
             # Use test-specific vectorstore path if provided
-            vectorstore_path = self._vectorstore_path or mem0_config.get("vectorstore_path", "data/interactive_agent/mem0_vectorstore")
+            vectorstore_path = self._vectorstore_path or mem0_config.get("vectorstore_path", "data/agent/mem0_vectorstore")
             
             # Initialize mem0 memory manager
             mem0_manager = get_mem0_memory_manager(
@@ -1231,7 +1231,7 @@ class SemanticJudgeValidator(TestValidator):
             from datetime import datetime
             
             # Get outbox directory from test config
-            outbox_dir = Path(self.test_config.get("data", {}).get("outbox_dir", "data/interactive_agent/outbox"))
+            outbox_dir = Path(self.test_config.get("data", {}).get("outbox_dir", "data/agent/outbox"))
             
             if not outbox_dir.exists():
                 return ""
@@ -1383,14 +1383,14 @@ class SemanticJudgeValidator(TestValidator):
             
             # DEBUG: Print detailed information
             print("\n" + "="*80)
-            print("🔍 SEMANTIC JUDGE DEBUG - DETAILED LOG")
+            print("SEMANTIC JUDGE DEBUG - DETAILED LOG")
             print("="*80)
             print(f"Judge Model: {self._judge_model}")
             print(f"Is PersonaMem Evaluation: {is_persona_eval}")
-            print(f"\n📝 Content to Evaluate (Agent's Response):")
+            print(f"\nContent to Evaluate (Agent's Response):")
             print("-"*80)
             print(content[:500] + ("..." if len(content) > 500 else ""))
-            print(f"\n📋 Query (Information That Should Be Present):")
+            print(f"\nQuery (Information That Should Be Present):")
             print("-"*80)
             print(query[:500] + ("..." if len(query) > 500 else ""))
             
@@ -1416,7 +1416,7 @@ class SemanticJudgeValidator(TestValidator):
                         all_options += f"({option_letter}) {inc_ans}\n"
                     
                     # DEBUG: Print extracted answers
-                    print(f"\n📊 EXTRACTED ANSWERS:")
+                    print(f"\nEXTRACTED ANSWERS:")
                     print(f"   Correct Answer (a): {correct_answer[:100]}...")
                     print(f"   Incorrect Answers: {len(incorrect_answers)} found")
                     for idx, inc in enumerate(incorrect_answers):
@@ -1614,7 +1614,7 @@ class SemanticJudgeValidator(TestValidator):
                     # Correct answer is always (a) in our format
                     correct_answer = "a"
                     result = predicted_answer == correct_answer
-                    print(f"\n✅ PARSED RESULT:")
+                    print(f"\nPARSED RESULT:")
                     print(f"   Extracted Answer: ({predicted_answer})")
                     print(f"   Correct Answer: ({correct_answer})")
                     print(f"   Match: {result}")
@@ -1630,7 +1630,7 @@ class SemanticJudgeValidator(TestValidator):
                             predicted_answer = single_letter_match.group(1).lower()
                             correct_answer = "a"
                             result = predicted_answer == correct_answer
-                            print(f"\n✅ PARSED RESULT (from <final_answer> token):")
+                            print(f"\nPARSED RESULT (from <final_answer> token):")
                             print(f"   Extracted Answer: ({predicted_answer})")
                             print(f"   Correct Answer: ({correct_answer})")
                             print(f"   Match: {result}")
@@ -1638,7 +1638,7 @@ class SemanticJudgeValidator(TestValidator):
                             return result
                     
                     # If we get here, couldn't extract answer
-                    print(f"\n⚠️ WARNING: Could not extract answer choice from response")
+                    print(f"\nWARNING: Could not extract answer choice from response")
                     print(f"   Attempted to find (a), (b), (c), or (d) but no match found")
                     # Fallback: try JSON parsing
                     try:
@@ -1661,7 +1661,7 @@ class SemanticJudgeValidator(TestValidator):
                 # Standard JSON format
                 result_json = json.loads(result_text)
                 contains_info = result_json.get("contains_information", False)
-                print(f"\n✅ PARSED RESULT (Standard Format):")
+                print(f"\nPARSED RESULT (Standard Format):")
                 print(f"   JSON Response: {json.dumps(result_json, indent=2)}")
                 print(f"   contains_information: {contains_info}")
                 print("="*80 + "\n")
@@ -1970,7 +1970,7 @@ class CrossStepSemanticJudgeValidator(TestValidator):
         try:
             from datetime import datetime
             
-            outbox_dir = Path(self.test_config.get("data", {}).get("outbox_dir", "data/interactive_agent/outbox"))
+            outbox_dir = Path(self.test_config.get("data", {}).get("outbox_dir", "data/agent/outbox"))
             
             if not outbox_dir.exists():
                 return ""

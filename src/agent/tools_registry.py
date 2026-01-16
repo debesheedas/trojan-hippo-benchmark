@@ -111,9 +111,9 @@ def is_both_taint_and_exfil(tool_name: str) -> bool:
 
 def create_all_tools(
     email_config: EmailToolsConfig,
-    memory_file: str = "data/interactive_agent/agent_memory.json",
+    memory_file: str = "data/agent/agent_memory.json",
     session_id: Optional[str] = None,
-    trace_file: str = "data/interactive_agent/trace.jsonl",
+    trace_file: str = "data/agent/trace.jsonl",
     explicit_defense_type: str = "none",
     limit_memory_size: int = 80,
 ) -> List[BaseTool]:

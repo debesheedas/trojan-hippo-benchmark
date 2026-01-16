@@ -82,7 +82,7 @@ def parse_result_file(result_file: Path) -> Optional[Dict]:
             "execution_errors": execution_errors if execution_errors else []
         }
     except Exception as e:
-        print(f"⚠️  Warning: Could not parse {result_file}: {e}")
+        print(f"WARNING: Could not parse {result_file}: {e}")
         return None
 
 
@@ -614,11 +614,11 @@ def main():
     all_models, all_attack_types = discover_models_and_attack_types(results_base_dir)
     
     if not all_models:
-        print(f"⚠️  No models found in {results_base_dir}")
+        print(f"WARNING: No models found in {results_base_dir}")
         return 1
     
     if not all_attack_types:
-        print(f"⚠️  No attack types found in {results_base_dir}")
+        print(f"WARNING: No attack types found in {results_base_dir}")
         return 1
     
     # Filter based on arguments
@@ -654,29 +654,29 @@ def main():
             # Generate CSV
             csv_file = generate_csv(model_name, attack_type, data, output_dir)
             csv_files.append(csv_file)
-            print(f"  ✅ CSV: {csv_file.name}")
+            print(f"  OK: CSV: {csv_file.name}")
             
             # Generate error summary
             error_summary = generate_error_summary(model_name, attack_type, results_base_dir, output_dir)
             if error_summary:
                 error_summaries.append(error_summary)
-                print(f"  ⚠️  Error Summary: {error_summary.name}")
+                print(f"  WARNING: Error Summary: {error_summary.name}")
                 print(f"     Location: {error_summary}")
             else:
-                print(f"  ✅ No execution errors found - all results are reliable")
+                print(f"  OK: No execution errors found - all results are reliable")
             
             # Generate individual heatmap plots
             if not args.no_plots:
                 if not PLOTTING_AVAILABLE:
-                    print(f"  ⚠️  Skipping plots: matplotlib/seaborn not installed")
+                    print(f"  WARNING: Skipping plots: matplotlib/seaborn not installed")
                     print(f"     Install with: pip install matplotlib seaborn")
                 else:
                     try:
                         heatmap_file = generate_heatmap(model_name, attack_type, data, output_dir)
                         plot_files.append(heatmap_file)
-                        print(f"  ✅ Heatmap: {heatmap_file.name}")
+                        print(f"  OK: Heatmap: {heatmap_file.name}")
                     except Exception as e:
-                        print(f"  ⚠️  Error generating heatmap: {e}")
+                        print(f"  WARNING: Error generating heatmap: {e}")
         
         # Store data for this model
         all_models_data[model_name] = all_suites_data
@@ -691,16 +691,16 @@ def main():
                         model_name, all_suites_data, output_dir
                     )
                     plot_files.append(combined_heatmap_file)
-                    print(f"  ✅ Combined Heatmaps: {combined_heatmap_file.name}")
+                    print(f"  OK: Combined Heatmaps: {combined_heatmap_file.name}")
                     
                     # Average heatmap
                     avg_heatmap_file = generate_average_heatmap(
                         model_name, all_suites_data, output_dir
                     )
                     plot_files.append(avg_heatmap_file)
-                    print(f"  ✅ Average Heatmap: {avg_heatmap_file.name}")
+                    print(f"  OK: Average Heatmap: {avg_heatmap_file.name}")
                 except Exception as e:
-                    print(f"  ⚠️  Error generating combined visualizations: {e}")
+                    print(f"  WARNING: Error generating combined visualizations: {e}")
         
         # Generate combined CSV files if processing multiple suites
         if len(attack_types_to_process) > 1:
@@ -709,26 +709,26 @@ def main():
                 # Combined CSV with all suites
                 combined_csv_file = generate_combined_csv(model_name, all_suites_data, output_dir)
                 csv_files.append(combined_csv_file)
-                print(f"  ✅ Combined CSV: {combined_csv_file.name}")
+                print(f"  OK: Combined CSV: {combined_csv_file.name}")
                 
                 # Average summary CSV
                 avg_csv_file = generate_average_summary_csv(model_name, all_suites_data, output_dir)
                 csv_files.append(avg_csv_file)
-                print(f"  ✅ Average Summary CSV: {avg_csv_file.name}")
+                print(f"  OK: Average Summary CSV: {avg_csv_file.name}")
             except Exception as e:
-                print(f"  ⚠️  Error generating combined CSV files: {e}")
+                print(f"  WARNING: Error generating combined CSV files: {e}")
     
     print(f"\n{'='*80}")
-    print(f"✅ Consolidation complete!")
-    print(f"📊 Generated {len(csv_files)} CSV file(s)")
+    print(f"Consolidation complete!")
+    print(f"Generated {len(csv_files)} CSV file(s)")
     if error_summaries:
-        print(f"\n⚠️  WARNING: Generated {len(error_summaries)} error summary file(s) - CHECK THESE!")
+        print(f"\nWARNING: Generated {len(error_summaries)} error summary file(s) - CHECK THESE!")
         for error_file in error_summaries:
             print(f"   - {error_file}")
     else:
-        print(f"✅ No execution errors found - all results are reliable")
+        print(f"OK: No execution errors found - all results are reliable")
     if not args.no_plots:
-        print(f"📈 Generated {len(plot_files)} plot file(s)")
+        print(f"Generated {len(plot_files)} plot file(s)")
     print(f"📁 Results saved to: {output_dir}")
     print(f"{'='*80}\n")
     
@@ -916,7 +916,7 @@ def generate_error_summary(
         f.write(f"Test Suite: {attack_type}\n")
         f.write(f"Generated: {Path(__file__).stat().st_mtime}\n")
         f.write(f"{'='*80}\n\n")
-        f.write(f"⚠️  WARNING: {len(errors_found)} combination(s) had execution errors!\n")
+        f.write(f"WARNING: {len(errors_found)} combination(s) had execution errors!\n")
         f.write(f"   These results may be unreliable. Rerun these combinations.\n\n")
         
         for error in errors_found:

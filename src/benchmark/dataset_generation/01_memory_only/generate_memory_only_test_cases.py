@@ -22,9 +22,9 @@ import sys
 import json
 import yaml
 import argparse
+import random
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
-import random
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -674,7 +674,7 @@ def generate_all_memory_only_test_cases(config: Dict[str, Any]) -> List[Dict[str
             print(f"  Probes (success checks): {len(test_case_data['probes'])}")
             print(f"  Total steps: {len(test_case['steps'])}")
         except Exception as e:
-            print(f"\n❌ Error generating test case {case_num}: {e}")
+            print(f"\nERROR: Error generating test case {case_num}: {e}")
             import traceback
             traceback.print_exc()
             continue
@@ -707,7 +707,7 @@ def main():
     test_cases = generate_all_memory_only_test_cases(config)
     
     if not test_cases:
-        print("\n❌ No test cases generated")
+        print("\nERROR: No test cases generated")
         return 1
     
     # Determine output directory
@@ -760,7 +760,7 @@ def main():
     if total_success_checks == expected_checks:
         print("✓ All test cases have the correct number of success checks")
     else:
-        print("⚠️  Warning: Some test cases do not have the expected number of success checks")
+        print("WARNING: Some test cases do not have the expected number of success checks")
     
     return 0
 

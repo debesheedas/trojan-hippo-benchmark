@@ -436,22 +436,22 @@ def cleanup_old_test_environments(
                 else:
                     try:
                         shutil.rmtree(test_env)
-                        print(f"  ✅ Deleted: {test_env.name} (age: {age_hours:.1f} hours)")
+                        print(f"  Deleted: {test_env.name} (age: {age_hours:.1f} hours)")
                         deleted_count += 1
                     except Exception as e:
-                        print(f"  ⚠️  Failed to delete {test_env.name}: {e}")
+                        print(f"  WARNING: Failed to delete {test_env.name}: {e}")
                         failed_count += 1
         except Exception as e:
-            print(f"  ⚠️  Error checking {test_env.name}: {e}")
+            print(f"  WARNING: Error checking {test_env.name}: {e}")
             failed_count += 1
     
     if not dry_run and deleted_count > 0:
-        print(f"✅ Cleaned up {deleted_count} old test environment(s)")
+        print(f"Cleaned up {deleted_count} old test environment(s)")
     elif dry_run:
         print(f"  [DRY RUN] Would clean up {deleted_count} old test environment(s)")
     
     if failed_count > 0:
-        print(f"⚠️  Failed to clean up {failed_count} test environment(s)")
+        print(f"WARNING: Failed to clean up {failed_count} test environment(s)")
     
     return deleted_count, failed_count
 
@@ -490,7 +490,7 @@ def discover_test_files(
     # Check if path exists
     if not test_path_obj.exists():
         if verbose:
-            print(f"⚠️  Test path not found: {test_path}")
+            print(f"WARNING: Test path not found: {test_path}")
             if test_path in suite_keywords:
                 print(f"   Expected location: {test_path_obj}")
                 print(f"   Unified test directory: {test_dir}")

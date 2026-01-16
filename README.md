@@ -1,24 +1,8 @@
 # Email Agent Security Benchmark
 
-A security-focused email agent with persistent memory, featuring both an interactive web interface and automated benchmarking capabilities. The system includes static and adaptive benchmarking for evaluating agent security and resilience to attacks.
+A security-focused email agent with persistent memory and automated benchmarking capabilities. The system includes static and adaptive benchmarking for evaluating agent security and resilience to attacks.
 
 ## Quick Start
-
-### Running the Interactive Agent
-
-Start the web-based interactive email agent:
-
-```bash
-# Activate virtual environment (if using one)
-source venv/bin/activate
-
-# Run the interactive agent server
-python src/interactive_agent/main.py
-```
-
-The server will start on `http://localhost:8000`. Open your browser and navigate to the URL to access the web interface.
-
-**What it does**: Provides a conversational interface where you can interact with the email agent, manage emails (read, search, reply, forward, compose), and use persistent memory that persists across sessions.
 
 ### Running Benchmarks
 
@@ -271,25 +255,12 @@ memory-agent-security-benchmark/
 │   │       ├── dspy_optimizer.py
 │   │       ├── openevolve_optimizer.py
 │   │       └── scorer.py
-│   └── interactive_agent/       # Web interface
-│       ├── main.py              # FastAPI application
-│       ├── frontend/            # React frontend components
-│       ├── static/              # Static HTML/JS files
-│       └── backend/             # Backend services
-│           ├── session_manager.py  # Session management
-│           └── routes/          # API routes
 ├── scripts/                     # Utility scripts
 │   ├── run_benchmark.py        # Unified benchmark runner
 │   ├── consolidate_results.py  # Unified results consolidation
 │   └── migrate_test_cases.py  # Test case migration tool
 ├── data/
-│   ├── interactive_agent/       # Interactive agent data
-│   │   ├── mailbox/             # Inbox emails
-│   │   ├── drafts/             # Draft emails
-│   │   ├── outbox/             # Sent emails
-│   │   ├── sessions/           # Session data
-│   │   ├── agent_memory.json   # Persistent memory
-│   │   └── trace.jsonl         # Interaction traces
+│   ├── agent/                   # Agent data (mailbox, drafts, outbox, memory)
 │   └── benchmark/              # Benchmark data
 │       ├── tests/              # Unified test directory
 │       │   ├── benign/         # Benign behavior tests
@@ -374,13 +345,13 @@ memory:
   explicit_memory:
     enabled: true      # Set to true to use explicit memory
     defense_type: "none"  # Unified defense type: none, disable_memory, user_prompt_only, etc.
-    memory_file: "data/interactive_agent/agent_memory.json"
+    memory_file: "data/agent/agent_memory.json"
   
   # Mem0 memory configuration
   mem0_memory:
     enabled: false     # Set to true to use mem0 memory
     defense_type: "none"  # Unified defense type (maps to "no_defense" internally)
-    vectorstore_path: "data/interactive_agent/mem0_vectorstore"
+    vectorstore_path: "data/agent/mem0_vectorstore"
     llm_provider: "openai"
     llm_model: "gpt-4o-mini"
     llm_temperature: 0.0
@@ -394,7 +365,7 @@ memory:
   rag_memory:
     enabled: false     # Set to true to use RAG memory
     defense_type: "none"  # Unified defense type
-    vectorstore_path: "data/interactive_agent/rag_vectorstore"
+    vectorstore_path: "data/agent/rag_vectorstore"
     chunk_size: 512
     embedding_model: "text-embedding-3-small"
     top_k: 8
@@ -454,55 +425,25 @@ seed: 42  # Global seed for reproducibility
 - **Unified Test Format**: Single test format works with all memory backends
 - **Isolated Test Environments**: Each test run uses a unique, isolated directory
 
-### Interactive Interface
-
-- **Web UI**: Single-page application with chat interface
-- **Real-time Updates**: Live memory panel with SSE updates
-- **Email Management**: Visual inbox, drafts, and outbox management
-- **Trace Viewing**: Real-time trace log viewing for debugging
-
-## API Endpoints (Interactive Agent)
-
-### Main Endpoints
-
-- `GET /` - Web UI
-- `POST /api/chat` - Chat with the agent
-- `GET /api/emails` - Get all emails
-- `GET /sessions` - List all sessions
-- `POST /sessions` - Create new session
-- `GET /sessions/{session_id}` - Get session details
-
-### Memory Endpoints
-
-- `GET /memory` - Get current memory state
-- `POST /memory` - Add to long-term memory
-- `DELETE /memory` - Clear all memory
-- `GET /memory/stream` - SSE stream for live memory updates
-
-### Utility Endpoints
-
-- `GET /api/session/{session_id}/trace` - Get trace events
-- `GET /api/health` - Health check
-
 ## Memory System
 
 The agent supports three memory backends, each with different characteristics:
 
 ### Explicit Memory (JSON-based)
 - **Format**: Simple JSON file with structured memory entries
-- **Storage**: `data/interactive_agent/agent_memory.json`
+- **Storage**: `data/agent/agent_memory.json`
 - **Characteristics**: Deterministic, easy to inspect, fast access
 - **Best for**: Simple use cases, debugging, deterministic behavior
 
 ### Mem0 Memory (Vector-based)
 - **Format**: Vector embeddings stored in FAISS vectorstore
-- **Storage**: `data/interactive_agent/mem0_vectorstore/`
+- **Storage**: `data/agent/mem0_vectorstore/`
 - **Characteristics**: Semantic search, automatic memory extraction, LLM-powered
 - **Best for**: Complex memory needs, semantic similarity search
 
 ### RAG Memory (Retrieval Augmented Generation)
 - **Format**: Chunked text stored in vectorstore
-- **Storage**: `data/interactive_agent/rag_vectorstore/`
+- **Storage**: `data/agent/rag_vectorstore/`
 - **Characteristics**: Document-based, chunked retrieval, configurable chunking
 - **Best for**: Long-form content, document-based memory
 
@@ -746,9 +687,9 @@ The caching key is: `{memory_backend}/{defense_type}/{model_name}/{attack_type}/
 
 ### Other Data Locations
 
-- **Interactive Agent Data**: `data/interactive_agent/`
+- **Agent Data**: `data/agent/`
 - **Application Logs**: `logs/`
-- **Trace Logs**: `data/interactive_agent/trace.jsonl`
+- **Trace Logs**: `data/agent/trace.jsonl`
 - **Test Environments**: `data/benchmark/test_envs/` (isolated per-run directories)
 
 ## Troubleshooting

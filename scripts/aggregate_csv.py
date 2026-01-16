@@ -104,7 +104,7 @@ def parse_csv_file(csv_file: Path) -> Optional[Dict]:
             
             return data
     except Exception as e:
-        print(f"⚠️  Warning: Could not parse {csv_file}: {e}")
+        print(f"WARNING: Could not parse {csv_file}: {e}")
         return None
 
 
@@ -532,11 +532,11 @@ def main():
     all_models, all_suites = discover_models_and_suites(input_dir)
     
     if not all_models:
-        print(f"⚠️  No models found in {input_dir}")
+        print(f"WARNING: No models found in {input_dir}")
         return 1
     
     if not all_suites:
-        print(f"⚠️  No test suites found in {input_dir}")
+        print(f"WARNING: No test suites found in {input_dir}")
         return 1
     
     # Filter based on arguments
@@ -570,19 +570,19 @@ def main():
             # Combined CSV with all suites
             combined_csv_file = generate_combined_csv(model_name, all_suites_data, output_dir)
             csv_files.append(combined_csv_file)
-            print(f"  ✅ Combined CSV: {combined_csv_file.name}")
+            print(f"  OK: Combined CSV: {combined_csv_file.name}")
             
             # Average summary CSV
             avg_csv_file = generate_average_summary_csv(model_name, all_suites_data, output_dir)
             csv_files.append(avg_csv_file)
-            print(f"  ✅ Average Summary CSV: {avg_csv_file.name}")
+            print(f"  OK: Average Summary CSV: {avg_csv_file.name}")
         except Exception as e:
-            print(f"  ⚠️  Error generating combined CSV files: {e}")
+            print(f"  WARNING: Error generating combined CSV files: {e}")
         
         # Generate combined visualizations
         if not args.no_plots:
             if not PLOTTING_AVAILABLE:
-                print(f"  ⚠️  Skipping plots: matplotlib/seaborn not installed")
+                print(f"  WARNING: Skipping plots: matplotlib/seaborn not installed")
                 print(f"     Install with: pip install matplotlib seaborn")
             else:
                 print(f"  Generating combined visualizations...")
@@ -592,22 +592,22 @@ def main():
                         model_name, all_suites_data, output_dir
                     )
                     plot_files.append(combined_heatmap_file)
-                    print(f"  ✅ Combined Heatmaps: {combined_heatmap_file.name}")
+                    print(f"  OK: Combined Heatmaps: {combined_heatmap_file.name}")
                     
                     # Average heatmap
                     avg_heatmap_file = generate_average_heatmap(
                         model_name, all_suites_data, output_dir
                     )
                     plot_files.append(avg_heatmap_file)
-                    print(f"  ✅ Average Heatmap: {avg_heatmap_file.name}")
+                    print(f"  OK: Average Heatmap: {avg_heatmap_file.name}")
                 except Exception as e:
-                    print(f"  ⚠️  Error generating combined visualizations: {e}")
+                    print(f"  WARNING: Error generating combined visualizations: {e}")
     
     print(f"\n{'='*80}")
-    print(f"✅ Aggregation complete!")
-    print(f"📊 Generated {len(csv_files)} CSV file(s)")
+    print(f"Aggregation complete!")
+    print(f"Generated {len(csv_files)} CSV file(s)")
     if not args.no_plots:
-        print(f"📈 Generated {len(plot_files)} plot file(s)")
+        print(f"Generated {len(plot_files)} plot file(s)")
     print(f"📁 Results saved to: {output_dir}")
     print(f"{'='*80}\n")
     

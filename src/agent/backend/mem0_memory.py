@@ -22,25 +22,12 @@ from typing import List, Dict, Any, Optional
 import threading
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from mem0 import Memory
+import tiktoken
 from agent.utils import debug_info, debug_debug, debug_print_exception
 
 # Load environment variables from .env file
 load_dotenv()
-
-try:
-    from mem0 import Memory
-    MEM0_AVAILABLE = True
-except ImportError as e:
-    MEM0_AVAILABLE = False
-    print(f"Warning: mem0 package not available. Mem0 memory will not work. Error: {e}")
-    print("Install with: pip install mem0ai")
-
-# Try to import tiktoken for token counting
-try:
-    import tiktoken
-    TIKTOKEN_AVAILABLE = True
-except ImportError:
-    TIKTOKEN_AVAILABLE = False
 
 
 class Mem0DefenseManager:
@@ -184,7 +171,7 @@ def _call_with_timeout(func, timeout_seconds=300, error_message="mem0 API call")
                 f"Results from this test are UNRELIABLE and should be marked as failed. "
                 f"This may indicate an API issue, network problem, or mem0 library bug."
             )
-            print(f"❌ ERROR: {error_msg}")
+            print(f"ERROR: {error_msg}")
             print(f"   This is likely causing the benchmark to hang.")
             print(f"   Consider checking:")
             print(f"   - API rate limits and quotas")
@@ -228,11 +215,6 @@ class Mem0MemoryManager:
             agent_id: Agent identifier (should always be None for mem0 - user memories use agent_id=None)
             api_key: Optional API key (uses env vars if not provided)
         """
-        if not MEM0_AVAILABLE:
-            raise ImportError(
-                "mem0 package required for mem0 memory. "
-                "Install with: pip install mem0ai"
-            )
         
         self.llm_provider = llm_provider
         self.llm_model = llm_model
@@ -356,7 +338,24 @@ class Mem0MemoryManager:
             return chunks
         
         # Count tokens to see if chunking is needed
-        if not TIKTOKEN_AVAILABLE:
+        try:
+            # Fallback: use character-based estimation (rough: 1 token ≈ 4 chars)
+            estimated_tokens = len(content) // 4
+            if estimated_tokens <= max_tokens:
+                return [message]
+            # Chunk by characters
+            chunk_size_chars = max_tokens * 4
+            chunks = []
+            for i in range(0, len(content), chunk_size_chars):
+                chunk_content = content[i:i + chunk_size_chars]
+                chunks.append({
+                    "role": role,
+                    "content": chunk_content,
+                    "chunk_index": i // chunk_size_chars,
+                    "total_chunks": (len(content) + chunk_size_chars - 1) // chunk_size_chars
+                })
+            return chunks
+        except Exception:
             # Fallback: use character-based estimation (rough: 1 token ≈ 4 chars)
             estimated_tokens = len(content) // 4
             if estimated_tokens <= max_tokens:
@@ -375,7 +374,6 @@ class Mem0MemoryManager:
             return chunks
         
         # Use tiktoken for accurate token counting (for medium-sized messages)
-        try:
             try:
                 tokenizer = tiktoken.encoding_for_model(model_name)
             except KeyError:
@@ -515,7 +513,7 @@ class Mem0MemoryManager:
                 
                 # Log chunking if it occurred
                 if len(messages_to_use) > len(messages):
-                    print(f"📦 Chunked {len(messages)} messages into {len(messages_to_use)} chunks to prevent token limit errors")
+                    print(f"Chunked {len(messages)} messages into {len(messages_to_use)} chunks to prevent token limit errors")
                 
                 # Extract memories using mem0 (with potentially chunked and truncated messages)
                 # Capture mem0's internal error messages to handle UPDATE operation failures gracefully
@@ -595,7 +593,7 @@ class Mem0MemoryManager:
                                     elif len(memory_text_str) > max_safe_memory_length:
                                         # Truncate to safe limit for embedding model
                                         memory_text_str = memory_text_str[:max_safe_memory_length]
-                                        print(f"⚠️  Truncated extracted memory from {len(str(memory_text))} to {max_safe_memory_length} chars to prevent embedding model errors")
+                                        print(f"WARNING: Truncated extracted memory from {len(str(memory_text))} to {max_safe_memory_length} chars to prevent embedding model errors")
                                     # Update the memory item with truncated text
                                     # Find which key was used and update it
                                     for key in ["memory", "memories", "text", "content", "fact"]:
@@ -623,7 +621,7 @@ class Mem0MemoryManager:
                                     elif len(memory_text_str) > max_safe_memory_length:
                                         # Truncate to safe limit for embedding model
                                         memory_text_str = memory_text_str[:max_safe_memory_length]
-                                        print(f"⚠️  Truncated extracted memory from {len(str(memory_text))} to {max_safe_memory_length} chars to prevent embedding model errors")
+                                        print(f"WARNING: Truncated extracted memory from {len(str(memory_text))} to {max_safe_memory_length} chars to prevent embedding model errors")
                                     # Update the memory item with truncated text
                                     for key in ["memory", "memories", "text", "content", "fact"]:
                                         if key in memory_item:
@@ -757,8 +755,8 @@ class Mem0MemoryManager:
                 # Very large query - use character-based truncation (faster)
                 truncate_chars = max_query_tokens * 4
                 search_query = query[:truncate_chars]
-                print(f"⚠️  [SEARCH OPTIMIZATION] Truncated very large query from {len(query):,} to {len(search_query):,} chars (estimated {max_query_tokens} tokens) for search")
-            elif TIKTOKEN_AVAILABLE:
+                print(f"WARNING: [SEARCH OPTIMIZATION] Truncated very large query from {len(query):,} to {len(search_query):,} chars (estimated {max_query_tokens} tokens) for search")
+            else:
                 # For medium-sized queries, use tokenization to check if truncation is needed
                 try:
                     try:
@@ -773,17 +771,17 @@ class Mem0MemoryManager:
                         # Truncate to first max_query_tokens
                         truncated_encoded = encoded[:max_query_tokens]
                         search_query = tokenizer.decode(truncated_encoded)
-                        print(f"⚠️  [SEARCH OPTIMIZATION] Truncated query from {token_count:,} to {max_query_tokens:,} tokens for search")
+                        print(f"WARNING: [SEARCH OPTIMIZATION] Truncated query from {token_count:,} to {max_query_tokens:,} tokens for search")
                 except Exception as e:
                     # If tokenization fails, fall back to character-based truncation
                     print(f"Warning: Query tokenization failed, using character-based truncation: {e}")
                     truncate_chars = max_query_tokens * 4
                     if len(query) > truncate_chars:
                         search_query = query[:truncate_chars]
-                        print(f"⚠️  [SEARCH OPTIMIZATION] Truncated query from {len(query):,} to {len(search_query):,} chars for search")
+                        print(f"WARNING: [SEARCH OPTIMIZATION] Truncated query from {len(query):,} to {len(search_query):,} chars for search")
             
             # Try normal search first (semantic search over all memories)
-            print(f"🔍 [BATCH SEARCH DEBUG] Attempting normal mem0 search (semantic search over all memories)")
+            print(f"[BATCH SEARCH DEBUG] Attempting normal mem0 search (semantic search over all memories)")
             print(f"   Query: '{search_query[:100]}...' (truncated)" if len(search_query) > 100 else f"   Query: '{search_query}'")
             if search_query != query:
                 print(f"   Original query length: {len(query):,} chars, using truncated query: {len(search_query):,} chars")
@@ -809,12 +807,12 @@ class Mem0MemoryManager:
                 else:
                     memories = []
                 
-                print(f"✅ [BATCH SEARCH DEBUG] Normal search succeeded: Found {len(memories)} memories")
+                print(f"[BATCH SEARCH DEBUG] Normal search succeeded: Found {len(memories)} memories")
                 
                 # P1: Check if any retrieved memory has U label (provable_policy defense)
                 if defense_type == "provable_policy" and session_id:
                     from agent.agent_core import ProvablePolicyManager
-                    print(f"🔍 [DEBUG] mem0 search: Checking {len(memories)} memories for U labels (session_id={session_id})")
+                    print(f"[DEBUG] mem0 search: Checking {len(memories)} memories for U labels (session_id={session_id})")
                     found_u_label = False
                     for i, memory_item in enumerate(memories):
                         if isinstance(memory_item, dict):
@@ -822,28 +820,28 @@ class Mem0MemoryManager:
                             metadata = memory_item.get("metadata", {})
                             label = metadata.get("label", None)
                             memory_text = memory_item.get("memory", "")[:50]
-                            print(f"🔍 [DEBUG] mem0 Memory {i}: label={label}, text_preview='{memory_text}'")
+                            print(f"[DEBUG] mem0 Memory {i}: label={label}, text_preview='{memory_text}'")
                             if label == "U":
                                 # Upgrade session to U if U-labeled memory is retrieved
-                                print(f"🛡️ [DEBUG] mem0: Found U-labeled memory! Upgrading session '{session_id}' to UNTRUSTED")
+                                print(f"[DEBUG] mem0: Found U-labeled memory! Upgrading session '{session_id}' to UNTRUSTED")
                                 ProvablePolicyManager.set_untrusted(session_id)
                                 found_u_label = True
                                 break
                             elif label is None:
                                 # Error: memory should have a label
-                                print(f"⚠️ [DEBUG] mem0 Memory {i} missing label! text_preview='{memory_text}'")
+                                print(f"WARNING: [DEBUG] mem0 Memory {i} missing label! text_preview='{memory_text}'")
                                 raise ValueError(
                                     f"Mem0 memory entry missing label in provable_policy defense. "
                                     f"All memories must have 'label' metadata set to 'T' or 'U'. "
                                     f"Memory text preview: {memory_text}..."
                                 )
                     if not found_u_label:
-                        print(f"🔍 [DEBUG] mem0: No U-labeled memories found. Session '{session_id}' remains trusted.")
+                        print(f"[DEBUG] mem0: No U-labeled memories found. Session '{session_id}' remains trusted.")
                 
                 return memories
             except Exception as e:
                 error_str = str(e)
-                print(f"❌ [BATCH SEARCH DEBUG] Normal search failed: {error_str[:200]}")
+                print(f"ERROR: [BATCH SEARCH DEBUG] Normal search failed: {error_str[:200]}")
                 
                 # Check if this is a token limit error
                 is_token_limit_error = (
@@ -858,7 +856,7 @@ class Mem0MemoryManager:
                 
                 if is_token_limit_error:
                     # Fall back to batch search (use truncated query)
-                    print(f"⚠️  [BATCH SEARCH DEBUG] Token limit error detected - switching to batch search fallback")
+                    print(f"WARNING: [BATCH SEARCH DEBUG] Token limit error detected - switching to batch search fallback")
                     print(f"   Error type: Token limit exceeded (embedding model limit: 8192 tokens)")
                     return self._batch_search(search_query, user_id, agent_id, limit, session_id, defense_type)
                 else:
@@ -901,7 +899,7 @@ class Mem0MemoryManager:
         Returns:
             List of memory dictionaries
         """
-        print(f"🔄 [BATCH SEARCH DEBUG] Starting batch search fallback")
+        print(f"[BATCH SEARCH DEBUG] Starting batch search fallback")
         print(f"   Query: '{query[:100]}...' (truncated)" if len(query) > 100 else f"   Query: '{query}'")
         print(f"   Target: {limit} results")
         
@@ -916,8 +914,8 @@ class Mem0MemoryManager:
             # Very large query - use character-based truncation (faster)
             truncate_chars = max_query_tokens * 4
             batch_search_query = query[:truncate_chars]
-            print(f"⚠️  [BATCH SEARCH OPTIMIZATION] Truncated very large query from {len(query):,} to {len(batch_search_query):,} chars for batch search")
-        elif TIKTOKEN_AVAILABLE:
+            print(f"WARNING: [BATCH SEARCH OPTIMIZATION] Truncated very large query from {len(query):,} to {len(batch_search_query):,} chars for batch search")
+        else:
             # For medium-sized queries, use tokenization to check if truncation is needed
             try:
                 try:
@@ -932,14 +930,14 @@ class Mem0MemoryManager:
                     # Truncate to first max_query_tokens
                     truncated_encoded = encoded[:max_query_tokens]
                     batch_search_query = tokenizer.decode(truncated_encoded)
-                    print(f"⚠️  [BATCH SEARCH OPTIMIZATION] Truncated query from {token_count:,} to {max_query_tokens:,} tokens for batch search")
+                    print(f"WARNING: [BATCH SEARCH OPTIMIZATION] Truncated query from {token_count:,} to {max_query_tokens:,} tokens for batch search")
             except Exception as e:
                 # If tokenization fails, fall back to character-based truncation
                 print(f"Warning: Query tokenization failed in batch search, using character-based truncation: {e}")
                 truncate_chars = max_query_tokens * 4
                 if len(query) > truncate_chars:
                     batch_search_query = query[:truncate_chars]
-                    print(f"⚠️  [BATCH SEARCH OPTIMIZATION] Truncated query from {len(query):,} to {len(batch_search_query):,} chars for batch search")
+                    print(f"WARNING: [BATCH SEARCH OPTIMIZATION] Truncated query from {len(query):,} to {len(batch_search_query):,} chars for batch search")
         
         try:
             # Get memories in batches - try semantic search first, fall back to text matching
@@ -959,7 +957,7 @@ class Mem0MemoryManager:
             print(f"   Retrieved {total_memories} memories from vector store")
             
             if not all_memories:
-                print(f"⚠️  [BATCH SEARCH DEBUG] No memories found in vector store")
+                print(f"WARNING: [BATCH SEARCH DEBUG] No memories found in vector store")
                 return []
             
             # Try to search in batches using mem0's search()
@@ -970,7 +968,7 @@ class Mem0MemoryManager:
             
             # Strategy: Try semantic search with smaller result limit first
             # If that fails, use text matching on batches
-            print(f"🔍 [BATCH SEARCH DEBUG] Attempting semantic search with reduced scope...")
+            print(f"[BATCH SEARCH DEBUG] Attempting semantic search with reduced scope...")
             
             # Try semantic search one more time with a smaller limit (might work if fewer results needed)
             # Use truncated query
@@ -991,12 +989,12 @@ class Mem0MemoryManager:
                     semantic_memories = semantic_result
                 
                 if semantic_memories:
-                    print(f"✅ [BATCH SEARCH DEBUG] Semantic search with reduced limit succeeded: {len(semantic_memories)} results")
+                    print(f"[BATCH SEARCH DEBUG] Semantic search with reduced limit succeeded: {len(semantic_memories)} results")
                     all_results = semantic_memories
                 else:
                     raise Exception("No results from semantic search")
             except Exception as semantic_error:
-                print(f"⚠️  [BATCH SEARCH DEBUG] Semantic search with reduced limit also failed: {str(semantic_error)[:100]}")
+                print(f"WARNING: [BATCH SEARCH DEBUG] Semantic search with reduced limit also failed: {str(semantic_error)[:100]}")
                 print(f"   Falling back to text matching on {total_memories} memories")
                 
                 # Fall back to text matching: check if query words appear in memory text
@@ -1004,7 +1002,7 @@ class Mem0MemoryManager:
                 query_lower = batch_search_query.lower()
                 query_words = set(query_lower.split())
                 if not query_words:
-                    print(f"⚠️  [BATCH SEARCH DEBUG] Empty query words after processing")
+                    print(f"WARNING: [BATCH SEARCH DEBUG] Empty query words after processing")
                     return []
                 
                 print(f"   Query words: {list(query_words)[:10]}..." if len(query_words) > 10 else f"   Query words: {list(query_words)}")
@@ -1042,7 +1040,7 @@ class Mem0MemoryManager:
                         del mem["_relevance_score"]
                 
                 all_results = scored_memories
-                print(f"📊 [BATCH SEARCH DEBUG] Text matching: {len(scored_memories)} matches found from {total_memories} memories")
+                print(f"[BATCH SEARCH DEBUG] Text matching: {len(scored_memories)} matches found from {total_memories} memories")
             
             # P1: Check if any retrieved memory has U label (provable_policy defense)
             if defense_type == "provable_policy" and session_id:
@@ -1063,14 +1061,14 @@ class Mem0MemoryManager:
                             )
             
             final_results = all_results[:limit]
-            print(f"✅ [BATCH SEARCH DEBUG] Batch search complete: Returning {len(final_results)} results (requested: {limit})")
+            print(f"[BATCH SEARCH DEBUG] Batch search complete: Returning {len(final_results)} results (requested: {limit})")
             if final_results:
                 print(f"   Top result: '{final_results[0].get('memory', '')[:80]}...'")
             
             return final_results
             
         except Exception as e:
-            print(f"❌ [BATCH SEARCH DEBUG] Batch search fallback failed: {e}")
+            print(f"ERROR: [BATCH SEARCH DEBUG] Batch search fallback failed: {e}")
             import traceback
             traceback.print_exc()
             return []
@@ -1114,28 +1112,28 @@ class Mem0MemoryManager:
                     # This is critical - fallback memories must also be checked for U labels
                     if defense_type == "provable_policy" and session_id:
                         from agent.agent_core import ProvablePolicyManager
-                        print(f"🔍 [DEBUG] mem0 get_context fallback: Checking {len(all_memories)} fallback memories for U labels (session_id={session_id})")
+                        print(f"[DEBUG] mem0 get_context fallback: Checking {len(all_memories)} fallback memories for U labels (session_id={session_id})")
                         found_u_label = False
                         for i, memory_item in enumerate(all_memories):
                             if isinstance(memory_item, dict):
                                 metadata = memory_item.get("metadata", {})
                                 label = metadata.get("label", None)
                                 memory_text = memory_item.get("memory", "")[:50]
-                                print(f"🔍 [DEBUG] mem0 Fallback Memory {i}: label={label}, text_preview='{memory_text}'")
+                                print(f"[DEBUG] mem0 Fallback Memory {i}: label={label}, text_preview='{memory_text}'")
                                 if label == "U":
-                                    print(f"🛡️ [DEBUG] mem0 fallback: Found U-labeled memory! Upgrading session '{session_id}' to UNTRUSTED")
+                                    print(f"[DEBUG] mem0 fallback: Found U-labeled memory! Upgrading session '{session_id}' to UNTRUSTED")
                                     ProvablePolicyManager.set_untrusted(session_id)
                                     found_u_label = True
                                     break
                                 elif label is None:
-                                    print(f"⚠️ [DEBUG] mem0 Fallback Memory {i} missing label! text_preview='{memory_text}'")
+                                    print(f"WARNING: [DEBUG] mem0 Fallback Memory {i} missing label! text_preview='{memory_text}'")
                                     raise ValueError(
                                         f"Mem0 fallback memory entry missing label in provable_policy defense. "
                                         f"All memories must have 'label' metadata set to 'T' or 'U'. "
                                         f"Memory text preview: {memory_text}..."
                                     )
                         if not found_u_label:
-                            print(f"🔍 [DEBUG] mem0 fallback: No U-labeled memories found. Session '{session_id}' remains trusted.")
+                            print(f"[DEBUG] mem0 fallback: No U-labeled memories found. Session '{session_id}' remains trusted.")
             except Exception:
                 pass
         

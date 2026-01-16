@@ -14,14 +14,7 @@ import numpy as np
 
 from agent.utils import generate_id, get_timestamp, append_trace_event, USER_EMAIL
 from agent.utils import debug_info, debug_debug, debug_print_exception
-
-# Try to import OpenAI for embeddings, but make it optional
-try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
-    OpenAI = None
+from openai import OpenAI
 
 
 def _keyword_relevance_score(query_lower: str, query_words: List[str], 
@@ -71,9 +64,6 @@ def _get_embedding(text: str, api_key: Optional[str] = None) -> Optional[List[fl
     Get embedding for text using OpenAI's text-embedding-3-small model.
     Returns None if embeddings are not available or API call fails.
     """
-    if not OPENAI_AVAILABLE or OpenAI is None:
-        return None
-    
     try:
         api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -131,7 +121,7 @@ def _find_best_email_match(search_query: str, config, folder: str = "inbox", lim
     
     # Get query embedding for semantic search (fallback to keyword search if unavailable)
     api_key = os.getenv("OPENAI_API_KEY")
-    query_embedding = _get_embedding(search_query, api_key) if search_query and OPENAI_AVAILABLE else None
+    query_embedding = _get_embedding(search_query, api_key) if search_query else None
     
     # Search across all emails in the folder - sort files for deterministic order
     email_files = sorted(search_dir.glob("*.json"), key=lambda p: p.name)
@@ -647,7 +637,7 @@ This is a one-step operation - no need to manually construct the reply email. If
                 ProvablePolicyManager.set_untrusted(self.config.session_id)
                 
                 error_msg = (
-                    "🛡️ Security Policy: This action has been blocked for safety reasons. "
+                    "Security Policy: This action has been blocked for safety reasons. "
                     "This tool both reads from untrusted sources and sends data externally, "
                     "which poses a security risk. Exfiltration tools that access untrusted data are not allowed."
                 )
@@ -702,7 +692,7 @@ This is a one-step operation - no need to manually construct the reply email. If
                     ProvablePolicyManager.set_untrusted(self.config.session_id)
                     
                     error_msg = (
-                        "🛡️ Security Policy: This action has been blocked for safety reasons. "
+                        "Security Policy: This action has been blocked for safety reasons. "
                         "This tool both reads from untrusted sources and sends data externally, "
                         "which poses a security risk. Exfiltration tools that access untrusted data are not allowed."
                     )
@@ -738,7 +728,7 @@ This is a one-step operation - no need to manually construct the reply email. If
                 # If session is already U, block immediately (don't even read from inbox)
                 if not ProvablePolicyManager.is_trusted(self.config.session_id):
                     error_msg = (
-                        "🛡️ Security Policy: This action has been blocked for safety reasons. "
+                        "Security Policy: This action has been blocked for safety reasons. "
                         "The current session has been marked as untrusted because untrusted data was accessed. "
                         "Exfiltration tools (email sending) are not allowed in untrusted sessions."
                     )
@@ -920,7 +910,7 @@ Important: The original email body and all content is automatically included - y
                 ProvablePolicyManager.set_untrusted(self.config.session_id)
                 
                 error_msg = (
-                    "🛡️ Security Policy: This action has been blocked for safety reasons. "
+                    "Security Policy: This action has been blocked for safety reasons. "
                     "This tool both reads from untrusted sources and sends data externally, "
                     "which poses a security risk. Exfiltration tools that access untrusted data are not allowed."
                 )
@@ -972,7 +962,7 @@ Important: The original email body and all content is automatically included - y
                 # If session is already U, block immediately (don't even read from inbox)
                 if not ProvablePolicyManager.is_trusted(self.config.session_id):
                     error_msg = (
-                        "🛡️ Security Policy: This action has been blocked for safety reasons. "
+                        "Security Policy: This action has been blocked for safety reasons. "
                         "The current session has been marked as untrusted because untrusted data was accessed. "
                         "Exfiltration tools (email sending) are not allowed in untrusted sessions."
                     )
@@ -1178,9 +1168,9 @@ class ComposeEmailTool(BaseTool):
             session_id = self.config.session_id
         
         # Debug output - always print to help diagnose issues
-        print(f"🔍 [DEBUG] send_email: session_id={session_id}, config={self.config is not None}, config_type={type(self.config).__name__ if self.config else 'None'}")
+        print(f"[DEBUG] send_email: session_id={session_id}, config={self.config is not None}, config_type={type(self.config).__name__ if self.config else 'None'}")
         if self.config:
-            print(f"🔍 [DEBUG] send_email: config.session_id={getattr(self.config, 'session_id', 'NOT_SET')}")
+            print(f"[DEBUG] send_email: config.session_id={getattr(self.config, 'session_id', 'NOT_SET')}")
         
         if session_id:
             from agent.agent_core import ProvablePolicyManager
@@ -1193,11 +1183,11 @@ class ComposeEmailTool(BaseTool):
             is_trusted = ProvablePolicyManager.is_trusted(session_id)
             session_label = ProvablePolicyManager.get_session_label(session_id)
             will_block = not is_trusted and is_provable_policy
-            print(f"🔍 [DEBUG] send_email: is_trusted={is_trusted}, session_label={session_label}, defense_type={defense_type}, is_provable_policy={is_provable_policy}, will_block={will_block}")
+            print(f"[DEBUG] send_email: is_trusted={is_trusted}, session_label={session_label}, defense_type={defense_type}, is_provable_policy={is_provable_policy}, will_block={will_block}")
             
             if not is_trusted and is_provable_policy:
                 error_msg = (
-                    "🛡️ Security Policy: This action has been blocked for safety reasons. "
+                    "Security Policy: This action has been blocked for safety reasons. "
                     "The current session has been marked as untrusted because untrusted data was accessed. "
                     "Exfiltration tools (email sending) are not allowed in untrusted sessions."
                 )

@@ -13,15 +13,9 @@ from datetime import datetime, timezone
 import sys
 from agent.utils import debug_info, debug_debug, debug_print_exception
 
-# LangChain imports for RAG (optional, only used when RAG backend is used)
-try:
-    from langchain_core.documents import Document
-    from langchain_community.vectorstores import FAISS
-    LANGCHAIN_AVAILABLE = True
-except ImportError:
-    LANGCHAIN_AVAILABLE = False
-    Document = None
-    FAISS = None
+# LangChain imports for RAG
+from langchain_core.documents import Document
+from langchain_community.vectorstores import FAISS
 
 # Add src to path for imports
 BASE_DIR = Path(__file__).parent.parent.parent

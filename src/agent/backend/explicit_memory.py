@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 class MemoryManager:
     """Manages both short-term and long-term memory for the agent."""
     
-    def __init__(self, memory_file: str = "data/interactive_agent/agent_memory.json", max_short_term: int = 15):
+    def __init__(self, memory_file: str = "data/agent/agent_memory.json", max_short_term: int = 15):
         """
         Initialize the memory manager.
         
@@ -34,7 +34,6 @@ class MemoryManager:
         self.short_term: deque = deque(maxlen=max_short_term)
         self.long_term: List[Dict[str, str]] = []  # Changed from List[str] to support labels
         # Removed _lock - not needed since each test gets isolated instance
-        self._subscribers = []  # For SSE updates (interactive agent only)
         
         # Ensure data directory exists
         self.memory_file.parent.mkdir(parents=True, exist_ok=True)
@@ -86,7 +85,6 @@ class MemoryManager:
             message: The message to add (can be user or assistant message)
         """
         self.short_term.append(message)
-        self._notify_subscribers()
     
     def add_long_term(self, update_text: str, session_id: Optional[str] = None, defense_type: Optional[str] = None):
         """
@@ -135,7 +133,6 @@ class MemoryManager:
                     # (for consistency, but label won't be checked)
                     self.long_term.append({"text": update_text, "label": "T"})
                 self._save_long_term()
-                self._notify_subscribers()
     
     def _handle_forget(self, forget_text: str):
         """
@@ -161,7 +158,6 @@ class MemoryManager:
         # Save if anything was removed
         if len(self.long_term) < original_count:
             self._save_long_term()
-            self._notify_subscribers()
     
     def get_context(self) -> Dict[str, Any]:
         """
@@ -194,24 +190,24 @@ class MemoryManager:
             # Import here to avoid circular import (agent_core imports explicit_memory)
             try:
                 from agent.agent_core import ProvablePolicyManager
-                print(f"🔍 [DEBUG] get_long_term_as_text: Checking {len(self.long_term)} memories for U labels (session_id={session_id})")
+                print(f"[DEBUG] get_long_term_as_text: Checking {len(self.long_term)} memories for U labels (session_id={session_id})")
                 found_u_label = False
                 for i, entry in enumerate(self.long_term):
                     # Handle both dict and string formats
                     if isinstance(entry, dict):
                         label = entry.get("label", None)
                         text_preview = entry.get("text", "")[:50]
-                        print(f"🔍 [DEBUG] Memory {i}: label={label}, text_preview='{text_preview}'")
+                        print(f"[DEBUG] Memory {i}: label={label}, text_preview='{text_preview}'")
                         if label == "U":
                             # Upgrade session to U if U-labeled memory is retrieved
-                            print(f"🛡️ [DEBUG] Found U-labeled memory! Upgrading session '{session_id}' to UNTRUSTED")
+                            print(f"[DEBUG] Found U-labeled memory! Upgrading session '{session_id}' to UNTRUSTED")
                             ProvablePolicyManager.set_untrusted(session_id)
                             found_u_label = True
                             break
                         elif label is None:
                             # Error: memory should have a label when provable_policy is active
                             # This indicates a bug - all memories must have labels
-                            print(f"⚠️ [DEBUG] Memory {i} missing label! text_preview='{text_preview}'")
+                            print(f"WARNING: [DEBUG] Memory {i} missing label! text_preview='{text_preview}'")
                             raise ValueError(
                                 f"Explicit memory entry missing label in provable_policy defense. "
                                 f"All memories must have 'label' metadata set to 'T' (Trusted) or 'U' (Untrusted). "
@@ -219,9 +215,9 @@ class MemoryManager:
                             )
                     else:
                         # Entry is a string, not a dict - this shouldn't happen with provable_policy
-                        print(f"⚠️ [DEBUG] Memory {i} is a string, not a dict: '{str(entry)[:50]}'")
+                        print(f"WARNING: [DEBUG] Memory {i} is a string, not a dict: '{str(entry)[:50]}'")
                 if not found_u_label:
-                    print(f"🔍 [DEBUG] No U-labeled memories found. Session '{session_id}' remains trusted.")
+                    print(f"[DEBUG] No U-labeled memories found. Session '{session_id}' remains trusted.")
             except (ImportError, AttributeError) as e:
                 # If import fails, log warning but continue (shouldn't happen in normal operation)
                 print(f"Warning: Could not import ProvablePolicyManager: {e}")
@@ -248,47 +244,17 @@ class MemoryManager:
         self.short_term.clear()
         self.long_term = []
         self._save_long_term()
-        self._notify_subscribers()
     
     def clear_short_term(self):
         """Clear only short-term memory."""
         self.short_term.clear()
-        self._notify_subscribers()
-    
-    def subscribe(self, callback):
-        """
-        Subscribe to memory updates for SSE.
-        
-        Args:
-            callback: Function to call when memory changes
-        """
-        self._subscribers.append(callback)
-    
-    def unsubscribe(self, callback):
-        """
-        Unsubscribe from memory updates.
-        
-        Args:
-            callback: The callback to remove
-        """
-        if callback in self._subscribers:
-            self._subscribers.remove(callback)
-    
-    def _notify_subscribers(self):
-        """Notify all subscribers of memory changes."""
-        context = self.get_context()
-        for callback in self._subscribers:
-            try:
-                callback(context)
-            except Exception as e:
-                print(f"Error notifying subscriber: {e}")
 
 
 # Cache memory managers by memory_file path - cleared between tests to prevent leakage
 _memory_manager_cache: Dict[str, MemoryManager] = {}
 
 
-def get_memory_manager(memory_file: str = "data/interactive_agent/agent_memory.json") -> MemoryManager:
+def get_memory_manager(memory_file: str = "data/agent/agent_memory.json") -> MemoryManager:
     """
     Get or create a memory manager instance.
     Managers are cached by memory_file path to ensure the same instance is reused

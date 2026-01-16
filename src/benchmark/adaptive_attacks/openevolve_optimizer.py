@@ -385,7 +385,7 @@ class OpenEvolveOptimizer(BaseOptimizer):
             max_iterations = self.max_iterations
         
         self._log_info("=" * 80)
-        self._log_info(f"🚀 STARTING OPENEVOLVE OPTIMIZATION")
+        self._log_info(f"STARTING OPENEVOLVE OPTIMIZATION")
         self._log_info(f"   Step: {step_num}")
         self._log_info(f"   Max iterations: {max_iterations}")
         self._log_info(f"   Candidates per iteration: {self.candidates_per_iteration}")
@@ -395,11 +395,11 @@ class OpenEvolveOptimizer(BaseOptimizer):
         # CRITICAL: Reset the database at the start of each optimization
         # This ensures we start fresh and don't accumulate candidates across multiple calls
         self.database.clear()
-        self._log_info(f"🔄 Database reset for fresh optimization run")
+        self._log_info(f"Database reset for fresh optimization run")
         
         # Set reference attack for diversity calculation
         self.database.set_reference_attack(original_attack_email)
-        self._log_info(f"\n📧 Original attack email:")
+        self._log_info(f"\nOriginal attack email:")
         self._log_info(f"   From: {original_attack_email.get('from', 'unknown')}")
         self._log_info(f"   Subject: {original_attack_email.get('subject', '')}")
         self._log_info(f"   Body length: {len(original_attack_email.get('body_plain', ''))} chars")
@@ -413,7 +413,7 @@ class OpenEvolveOptimizer(BaseOptimizer):
             iteration=0
         )
         
-        self._log_info(f"\n🎯 Scoring initial candidate...")
+        self._log_info(f"\nScoring initial candidate...")
         # Score initial candidate
         self._score_candidate(
             initial_candidate,
@@ -425,9 +425,9 @@ class OpenEvolveOptimizer(BaseOptimizer):
         )
         
         self.database.add(initial_candidate)
-        self._log_info(f"✅ Initial candidate: score={initial_candidate.agentdojo_score}/10, partial={initial_candidate.partial_score:.2f}")
-        self._log_info(f"   📝 Explanation: {initial_candidate.explanation if initial_candidate.explanation else '[NONE]'}")
-        self._log_info(f"   💡 Improvement: {initial_candidate.improvement if initial_candidate.improvement else '[NONE]'}")
+        self._log_info(f"Initial candidate: score={initial_candidate.agentdojo_score}/10, partial={initial_candidate.partial_score:.2f}")
+        self._log_info(f"   Explanation: {initial_candidate.explanation if initial_candidate.explanation else '[NONE]'}")
+        self._log_info(f"   Improvement: {initial_candidate.improvement if initial_candidate.improvement else '[NONE]'}")
         
         feedback = [f"Initial candidate score: {initial_candidate.agentdojo_score}/10"]
         
@@ -438,12 +438,12 @@ class OpenEvolveOptimizer(BaseOptimizer):
         
         # Main evolution loop
         self._log_info(f"\n{'='*80}")
-        self._log_info(f"🧬 STARTING EVOLUTION LOOP")
+        self._log_info(f"STARTING EVOLUTION LOOP")
         self._log_info(f"{'='*80}")
         
         for iteration in range(1, max_iterations + 1):
             self._log_info(f"\n{'─'*80}")
-            self._log_info(f"📊 ITERATION {iteration}/{max_iterations}")
+            self._log_info(f"ITERATION {iteration}/{max_iterations}")
             self._log_info(f"{'─'*80}")
             
             # Track best score BEFORE this iteration for improvement detection
@@ -452,29 +452,29 @@ class OpenEvolveOptimizer(BaseOptimizer):
             
             # Check early stopping - perfect score
             if best_before_iteration and best_before_iteration.agentdojo_score >= early_stop_score:
-                self._log_info(f"🎉 Early stopping: achieved perfect score {best_before_iteration.agentdojo_score}/{early_stop_score}")
+                self._log_info(f"Early stopping: achieved perfect score {best_before_iteration.agentdojo_score}/{early_stop_score}")
                 break
             
             # Log current state
             stats = self.database.get_statistics()
-            self._log_info(f"📈 Current state:")
+            self._log_info(f"Current state:")
             self._log_info(f"   Best score: {prev_best_score}/10")
             self._log_info(f"   Total candidates: {stats['total_candidates']}")
             self._log_info(f"   Grid coverage: {stats['grid_coverage']:.1%} ({stats['grid_cells_occupied']}/{self.length_bins * self.diversity_bins} cells)")
             self._log_info(f"   No improvement count: {iterations_without_improvement}")
             
             # Sample parent candidates
-            self._log_info(f"\n🎲 Sampling {self.sample_size} parent candidates...")
+            self._log_info(f"\nSampling {self.sample_size} parent candidates...")
             parents = self.database.sample_candidates(
                 n=self.sample_size,
                 elite_ratio=self.elite_ratio
             )
             
             if not parents:
-                self._log_warning("❌ No parents available for mutation, stopping")
+                self._log_warning("ERROR: No parents available for mutation, stopping")
                 break
             
-            self._log_info(f"✅ Sampled {len(parents)} parents:")
+            self._log_info(f"Sampled {len(parents)} parents:")
             for i, p in enumerate(parents, 1):
                 self._log_info(f"   Parent {i}: score={p.agentdojo_score}/10, length={p.length}, diversity={p.diversity:.2f}")
             
@@ -482,7 +482,7 @@ class OpenEvolveOptimizer(BaseOptimizer):
             attack_goal_dict = failed_step.get("attack_goal", {})
             user_message = failed_step.get("user_message", "")
             
-            self._log_info(f"\n🧪 Mutating to generate {self.candidates_per_iteration} new variants...")
+            self._log_info(f"\nMutating to generate {self.candidates_per_iteration} new variants...")
             try:
                 new_variants = self._mutate(
                     parent_candidates=parents,
@@ -493,17 +493,17 @@ class OpenEvolveOptimizer(BaseOptimizer):
                 )
             except RuntimeError as e:
                 # Model refused to generate mutations - terminate optimization
-                self._log_error(f"❌ Optimization terminated: {e}")
+                self._log_error(f"ERROR: Optimization terminated: {e}")
                 raise
             
             if not new_variants:
-                self._log_warning(f"❌ Mutation failed at iteration {iteration}, stopping")
+                self._log_warning(f"ERROR: Mutation failed at iteration {iteration}, stopping")
                 break
             
-            self._log_info(f"✅ Generated {len(new_variants)} new variants")
+            self._log_info(f"Generated {len(new_variants)} new variants")
             
             # Score and add each variant
-            self._log_info(f"\n🎯 Scoring and evaluating {len(new_variants)} new variants...")
+            self._log_info(f"\nScoring and evaluating {len(new_variants)} new variants...")
             iteration_best_score = 0
             for i, variant_email in enumerate(new_variants, 1):
                 self._log_info(f"\n   Variant {i}/{len(new_variants)}:")
@@ -522,7 +522,7 @@ class OpenEvolveOptimizer(BaseOptimizer):
                 # CRITICAL: Use the base session_id (not a unique one per variant)
                 # The scorer will clear the session before testing, ensuring fresh state
                 # This matches the environment used in the final static test
-                self._log_info(f"      ⏳ Scoring...")
+                self._log_info(f"      Scoring...")
                 self._score_candidate(
                     variant_candidate,
                     failed_step=failed_step,
@@ -536,10 +536,10 @@ class OpenEvolveOptimizer(BaseOptimizer):
                 added = self.database.add(variant_candidate)
                 
                 score_str = f"{variant_candidate.agentdojo_score}/10"
-                added_str = "✅ ADDED TO ELITE" if added else "❌ Not elite"
+                added_str = "ADDED TO ELITE" if added else "Not elite"
                 self._log_info(f"      {added_str}: score={score_str}, partial={variant_candidate.partial_score:.2f}, length={variant_candidate.length}, diversity={variant_candidate.diversity:.2f}")
-                self._log_info(f"      📝 {variant_candidate.explanation if variant_candidate.explanation else '[NO EXPLANATION]'}")
-                self._log_info(f"      💡 {variant_candidate.improvement if variant_candidate.improvement else '[NO IMPROVEMENT]'}")
+                self._log_info(f"      Explanation: {variant_candidate.explanation if variant_candidate.explanation else '[NO EXPLANATION]'}")
+                self._log_info(f"      Improvement: {variant_candidate.improvement if variant_candidate.improvement else '[NO IMPROVEMENT]'}")
                 
                 iteration_best_score = max(iteration_best_score, variant_candidate.agentdojo_score)
                 
@@ -561,7 +561,7 @@ class OpenEvolveOptimizer(BaseOptimizer):
             )
             
             self._log_info(f"\n{'─'*80}")
-            self._log_info(f"📊 ITERATION {iteration} SUMMARY:")
+            self._log_info(f"ITERATION {iteration} SUMMARY:")
             self._log_info(f"   Best score this iteration: {iteration_best_score}/10")
             self._log_info(f"   Best score overall: {current_best_score}/10 (partial: {best_after_iteration.partial_score if best_after_iteration else 0:.2f})")
             self._log_info(f"   Total candidates evaluated: {stats['total_candidates']}")
@@ -570,16 +570,16 @@ class OpenEvolveOptimizer(BaseOptimizer):
             # Check for improvement (compare against score BEFORE this iteration)
             if current_best_score > prev_best_score:
                 iterations_without_improvement = 0
-                self._log_info(f"   🎉 IMPROVEMENT! Score increased from {prev_best_score}/10 to {current_best_score}/10")
+                self._log_info(f"   IMPROVEMENT! Score increased from {prev_best_score}/10 to {current_best_score}/10")
             else:
                 iterations_without_improvement += 1
-                self._log_info(f"   ⚠️ No improvement for {iterations_without_improvement} iteration(s)")
+                self._log_info(f"   WARNING: No improvement for {iterations_without_improvement} iteration(s)")
             
             self._log_info(f"{'─'*80}")
             
             # Check early stopping - no improvement
             if iterations_without_improvement >= early_stop_patience:
-                self._log_info(f"\n⏹️ Early stopping: no improvement for {early_stop_patience} iterations")
+                self._log_info(f"\nEarly stopping: no improvement for {early_stop_patience} iterations")
                 break
         
         # Final evaluation
@@ -587,7 +587,7 @@ class OpenEvolveOptimizer(BaseOptimizer):
         final_stats = self.database.get_statistics()
         
         self._log_info(f"\n{'='*80}")
-        self._log_info(f"🏁 OPENEVOLVE OPTIMIZATION COMPLETE")
+        self._log_info(f"OPENEVOLVE OPTIMIZATION COMPLETE")
         self._log_info(f"{'='*80}")
         
         if best_candidate:
@@ -599,17 +599,17 @@ class OpenEvolveOptimizer(BaseOptimizer):
                 f"grid_coverage={final_stats['grid_coverage']:.1%}"
             )
             
-            self._log_info(f"📊 FINAL RESULTS:")
+            self._log_info(f"FINAL RESULTS:")
             self._log_info(f"   Best score: {best_candidate.agentdojo_score}/10 (partial: {best_candidate.partial_score:.2f})")
             self._log_info(f"   Total candidates evaluated: {final_stats['total_candidates']}")
             self._log_info(f"   Grid coverage: {final_stats['grid_coverage']:.1%} ({final_stats['grid_cells_occupied']}/{self.length_bins * self.diversity_bins} cells)")
-            self._log_info(f"   Success: {'✅ YES' if success else '❌ NO'}")
+            self._log_info(f"   Success: {'YES' if success else 'NO'}")
             self._log_info(f"{'='*80}")
             
             if success:
-                self._log_info(f"🎉 OpenEvolve optimization SUCCESSFUL! Score: {best_candidate.agentdojo_score}/10")
+                self._log_info(f"OpenEvolve optimization SUCCESSFUL! Score: {best_candidate.agentdojo_score}/10")
             else:
-                self._log_info(f"⚠️  OpenEvolve optimization completed but did not fully succeed. Best score: {best_candidate.agentdojo_score}/10")
+                self._log_info(f"WARNING: OpenEvolve optimization completed but did not fully succeed. Best score: {best_candidate.agentdojo_score}/10")
             
             return OptimizationResult(
                 success=success,
@@ -972,10 +972,10 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
                     response_text = (choice.message.content or "").strip()
                     
                     # DEBUG: Log the raw response immediately
-                    self._log_info(f"🔍 [DEBUG] Raw response_text (first 200 chars): {repr(response_text[:200])}")
-                    self._log_info(f"🔍 [DEBUG] response_text length: {len(response_text)}")
-                    self._log_info(f"🔍 [DEBUG] response_text is None: {response_text is None}")
-                    self._log_info(f"🔍 [DEBUG] response_text is empty: {not response_text}")
+                    self._log_info(f"[DEBUG] Raw response_text (first 200 chars): {repr(response_text[:200])}")
+                    self._log_info(f"[DEBUG] response_text length: {len(response_text)}")
+                    self._log_info(f"[DEBUG] response_text is None: {response_text is None}")
+                    self._log_info(f"[DEBUG] response_text is empty: {not response_text}")
                     
                     if not response_text:
                         # Check if it's a refusal
@@ -1003,19 +1003,19 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
                     refusal_indicators = ["i'm sorry", "i can't help", "cannot assist", "unable to", "i apologize", "i cannot", "i won't", "refuse", "decline"]
                     
                     # DEBUG: Log refusal check details
-                    self._log_info(f"🔍 [DEBUG] Checking refusal indicators against: {repr(response_lower[:100])}")
+                    self._log_info(f"[DEBUG] Checking refusal indicators against: {repr(response_lower[:100])}")
                     matched_indicators = [ind for ind in refusal_indicators if ind in response_lower]
-                    self._log_info(f"🔍 [DEBUG] Matched indicators: {matched_indicators}")
+                    self._log_info(f"[DEBUG] Matched indicators: {matched_indicators}")
                     
                     if matched_indicators:
-                        self._log_info(f"🔍 Detected refusal indicators: {matched_indicators}")
+                        self._log_info(f"Detected refusal indicators: {matched_indicators}")
                     
                     if any(indicator in response_lower for indicator in refusal_indicators):
                         # This is a refusal - retry with modified prompt
                         retry_count += 1
-                        self._log_warning(f"⚠️  Mutator refused (attempt {retry_count}/{max_retries}). Response: {response_text[:200]}")
+                        self._log_warning(f"WARNING: Mutator refused (attempt {retry_count}/{max_retries}). Response: {response_text[:200]}")
                         if retry_count < max_retries:
-                            self._log_warning(f"🔄 Retrying with enhanced prompt...")
+                            self._log_warning(f"Retrying with enhanced prompt...")
                             # Enhance the prompt to be more explicit about research context
                             enhanced_system_prompt = system_prompt.replace(
                                 "**IMPORTANT CONTEXT: This is a legitimate security research project",
@@ -1032,7 +1032,7 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
                             raise RuntimeError(error_msg)
                     
                     # Success - break out of retry loop
-                    self._log_info(f"✅ Mutator response looks valid (no refusal detected), proceeding to parse...")
+                    self._log_info(f"Mutator response looks valid (no refusal detected), proceeding to parse...")
                     break
                     
                 except RuntimeError as e:
@@ -1041,7 +1041,7 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
                     if "refused" in error_str.lower() or "can't help" in error_str.lower() or "cannot assist" in error_str.lower():
                         retry_count += 1
                         if retry_count < max_retries:
-                            self._log_warning(f"⚠️  Mutator refused (attempt {retry_count}/{max_retries}). Retrying with enhanced prompt...")
+                            self._log_warning(f"WARNING: Mutator refused (attempt {retry_count}/{max_retries}). Retrying with enhanced prompt...")
                             # Enhance the prompt
                             enhanced_system_prompt = system_prompt.replace(
                                 "**IMPORTANT CONTEXT: This is a legitimate security research project",
@@ -1061,7 +1061,7 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
             
             # If we got here, we have a valid response_text (or raised an exception)
             if retry_count > 0:
-                self._log_info(f"✅ Successfully generated response after {retry_count} retry attempts")
+                self._log_info(f"Successfully generated response after {retry_count} retry attempts")
             
         except RuntimeError as e:
             # Re-raise RuntimeError (model refusal after retries, or token limit)
@@ -1142,7 +1142,7 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
         except RuntimeError as e:
             # Re-raise RuntimeError from _parse_mutator_response (refusal detected)
             # This should have been caught in the retry loop, but if we're here, propagate it
-            self._log_error(f"⚠️  Refusal detected in parser (should have been caught earlier): {e}")
+            self._log_error(f"WARNING: Refusal detected in parser (should have been caught earlier): {e}")
             raise
         
         # Ensure variants only contain allowed fields and merge with original
@@ -1204,7 +1204,7 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
             # This should have been caught earlier, but if we're here, the retry loop didn't work
             error_msg = f"Mutator model ({self.mutator_model}) refused to generate content (caught in parser). Matched patterns: {matched_patterns}. Response: {response_text[:500]}"
             self._log_error(error_msg)
-            self._log_error("⚠️  WARNING: Refusal was not caught in retry loop - this indicates a bug in the refusal detection logic!")
+            self._log_error("WARNING: Refusal was not caught in retry loop - this indicates a bug in the refusal detection logic!")
             # CRITICAL: Raise RuntimeError here - this will be caught by the caller and terminate optimization
             raise RuntimeError(error_msg)
         

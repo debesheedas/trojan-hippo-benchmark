@@ -6,7 +6,6 @@ Provides tools for the agent to update memory.
 from langchain.tools import BaseTool
 from typing import Optional
 from pydantic import BaseModel, Field
-
 from agent.backend.explicit_memory import get_memory_manager
 from agent.utils import append_trace_event, generate_id
 
@@ -40,9 +39,9 @@ class UpdateMemoryTool(BaseTool):
     """
 
     args_schema: type[BaseModel] = UpdateMemoryInput
-    memory_file: str = "data/interactive_agent/agent_memory.json"
+    memory_file: str = "data/agent/agent_memory.json"
     session_id: Optional[str] = None
-    trace_file: str = "data/interactive_agent/trace.jsonl"
+    trace_file: str = "data/agent/trace.jsonl"
     explicit_defense_type: str = "none"
     limit_memory_size: int = 80  # Default limit from config
 
@@ -54,7 +53,7 @@ class UpdateMemoryTool(BaseTool):
         # Defense: disable_memory – baseline defense that completely disables memory updates
         if self.explicit_defense_type == "disable_memory":
             result = (
-                "🛡️ Memory indexing is disabled. This memory update was not stored."
+                "Memory indexing is disabled. This memory update was not stored."
             )
 
             # Log tool call and result even when indexing is blocked
@@ -108,7 +107,7 @@ class UpdateMemoryTool(BaseTool):
             from agent.agent_core import SessionTrustManager
             if self.session_id and not SessionTrustManager.is_trusted(self.session_id):
                 result = (
-                    "🛡️ Memory indexing disabled for this session because an untrusted tool was used. "
+                    "Memory indexing disabled for this session because an untrusted tool was used. "
                     "This turn's memory update was not stored."
                 )
 
@@ -194,9 +193,9 @@ class UpdateMemoryTool(BaseTool):
 
 
 def create_memory_tools(
-    memory_file: str = "data/interactive_agent/agent_memory.json",
+    memory_file: str = "data/agent/agent_memory.json",
     session_id: Optional[str] = None,
-    trace_file: str = "data/interactive_agent/trace.jsonl",
+    trace_file: str = "data/agent/trace.jsonl",
     explicit_defense_type: str = "none",
     limit_memory_size: int = 80,
 ):

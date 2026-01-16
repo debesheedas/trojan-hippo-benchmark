@@ -23,15 +23,8 @@ from typing import List, Dict, Any, Optional
 import threading
 import json
 from datetime import datetime, timezone
+import tiktoken
 from agent.utils import debug_info, debug_debug, debug_print_exception
-
-# Try to import tiktoken for token counting
-try:
-    import tiktoken
-    TIKTOKEN_AVAILABLE = True
-except ImportError:
-    TIKTOKEN_AVAILABLE = False
-    debug_info("Warning: tiktoken not available. Context truncation will use character-based estimation.")
 
 
 class ContextDefenseManager:
@@ -145,7 +138,7 @@ class ContextMemoryManager:
         
         # Initialize tokenizer for token counting
         self.tokenizer = None
-        if TIKTOKEN_AVAILABLE and max_context_length is not None:
+        if max_context_length is not None:
             try:
                 # Use provided model_name or default to gpt-4o-mini
                 tokenizer_model = model_name if model_name else "gpt-4o-mini"
@@ -292,30 +285,30 @@ class ContextMemoryManager:
             # the new session must be marked as untrusted immediately
             if defense_type == "provable_policy" and session_id:
                 from agent.agent_core import ProvablePolicyManager
-                debug_debug(f"🔍 [DEBUG] context retrieve: Checking {len(self.history)} history entries for U labels (session_id={session_id})")
+                debug_debug(f"[DEBUG] context retrieve: Checking {len(self.history)} history entries for U labels (session_id={session_id})")
                 found_u_label = False
                 for i, entry in enumerate(self.history):
                     # Handle both dict and string formats
                     if isinstance(entry, dict):
                         label = entry.get("label", None)
                         text_preview = entry.get("text", "")[:50]
-                        debug_debug(f"🔍 [DEBUG] context History {i}: label={label}, text_preview='{text_preview}'")
+                        debug_debug(f"[DEBUG] context History {i}: label={label}, text_preview='{text_preview}'")
                         if label == "U":
                             # Upgrade session to U if U-labeled memory is retrieved
-                            debug_info(f"🛡️ [DEBUG] context: Found U-labeled memory! Upgrading session '{session_id}' to UNTRUSTED")
+                            debug_info(f"[DEBUG] context: Found U-labeled memory! Upgrading session '{session_id}' to UNTRUSTED")
                             ProvablePolicyManager.set_untrusted(session_id)
                             found_u_label = True
                             break
                         elif label is None:
                             # Error: memory should have a label
-                            debug_info(f"⚠️ [DEBUG] context History {i} missing label! text_preview='{text_preview}'")
+                            debug_info(f"WARNING: [DEBUG] context History {i} missing label! text_preview='{text_preview}'")
                             raise ValueError(
                                 f"Context memory entry missing label in provable_policy defense. "
                                 f"All memories must have 'label' metadata set to 'T' or 'U'. "
                                 f"Entry text preview: {text_preview}..."
                             )
                 if not found_u_label:
-                    debug_debug(f"🔍 [DEBUG] context: No U-labeled memories found. Session '{session_id}' remains trusted.")
+                    debug_debug(f"[DEBUG] context: No U-labeled memories found. Session '{session_id}' remains trusted.")
             
             # Return text content from history entries
             result: List[str] = []
@@ -358,12 +351,12 @@ class ContextMemoryManager:
             # Add debug output for large contexts
             original_length = len(context_string)
             if len(context_string) > 100000:  # If context is > 100k chars, warn
-                debug_info(f"⚠️  Large context detected ({len(context_string)} chars), checking truncation...")
+                debug_info(f"WARNING: Large context detected ({len(context_string)} chars), checking truncation...")
             context_string = self._truncate_context(context_string)
             if len(context_string) != original_length:
-                debug_info(f"⚠️  Context memory truncated: {original_length} → {len(context_string)} chars")
+                debug_info(f"WARNING: Context memory truncated: {original_length} → {len(context_string)} chars")
             elif len(context_string) > 100000:
-                debug_debug(f"ℹ️  Context memory: {len(context_string)} chars (no truncation needed)")
+                debug_debug(f"Context memory: {len(context_string)} chars (no truncation needed)")
         
         return context_string
     
@@ -386,7 +379,7 @@ class ContextMemoryManager:
             try:
                 # For very large contexts, encoding can be slow - add progress indicator
                 if len(context) > 100000:
-                    debug_debug(f"🔄 Encoding large context ({len(context)} chars) for truncation...")
+                    debug_debug(f"Encoding large context ({len(context)} chars) for truncation...")
                 
                 encoded = self.tokenizer.encode(context, disallowed_special=())
                 token_count = len(encoded)
@@ -394,17 +387,17 @@ class ContextMemoryManager:
                 # If within limit, return as-is
                 if token_count <= self.max_context_length:
                     if len(context) > 100000:
-                        debug_debug(f"ℹ️  Context memory: {token_count} tokens (within limit of {self.max_context_length} tokens, no truncation needed)")
+                        debug_debug(f"Context memory: {token_count} tokens (within limit of {self.max_context_length} tokens, no truncation needed)")
                     return context
                 
                 # Truncate to keep most recent tokens (sliding window from end)
                 if len(context) > 100000:
-                    debug_info(f"🔄 Truncating context memory from {token_count} to {self.max_context_length} tokens (keeping most recent, evicting oldest)...")
+                    debug_info(f"Truncating context memory from {token_count} to {self.max_context_length} tokens (keeping most recent, evicting oldest)...")
                 truncated_encoded = encoded[-self.max_context_length:]
                 result = self.tokenizer.decode(truncated_encoded)
                 if len(context) > 100000:
                     result_tokens = len(self.tokenizer.encode(result, disallowed_special=()))
-                    debug_info(f"✅ Truncation complete: {len(result)} chars ({result_tokens} tokens), evicted {token_count - result_tokens} tokens from beginning")
+                    debug_info(f"Truncation complete: {len(result)} chars ({result_tokens} tokens), evicted {token_count - result_tokens} tokens from beginning")
                 return result
             except Exception as e:
                 debug_info(f"Warning: Error during token-based truncation: {e}")

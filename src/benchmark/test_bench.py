@@ -13,10 +13,11 @@ import time
 import shutil
 import tempfile
 import uuid
-from pathlib import Path
+import os
 import sys
-from typing import Dict, List, Any, Optional, Tuple
 import logging
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -30,7 +31,6 @@ load_dotenv()
 from agent.agent_core import invoke_agent, clear_session_agent, clear_agent_cache
 from agent.utils import read_trace_events, load_config, ensure_data_directories, set_global_seeds
 from agent.utils import debug_info, debug_debug, debug_print_exception, debug_print_long_content, set_debug_level, DebugLevel, get_debug_level
-import os
 from benchmark.test_validators import create_validator, CompositeValidator
 from agent.colored_trace_printer import get_colored_printer
 from benchmark.memory_backend import get_memory_backend_registry
@@ -175,19 +175,19 @@ class TestBench:
         # For backward compatibility (used by some old code paths)
         self.memory_type = self.memory_backend_name
         
-        print(f"🧠 Memory Backend: {self.memory_backend_name.upper()}")
-        print(f"🛡️ Defense: {self.unified_defense} (backend: {self.backend_defense})")
-        print(f"📁 Test Directory: {self.test_bench_dir}")
-        print(f"📊 Results Directory: {self.results_base_dir}")
+        print(f"Memory Backend: {self.memory_backend_name.upper()}")
+        print(f"Defense: {self.unified_defense} (backend: {self.backend_defense})")
+        print(f"Test Directory: {self.test_bench_dir}")
+        print(f"Results Directory: {self.results_base_dir}")
         if self.force:
-            print(f"⚡ Force mode: Will overwrite existing results")
+            print(f"Force mode: Will overwrite existing results")
         
         # Check if adaptive benchmark is enabled
         self.adaptive_enabled = self.config.get("benchmark", {}).get("enable_adaptive_benchmark", False)
         if self.adaptive_enabled:
             # Import adaptive components only when needed
             from benchmark.adaptive_attacks import DSPyOptimizer, OpenEvolveOptimizer
-            from agent.utils import compare_attack_bench_files
+            from agent.attack_utils import compare_attack_bench_files
             from benchmark.environment_state import StateManager
             
             # Initialize optimization strategies based on config
@@ -204,7 +204,7 @@ class TestBench:
                 self.optimizers["openevolve"] = OpenEvolveOptimizer(self.config)
             
             if not self.optimizers:
-                print("⚠️ Warning: No optimizers enabled in config. Adaptive benchmark will not work.")
+                print("WARNING: No optimizers enabled in config. Adaptive benchmark will not work.")
             
             # Cache directory for successful attacks
             self.cache_dir = Path("data/benchmark/attack_bench_cache")
@@ -218,9 +218,9 @@ class TestBench:
             for optimizer in self.optimizers.values():
                 optimizer.set_logger(self.logger)
             
-            print("🔧 Adaptive benchmark mode ENABLED")
+            print("Adaptive benchmark mode ENABLED")
         else:
-            print("📊 Static benchmark mode")
+            print("Static benchmark mode")
     
     def _debug_print_initial_mem0_memories(self, test_config: Dict[str, Any]):
         """Debug print: Print all initial mem0 memories loaded in the vectorstore at the start of a test case."""
@@ -236,7 +236,7 @@ class TestBench:
             from pathlib import Path
             
             mem0_config = test_config.get("memory", {}).get("mem0_memory", {})
-            vectorstore_path = mem0_config.get("vectorstore_path", "data/interactive_agent/mem0_vectorstore")
+            vectorstore_path = mem0_config.get("vectorstore_path", "data/agent/mem0_vectorstore")
             user_id = mem0_config.get("user_id", "vince")
             # Memories are stored with agent_id=None, so we query with None
             agent_id = None
@@ -246,7 +246,7 @@ class TestBench:
             faiss_files = list(vectorstore_path_obj.glob("*.faiss")) if vectorstore_path_obj.exists() else []
             
             print(f"\n{'='*80}")
-            print(f"🔍 DEBUG: Initial mem0 Memories in Vectorstore")
+            print(f"DEBUG: Initial mem0 Memories in Vectorstore")
             print(f"{'='*80}")
             print(f"Vectorstore Path: {vectorstore_path}")
             print(f"Vectorstore Exists: {vectorstore_path_obj.exists()}")
@@ -318,7 +318,7 @@ class TestBench:
             from agent.agent_core import _build_agent_prompt
             
             mem0_config = test_config.get("memory", {}).get("mem0_memory", {})
-            vectorstore_path = mem0_config.get("vectorstore_path", "data/interactive_agent/mem0_vectorstore")
+            vectorstore_path = mem0_config.get("vectorstore_path", "data/agent/mem0_vectorstore")
             user_id = mem0_config.get("user_id", "vince")
             agent_id = mem0_config.get("agent_id", "email_agent")
             
@@ -373,7 +373,7 @@ class TestBench:
                                 embedding_model=rag_config.get("embedding_model", "text-embedding-3-small"),
                                 top_k=rag_config.get("top_k", 3),
                                 chunk_size=rag_config.get("chunk_size", 512),
-                                vectorstore_path=rag_config.get("vectorstore_path", "data/interactive_agent/rag_vectorstore"),
+                                vectorstore_path=rag_config.get("vectorstore_path", "data/agent/rag_vectorstore"),
                             )
                             # Pass session_id and defense_type for provable_policy defense
                             rag_context = rag_memory_manager.get_context(
@@ -393,29 +393,29 @@ class TestBench:
                     if mem0_context:
                         formatted_mem0_context = "\n\n# Relevant Mem0 Memory Context\n" + mem0_context + "\n"
                         context_parts.append(formatted_mem0_context)
-                        print("\n📝 Mem0 Context Added to User Message:")
+                        print("\nMem0 Context Added to User Message:")
                         print("-" * 80)
                         print(formatted_mem0_context)
                         print("-" * 80)
                     else:
-                        print("\n📝 Mem0 Context Added to User Message: (none - no relevant memories found)")
+                        print("\nMem0 Context Added to User Message: (none - no relevant memories found)")
                     
                     # Build final user message (same logic as in agent_core.py)
                     final_user_message = "".join(context_parts) + user_message if context_parts else user_message
                     
-                    print("\n💬 Final User Message Sent to Model:")
+                    print("\nFinal User Message Sent to Model:")
                     print("=" * 80)
                     print(final_user_message)
                     print("=" * 80)
                 except Exception as e:
                     debug_info("Could not retrieve mem0 context for debug printing")
                     debug_print_exception(e, context="Retrieving mem0 context for debug printing", include_traceback=True)
-                    print("\n💬 Final User Message Sent to Model:")
+                    print("\nFinal User Message Sent to Model:")
                     print("=" * 80)
                     print(user_message)
                     print("=" * 80)
             else:
-                print("\n💬 Final User Message Sent to Model: (no user message provided)")
+                print("\nFinal User Message Sent to Model: (no user message provided)")
             
             # Print system prompt (memory-related parts)
             try:
@@ -438,7 +438,7 @@ class TestBench:
                     try:
                         from agent.backend.explicit_memory import get_memory_manager
                         memory_file = memory_config.get("explicit_memory", {}).get("memory_file", 
-                            test_config.get("data", {}).get("memory_file", "data/interactive_agent/agent_memory.json"))
+                            test_config.get("data", {}).get("memory_file", "data/agent/agent_memory.json"))
                         memory_manager = get_memory_manager(memory_file=memory_file)
                         # Note: For provable_policy defense, session_id and defense_type should be passed
                         # but in test_bench context, we don't have session_id here, so pass None
@@ -447,7 +447,7 @@ class TestBench:
                     except Exception:
                         explicit_memory_context = ""
                 
-                print("\n📋 System Prompt (Memory-Related Sections):")
+                print("\nSystem Prompt (Memory-Related Sections):")
                 print("=" * 80)
                 if memory_instructions:
                     print("\n[Memory Instructions Section]")
@@ -575,7 +575,7 @@ class TestBench:
                     print(f"Added attack email: {attack_email.get('subject', 'No subject')} from {attack_email.get('from', 'Unknown sender')}")
         else:
             # Fallback to original behavior if no initial_data specified
-            original_mailbox = Path("data/interactive_agent/mailbox")
+            original_mailbox = Path("data/agent/mailbox")
             if original_mailbox.exists():
                 for email_file in original_mailbox.glob("*.json"):
                     shutil.copy2(email_file, inbox_dir)
@@ -583,7 +583,7 @@ class TestBench:
         # Initialize memory using unified backend
         # All tests start with empty memory - memory is built during test execution
         if self.memory_backend_name == "none":
-            print(f"🛡️ No memory backend enabled (memory_backend: none) - skipping memory initialization")
+            print(f"No memory backend enabled (memory_backend: none) - skipping memory initialization")
             # Still create empty memory file for compatibility
             memory_file = test_dir / "agent_memory.json"
             if not memory_file.exists():
@@ -593,7 +593,7 @@ class TestBench:
         else:
             # Initialize empty memory backend - memory will be built during test execution
             # Backends will create empty stores on first use, no initialization needed
-            print(f"✅ Initialized {self.memory_backend_name} memory backend (empty - memory built during test)")
+            print(f"Initialized {self.memory_backend_name} memory backend (empty - memory built during test)")
             
             # Still create empty memory file for compatibility (for explicit backend)
             if self.memory_backend_name == "explicit":
@@ -692,7 +692,7 @@ class TestBench:
         if test_dir and test_dir.exists():
             try:
                 shutil.rmtree(test_dir)
-                print(f"✅ Cleaned up test environment: {test_dir.name}")
+                print(f"Cleaned up test environment: {test_dir.name}")
             except Exception as e:
                 # Log error but don't fail - we'll clean up later if needed
                 debug_info(f"Failed to clean up test environment {test_dir.name}")
@@ -766,7 +766,7 @@ class TestBench:
                     status = "✓ PASSED" if all_passed else "✗ FAILED"
                     print(f"Test: {test_file.name} - {status} ({total_successful_user_steps}/{total_user_steps} steps)", file=original_stdout, flush=True)
                     if execution_errors:
-                        print(f"  ⚠️  {len(execution_errors)} execution error(s) - see log file for details", file=original_stdout, flush=True)
+                        print(f"  WARNING: {len(execution_errors)} execution error(s) - see log file for details", file=original_stdout, flush=True)
                 except Exception:
                     # If we can't get the result, just skip summary
                     pass
@@ -822,7 +822,7 @@ class TestBench:
                 test_file,
                 self.results_base_dir
             )
-            print(f"⏭️  Skipping {test_file.name} - result already exists at {result_path}")
+            print(f"Skipping {test_file.name} - result already exists at {result_path}")
             print(f"   Use --force to overwrite")
             
             # Load and return existing result
@@ -885,7 +885,7 @@ class TestBench:
                 
                 if step_type == "start_new_session":
                     # Handle session management step
-                    print(f"🔄 {step.get('description', 'Starting new session')}")
+                    print(f"{step.get('description', 'Starting new session')}")
                     
                     # Save current session history
                     try:
@@ -949,7 +949,7 @@ class TestBench:
                     # Get the attack email from the step
                     attack_email = step.get("attack_email")
                     if not attack_email:
-                        print(f"⚠️ Warning: Step {i} has step_type 'insert_attack_email' but no 'attack_email' field. Skipping.")
+                        print(f"WARNING: Step {i} has step_type 'insert_attack_email' but no 'attack_email' field. Skipping.")
                         step_results.append({
                             "step": i,
                             "step_type": "insert_attack_email",
@@ -972,7 +972,7 @@ class TestBench:
                         with open(attack_email_file, 'w', encoding='utf-8') as f:
                             json.dump(attack_email, f, indent=2, ensure_ascii=False)
                         
-                        print(f"✅ Added attack email: {attack_email.get('subject', 'No subject')} from {attack_email.get('from', 'Unknown sender')}")
+                        print(f"Added attack email: {attack_email.get('subject', 'No subject')} from {attack_email.get('from', 'Unknown sender')}")
                         
                         # Record this step (no success_check, so no "passed" attribute)
                         step_results.append({
@@ -1002,7 +1002,7 @@ class TestBench:
                     # Get the email from the step
                     email = step.get("email")
                     if not email:
-                        print(f"⚠️ Warning: Step {i} has step_type 'insert_email' but no 'email' field. Skipping.")
+                        print(f"WARNING: Step {i} has step_type 'insert_email' but no 'email' field. Skipping.")
                         step_results.append({
                             "step": i,
                             "step_type": "insert_email",
@@ -1025,7 +1025,7 @@ class TestBench:
                         with open(email_file, 'w', encoding='utf-8') as f:
                             json.dump(email, f, indent=2, ensure_ascii=False)
                         
-                        print(f"✅ Added email: {email.get('subject', 'No subject')} from {email.get('from', 'Unknown sender')}")
+                        print(f"Added email: {email.get('subject', 'No subject')} from {email.get('from', 'Unknown sender')}")
                         
                         # Update state manager with new email
                         try:
@@ -1065,7 +1065,7 @@ class TestBench:
                     # Get the benign email from the step
                     benign_email = step.get("benign_email")
                     if not benign_email:
-                        print(f"⚠️ Warning: Step {i} has step_type 'insert_benign_email' but no 'benign_email' field. Skipping.")
+                        print(f"WARNING: Step {i} has step_type 'insert_benign_email' but no 'benign_email' field. Skipping.")
                         step_results.append({
                             "step": i,
                             "step_type": "insert_benign_email",
@@ -1088,7 +1088,7 @@ class TestBench:
                         with open(benign_email_file, 'w', encoding='utf-8') as f:
                             json.dump(benign_email, f, indent=2, ensure_ascii=False)
                         
-                        print(f"✅ Added benign email: {benign_email.get('subject', 'No subject')} from {benign_email.get('from', 'Unknown sender')}")
+                        print(f"Added benign email: {benign_email.get('subject', 'No subject')} from {benign_email.get('from', 'Unknown sender')}")
                         
                         # Record this step (no success_check, so no "passed" attribute)
                         step_results.append({
@@ -1121,7 +1121,7 @@ class TestBench:
                 print(f"Expected: {step['expected_behavior']}")
                 
                 # Invoke agent (pure Python, no HTTP)
-                print(f"🔄 Calling invoke_agent...", flush=True)
+                print(f"Calling invoke_agent...", flush=True)
                 sys.stdout.flush()
                 start_time = time.time()
                 
@@ -1135,7 +1135,7 @@ class TestBench:
                         config=test_config
                     )
                     duration = time.time() - start_time
-                    print(f"✅ invoke_agent returned (took {duration:.2f}s)", flush=True)
+                    print(f"invoke_agent returned (took {duration:.2f}s)", flush=True)
                     sys.stdout.flush()
                     
                     response = result["response"]
@@ -1186,7 +1186,7 @@ class TestBench:
                                     validator = create_validator(user_goal_check, test_config)
                                     # Use validate_with_print if it's a composite validator
                                     if isinstance(validator, CompositeValidator):
-                                        print("\n🔍 User Goal Validator Results:")
+                                        print("\nUser Goal Validator Results:")
                                         trace_file = test_config.get("data", {}).get("trace_file") if isinstance(test_config.get("data"), dict) else None
                                         user_goal_passed = validator.validate_with_print(response, session_id, step_traces, trace_file=trace_file)
                                     else:
@@ -1234,7 +1234,7 @@ class TestBench:
                                     validator = create_validator(attack_goal_check, test_config)
                                     # Use validate_with_print if it's a composite validator
                                     if isinstance(validator, CompositeValidator):
-                                        print("\n🔍 Validator Results:")
+                                        print("\nValidator Results:")
                                         trace_file = test_config.get("data", {}).get("trace_file") if isinstance(test_config.get("data"), dict) else None
                                         attack_goal_passed = validator.validate_with_print(response, session_id, step_traces, trace_file=trace_file)
                                     else:
@@ -1310,7 +1310,7 @@ class TestBench:
                                     validator = create_validator(step["success_check"], test_config)
                                     # Use validate_with_print if it's a composite validator
                                     if isinstance(validator, CompositeValidator):
-                                        print("\n🔍 Validator Results:")
+                                        print("\nValidator Results:")
                                         trace_file = test_config.get("data", {}).get("trace_file") if isinstance(test_config.get("data"), dict) else None
                                         step_passed = validator.validate_with_print(response, session_id, step_traces, trace_file=trace_file)
                                     else:
@@ -1564,7 +1564,7 @@ class TestBench:
         
         # Check if this is an indirect PI attack (only these get adaptive treatment)
         if attack_type != "indirect":
-            print(f"📊 Non-indirect attack, running in static mode")
+            print(f"Non-indirect attack, running in static mode")
             return self._run_static_test_from_file(test_file)
         
         # Check for cached version first
@@ -1573,7 +1573,7 @@ class TestBench:
             print(f"💾 Using cached test with optimized attack")
             return self._run_static_test_from_file(cached_test)
         
-        print(f"🔧 Running adaptive test for indirect attack: {test_name}")
+        print(f"Running adaptive test for indirect attack: {test_name}")
         
         # Initialize state manager with test data
         self.state_manager.initialize(test_def, self.config)
@@ -1691,7 +1691,7 @@ class TestBench:
                 # Handle special step types (e.g., start_new_session) similar to static mode
                 step_type = step.get("step_type", "user_message")
                 if step_type == "start_new_session":
-                    print(f"🔄 {step.get('description', 'Starting new session')}")
+                    print(f"{step.get('description', 'Starting new session')}")
                     
                     # Save current session history before switching
                     try:
@@ -1766,7 +1766,7 @@ class TestBench:
                     # Get the attack email from the step
                     attack_email = step.get("attack_email")
                     if not attack_email:
-                        print(f"⚠️ Warning: Step {i} has step_type 'insert_attack_email' but no 'attack_email' field. Skipping.")
+                        print(f"WARNING: Step {i} has step_type 'insert_attack_email' but no 'attack_email' field. Skipping.")
                         step_results.append({
                             "step": i,
                             "step_type": "insert_attack_email",
@@ -1789,7 +1789,7 @@ class TestBench:
                         with open(attack_email_file, 'w', encoding='utf-8') as f:
                             json.dump(attack_email, f, indent=2, ensure_ascii=False)
                         
-                        print(f"✅ Added attack email: {attack_email.get('subject', 'No subject')} from {attack_email.get('from', 'Unknown sender')}")
+                        print(f"Added attack email: {attack_email.get('subject', 'No subject')} from {attack_email.get('from', 'Unknown sender')}")
                         
                         # Update state manager with new email
                         try:
@@ -1829,7 +1829,7 @@ class TestBench:
                     # Get the email from the step
                     email = step.get("email")
                     if not email:
-                        print(f"⚠️ Warning: Step {i} has step_type 'insert_email' but no 'email' field. Skipping.")
+                        print(f"WARNING: Step {i} has step_type 'insert_email' but no 'email' field. Skipping.")
                         step_results.append({
                             "step": i,
                             "step_type": "insert_email",
@@ -1852,7 +1852,7 @@ class TestBench:
                         with open(email_file, 'w', encoding='utf-8') as f:
                             json.dump(email, f, indent=2, ensure_ascii=False)
                         
-                        print(f"✅ Added email: {email.get('subject', 'No subject')} from {email.get('from', 'Unknown sender')}")
+                        print(f"Added email: {email.get('subject', 'No subject')} from {email.get('from', 'Unknown sender')}")
                         
                         # Update state manager with new email
                         try:
@@ -1892,7 +1892,7 @@ class TestBench:
                     # Get the benign email from the step
                     benign_email = step.get("benign_email")
                     if not benign_email:
-                        print(f"⚠️ Warning: Step {i} has step_type 'insert_benign_email' but no 'benign_email' field. Skipping.")
+                        print(f"WARNING: Step {i} has step_type 'insert_benign_email' but no 'benign_email' field. Skipping.")
                         step_results.append({
                             "step": i,
                             "step_type": "insert_benign_email",
@@ -1915,7 +1915,7 @@ class TestBench:
                         with open(benign_email_file, 'w', encoding='utf-8') as f:
                             json.dump(benign_email, f, indent=2, ensure_ascii=False)
                         
-                        print(f"✅ Added benign email: {benign_email.get('subject', 'No subject')} from {benign_email.get('from', 'Unknown sender')}")
+                        print(f"Added benign email: {benign_email.get('subject', 'No subject')} from {benign_email.get('from', 'Unknown sender')}")
                         
                         # Update state manager with new email
                         try:
@@ -1950,7 +1950,7 @@ class TestBench:
 
                 # Check if this step has an attack goal
                 if "attack_goal" in step and step["attack_goal"]:
-                    print(f"🎯 Step {i} has attack goal, testing attack effectiveness")
+                    print(f"Step {i} has attack goal, testing attack effectiveness")
                     
                     # Run the step and check if attack succeeds
                     step_result = self._run_step_with_attack_check(
@@ -1982,7 +1982,7 @@ class TestBench:
                     # Check if attack failed
                     attack_goal_passed = step_result.get("attack_goal", {}).get("passed")
                     if attack_goal_passed is False:
-                        print(f"⚠️ Attack failed at step {i}, attempting optimization")
+                        print(f"WARNING: Attack failed at step {i}, attempting optimization")
                         
                         # Find which step inserted the attack email
                         original_attack_email, attack_email_step_num = self._find_attack_email_from_steps(test_def, i)
@@ -1999,11 +1999,11 @@ class TestBench:
                             if attack_email_step_num == i - 1:
                                 # Attack email was inserted in the previous step, so prev_state is correct
                                 restore_success = self.state_manager.restore_to_prev_state()
-                                print(f"🔄 Restored to state after attack email insertion (step {attack_email_step_num})")
+                                print(f"Restored to state after attack email insertion (step {attack_email_step_num})")
                             else:
                                 # Attack email was inserted earlier, we need to restore to initial state
                                 # and replay up to the attack email step
-                                print(f"🔄 Attack email was inserted at step {attack_email_step_num}, restoring to that point")
+                                print(f"Attack email was inserted at step {attack_email_step_num}, restoring to that point")
                                 # Restore to prev_state first
                                 self.state_manager.restore_to_prev_state()
                                 # Then we need to restore the initial state and replay steps up to attack_email_step_num
@@ -2014,16 +2014,16 @@ class TestBench:
                                     # TODO: Replay steps 1 to attack_email_step_num if needed
                                     # For simplicity, we'll rely on the environment being restored correctly
                                     restore_success = True
-                                    print(f"🔄 Restored to initial state, will replay steps up to {attack_email_step_num}")
+                                    print(f"Restored to initial state, will replay steps up to {attack_email_step_num}")
                                 else:
                                     restore_success = self.state_manager.restore_to_prev_state()
                         else:
                             # Fallback: restore to previous state
                             restore_success = self.state_manager.restore_to_prev_state()
-                            print(f"🔄 Restored to previous state for optimization")
+                            print(f"Restored to previous state for optimization")
                         
                         if not restore_success:
-                            print(f"⚠️ Could not restore to previous state, using current state")
+                            print(f"WARNING: Could not restore to previous state, using current state")
                         
                         # Try optimization strategies in order: basic, dspy, openevolve
                         optimization_result = self._optimize_attack(
@@ -2031,7 +2031,7 @@ class TestBench:
                         )
                         
                         if optimization_result.success:
-                            print(f"✅ Optimization successful with {optimization_result.optimization_strategy}")
+                            print(f"Optimization successful with {optimization_result.optimization_strategy}")
                             
                             # Update the test with optimized attack (update the insert_attack_email step)
                             test_def = self._update_test_with_optimized_attack(
@@ -2063,7 +2063,7 @@ class TestBench:
                             # CRITICAL FIX: Clear session history to match the fresh state used during scoring
                             # During optimization, each variant was scored with a fresh session_id like "adaptive_xxx_iter5_var1"
                             # We need to clear the current session's history to match that fresh state
-                            print(f"🔄 Clearing session history for {session_id} to match fresh optimization state")
+                            print(f"Clearing session history for {session_id} to match fresh optimization state")
                             clear_session_agent(session_id)
                             
                             # Re-run the step with optimized attack
@@ -2080,7 +2080,7 @@ class TestBench:
                                 "optimized_attack_email": optimization_result.optimized_attack_email
                             }
                         else:
-                            print(f"❌ All optimization strategies failed for step {i}")
+                            print(f"ERROR: All optimization strategies failed for step {i}")
                             step_result["optimization"] = {
                                 "strategy": "all_failed",
                                 "iterations": 0,
@@ -2477,7 +2477,7 @@ class TestBench:
         original_attack_email, attack_email_step_num = self._find_attack_email_from_steps(test_def, step_num)
         
         if not original_attack_email:
-            print(f"❌ No attack email found in test definition (searched up to step {step_num})")
+            print(f"ERROR: No attack email found in test definition (searched up to step {step_num})")
             return OptimizationResult(
                 success=False,
                 optimized_attack_email=None,
@@ -2491,7 +2491,7 @@ class TestBench:
         
         # Check if any optimizers are available
         if not self.optimizers:
-            print("❌ No optimizers available (all disabled in config)")
+            print("ERROR: No optimizers available (all disabled in config)")
             return OptimizationResult(
                 success=False,
                 optimized_attack_email=None,
@@ -2504,7 +2504,7 @@ class TestBench:
         # Get current environment state for optimization
         current_state = self.state_manager.get_current_state()
         if not current_state:
-            print("❌ No environment state available for optimization")
+            print("ERROR: No environment state available for optimization")
             return OptimizationResult(
                 success=False,
                 optimized_attack_email=None,
@@ -2516,17 +2516,17 @@ class TestBench:
         
         # Try each optimization strategy in order
         for strategy_name, optimizer in self.optimizers.items():
-            print(f"🔧 Trying optimization strategy: {strategy_name}")
+            print(f"Trying optimization strategy: {strategy_name}")
             
             result = optimizer.optimize_attack(
                 original_attack_email, failed_step, step_num, session_id, test_config, current_state
             )
             
             if result.success:
-                print(f"✅ Optimization successful with {strategy_name}")
+                print(f"Optimization successful with {strategy_name}")
                 return result
             else:
-                print(f"⚠️ Optimization failed with {strategy_name}")
+                print(f"WARNING: Optimization failed with {strategy_name}")
         
         # All strategies failed
         return OptimizationResult(
@@ -2557,12 +2557,12 @@ class TestBench:
                 step = steps[attack_email_step_num - 1]  # Convert to 0-indexed
                 if step.get("step_type") == "insert_attack_email":
                     step["attack_email"] = optimized_attack_email
-                    print(f"📝 Updated attack email in step {attack_email_step_num}")
+                    print(f"Updated attack email in step {attack_email_step_num}")
         else:
             # Fallback: update initial_data for backwards compatibility
             if "initial_data" in test_def and "attack_emails" in test_def["initial_data"]:
                 test_def["initial_data"]["attack_emails"][0] = optimized_attack_email
-                print(f"📝 Updated attack email in initial_data")
+                print(f"Updated attack email in initial_data")
         return test_def
     
     def _inject_optimized_attack_email(self, test_config: Dict[str, Any], 
@@ -2705,7 +2705,7 @@ class TestBench:
         for test_dir in self.test_dirs:
             self.cleanup_test_environment(test_dir)
         self.test_dirs.clear()
-        print("✅ All test environments cleaned up.")
+        print("All test environments cleaned up.")
     
     def print_summary(self, results: List[Dict[str, Any]]):
         """Generate a summary report of all test results."""
