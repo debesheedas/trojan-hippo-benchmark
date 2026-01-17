@@ -484,3 +484,100 @@ def get_rag_memory_manager(
         chunk_size=chunk_size,
         vectorstore_path=vectorstore_path
     )
+
+
+def get_rag_memory_context(text: str, session_id: str, memory_config: dict, memory_backend: str) -> str:
+    """Retrieve RAG memory context if enabled."""
+    rag_memory_config = memory_config.get("rag_memory", {})
+    rag_memory_enabled = rag_memory_config.get("enabled", False) or (memory_backend == "rag")
+    rag_defense_type = rag_memory_config.get("defense_type", "none")
+    
+    if not rag_memory_enabled or rag_defense_type == "disable_memory":
+        return ""
+    
+    try:
+        rag_memory_manager = get_rag_memory_manager(
+            embedding_model=rag_memory_config.get("embedding_model", "text-embedding-3-small"),
+            top_k=rag_memory_config.get("top_k", 3),
+            chunk_size=rag_memory_config.get("chunk_size", 512),
+            vectorstore_path=rag_memory_config.get("vectorstore_path", "data/agent/rag_vectorstore"),
+        )
+        rag_context = rag_memory_manager.get_context(text, session_id=session_id, defense_type=rag_defense_type)
+        return "\n\n# Relevant Memory Context\n" + rag_context + "\n" if rag_context else ""
+    except (OSError, IOError, ValueError, RuntimeError) as e:
+        debug_debug(f"Could not retrieve RAG memory context: {e}")
+        return ""
+
+
+def index_rag_memory(text: str, response_text: str, session_id: str, rag_memory_config: dict, rag_defense_type: str, config: dict) -> None:
+    """Index conversation into RAG memory if enabled and defense allows."""
+    try:
+        defense_manager = get_rag_defense_manager(defense_type=rag_defense_type, session_id=session_id)
+        
+        if not defense_manager.should_index_memory(session_id, text, response_text):
+            return
+        
+        default_chunk_size = rag_memory_config.get("chunk_size", 512)
+        limit_memory_size = config.get("benchmark", {}).get("limit_memory_size_defense", 80)
+        effective_chunk_size = defense_manager.get_chunk_size(default_chunk_size, limit_memory_size=limit_memory_size)
+        conversation_turn = defense_manager.filter_conversation_turn(text, response_text)
+        
+        rag_memory_manager = get_rag_memory_manager(
+            embedding_model=rag_memory_config.get("embedding_model", "text-embedding-3-small"),
+            top_k=rag_memory_config.get("top_k", 3),
+            chunk_size=effective_chunk_size,
+            vectorstore_path=rag_memory_config.get("vectorstore_path", "data/agent/rag_vectorstore"),
+        )
+        
+        # Chunk conversation turn
+        chunks = []
+        chunk_size = effective_chunk_size
+        if len(conversation_turn) > 100000:
+            print(f"Chunking large conversation turn ({len(conversation_turn)} chars) into {chunk_size}-char chunks...", flush=True)
+        
+        for i in range(0, len(conversation_turn), chunk_size):
+            chunk = conversation_turn[i:i + chunk_size]
+            if chunk.strip():
+                chunks.append(chunk)
+        
+        if not chunks:
+            chunks = [""]
+        
+        if len(chunks) > 1000:
+            print(f"WARNING: Creating {len(chunks)} chunks for RAG storage - this may take a while...", flush=True)
+        
+        if len(chunks) > 100:
+            print(f"Storing {len(chunks)} chunks in RAG memory (batching to reduce API calls)...", flush=True)
+        
+        valid_chunks = [chunk for chunk in chunks if chunk.strip()]
+        
+        if valid_chunks:
+            max_batch_size = 1000
+            batch_size = min(max_batch_size, len(valid_chunks))
+            total_batches = (len(valid_chunks) + batch_size - 1) // batch_size
+            
+            if len(valid_chunks) > 100:
+                print(f"   Using batch size: {batch_size} chunks per batch", flush=True)
+            
+            for batch_idx in range(total_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, len(valid_chunks))
+                batch_chunks = valid_chunks[start_idx:end_idx]
+                
+                if len(valid_chunks) > 100:
+                    print(f"   Progress: Batch {batch_idx + 1}/{total_batches} ({start_idx + 1}-{end_idx}/{len(valid_chunks)} chunks)...", flush=True)
+                
+                try:
+                    rag_memory_manager.add_memories_batch(
+                        batch_chunks,
+                        metadata={"session_id": session_id, "type": "conversation", "defense_type": rag_defense_type},
+                        session_id=session_id,
+                        defense_type=rag_defense_type
+                    )
+                except (OSError, IOError, ValueError, RuntimeError) as e:
+                    debug_debug(f"Failed to store RAG memory batch {batch_idx + 1}: {e}")
+            
+            if len(valid_chunks) > 100:
+                print(f"Stored {len(valid_chunks)} chunks in RAG memory ({total_batches} batches)", flush=True)
+    except (OSError, IOError, ValueError, RuntimeError) as e:
+        debug_debug(f"Could not index RAG memory: {e}")

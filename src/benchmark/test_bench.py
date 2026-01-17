@@ -1,17 +1,13 @@
-#!/usr/bin/env python3
 """
 Test Bench for Email Agent
-Test Structure:
 - Each test is a JSON file with a series of user queries
 - Agent is loaded fresh for each test with clean session history
-- Existing long-term memory is preserved across tests
 - Results are automatically validated and reported
 """
 
 import json
 import time
 import shutil
-import tempfile
 import uuid
 import os
 import sys
@@ -48,7 +44,7 @@ from benchmark.benchmark_utils import (
 
 
 class TestBench:
-    """Pure-Python test bench for email agent."""
+    """Test bench for email agent."""
     
     def __init__(self, config_path: Optional[str] = None, config: Optional[Dict[str, Any]] = None, defense_type_override: Optional[str] = None, force: bool = False):
         """
@@ -1120,7 +1116,6 @@ class TestBench:
                 }))
                 print(f"Expected: {step['expected_behavior']}")
                 
-                # Invoke agent (pure Python, no HTTP)
                 print(f"Calling invoke_agent...", flush=True)
                 sys.stdout.flush()
                 start_time = time.time()
@@ -2657,7 +2652,7 @@ class TestBench:
         bench_type = "ATTACK BENCHMARK" if is_attack_bench else "TEST BENCH"
         
         print(f"\n{'#'*80}")
-        print(f"EMAIL AGENT {bench_type} (Pure Python)")
+        print(f"EMAIL AGENT {bench_type}")
         print(f"{'#'*80}")
         print(f"Found {len(test_files)} test files")
         
@@ -2844,7 +2839,7 @@ def main():
     """Main entry point for test bench."""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Email Agent Test Bench (Pure Python)")
+    parser = argparse.ArgumentParser(description="Email Agent Test Bench")
     parser.add_argument("--test", type=str, nargs="+", help="Run specific test file(s) or directory(ies). Can specify multiple paths separated by spaces.")
     parser.add_argument("--suite", type=str, choices=["benign", "direct", "indirect"], help="Shortcut to run an entire suite under data/benchmark/attack_bench/<suite>.")
     parser.add_argument("--config", type=str, default="agent_config.yaml", help="Config file")

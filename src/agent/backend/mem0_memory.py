@@ -1337,3 +1337,98 @@ def get_mem0_memory_manager(
         agent_id=agent_id
     )
 
+
+def get_mem0_memory_context(text: str, session_id: str, memory_config: dict) -> str:
+    """Retrieve mem0 memory context if enabled."""
+    mem0_memory_config = memory_config.get("mem0_memory", {})
+    mem0_memory_enabled = mem0_memory_config.get("enabled", False)
+    mem0_defense_type = mem0_memory_config.get("defense_type", "none")
+    
+    if not mem0_memory_enabled or mem0_defense_type == "disable_memory":
+        return ""
+    
+    try:
+        mem0_memory_manager = get_mem0_memory_manager(
+            llm_provider=mem0_memory_config.get("llm_provider", "openai"),
+            llm_model=mem0_memory_config.get("llm_model", "gpt-5-mini"),
+            llm_temperature=mem0_memory_config.get("llm_temperature", 0.0),
+            embedding_provider=mem0_memory_config.get("embedding_provider", "openai"),
+            embedding_model=mem0_memory_config.get("embedding_model", "text-embedding-3-small"),
+            vector_store_provider=mem0_memory_config.get("vector_store_provider", "faiss"),
+            vectorstore_path=mem0_memory_config.get("vectorstore_path", "data/agent/mem0_vectorstore"),
+            top_k=mem0_memory_config.get("top_k", 10),
+            user_id=mem0_memory_config.get("user_id", "default_user"),
+            agent_id=None,
+        )
+        mem0_context = mem0_memory_manager.get_context(
+            text, user_id="vince", session_id=session_id, defense_type=mem0_defense_type
+        )
+        return "\n\n# Relevant Mem0 Memory Context\n" + mem0_context + "\n" if mem0_context else ""
+    except Mem0TimeoutError as e:
+        print(f"CRITICAL ERROR: mem0 memory retrieval timed out: {e}")
+        print("   Test results are UNRELIABLE - the API call was not successful.")
+        raise
+    except (OSError, IOError, ValueError, RuntimeError) as e:
+        debug_debug(f"Could not retrieve mem0 memory context: {e}")
+        return ""
+
+
+def index_mem0_memory(text: str, response_text: str, session_id: str, mem0_memory_config: dict, mem0_defense_type: str, config: dict) -> None:
+    """Index conversation into mem0 memory if enabled and defense allows."""
+    try:
+        defense_manager = get_defense_manager(defense_type=mem0_defense_type, session_id=session_id)
+        
+        conversation_messages = [
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": response_text}
+        ]
+        
+        if not defense_manager.should_index_memory(session_id, conversation_messages):
+            if mem0_memory_config.get("mem0_print", False):
+                print(f"\nDefense '{mem0_defense_type}' blocked memory indexing for this turn")
+            return
+        
+        filtered_messages = defense_manager.filter_messages(conversation_messages)
+        
+        if not filtered_messages:
+            if mem0_memory_config.get("mem0_print", False):
+                print(f"\nDefense '{mem0_defense_type}' filtered out all messages")
+            return
+        
+        mem0_memory_manager = get_mem0_memory_manager(
+            llm_provider=mem0_memory_config.get("llm_provider", "openai"),
+            llm_model=mem0_memory_config.get("llm_model", "gpt-5-mini"),
+            llm_temperature=mem0_memory_config.get("llm_temperature", 0.0),
+            embedding_provider=mem0_memory_config.get("embedding_provider", "openai"),
+            embedding_model=mem0_memory_config.get("embedding_model", "text-embedding-3-small"),
+            vector_store_provider=mem0_memory_config.get("vector_store_provider", "faiss"),
+            vectorstore_path=mem0_memory_config.get("vectorstore_path", "data/agent/mem0_vectorstore"),
+            top_k=mem0_memory_config.get("top_k", 3),
+            user_id=mem0_memory_config.get("user_id", "default_user"),
+            agent_id=mem0_memory_config.get("agent_id", "email_agent"),
+        )
+        
+        limit_memory_size = config.get("benchmark", {}).get("limit_memory_size_defense", 80)
+        max_memory_length = limit_memory_size if mem0_defense_type == "limit_memory_length" else None
+
+        result = mem0_memory_manager.add_memory(
+            messages=filtered_messages,
+            metadata={"session_id": session_id, "type": "conversation", "defense_type": mem0_defense_type},
+            user_id="vince",
+            max_memory_length=max_memory_length,
+            session_id=session_id,
+            defense_type=mem0_defense_type,
+        )
+        if mem0_memory_config.get("mem0_print", False) and result:
+            results = result.get("results", [])
+            if results:
+                print(f"\nStored {len(results)} memory(ies) to mem0")
+            else:
+                print("\nWARNING: No memories extracted from conversation")
+    except Mem0TimeoutError as e:
+        print(f"CRITICAL ERROR: mem0 memory operation timed out: {e}")
+        print("   Test results are UNRELIABLE - the API call was not successful.")
+        raise
+    except (OSError, IOError, ValueError, RuntimeError) as e:
+        debug_debug(f"Could not index mem0 memory: {e}")
+

@@ -224,6 +224,48 @@ def get_timestamp() -> str:
     return fixed_date.isoformat()
 
 
+def _get_model_context_windows() -> Dict[str, int]:
+    """Get dictionary mapping model names to their context windows."""
+    return {
+        "gpt-5-mini": 400000,
+        "gpt-4o": 128000,
+        "gpt-4o-mini": 128000,
+        "gpt-4.1-mini": 1000000,
+        "o1": 200000,
+        "o1-mini": 200000,
+        "claude-3-7-sonnet": 200000,
+        "gemini-2.0-flash": 1000000,
+    }
+
+
+def _get_api_token_limits() -> Dict[str, int]:
+    """Get dictionary mapping model names to their API token limits."""
+    return {
+        "gpt-5-mini": 272000,
+        "gpt-4o": 128000,
+        "gpt-4o-mini": 128000,
+        "gpt-4.1-mini": 1000000,
+        "o1": 200000,
+        "o1-mini": 200000,
+        "claude-3-7-sonnet": 200000,
+        "gemini-2.0-flash": 1000000,
+    }
+
+
+def get_model_context_window(model_name: str, default: int = 128000) -> int:
+    """
+    Get context window for a model name.
+    
+    Args:
+        model_name: Model name (case-insensitive)
+        default: Default context window if model not found
+    
+    Returns:
+        Context window size
+    """
+    return _get_model_context_windows().get(model_name.lower(), default)
+
+
 def load_config(config_path: str = "agent_config.yaml") -> dict:
     """Load configuration from YAML file."""
     config_file = Path(config_path)
@@ -238,27 +280,8 @@ def load_config(config_path: str = "agent_config.yaml") -> dict:
         raise ValueError(f"Configuration file must contain a dictionary, got {type(config)}")
     
     # Look up context window and API token limits for the model and add them to config
-    model_context_windows = {
-        "gpt-5-mini": 400000,
-        "gpt-4o": 128000,
-        "gpt-4o-mini": 128000,
-        "gpt-4.1-mini": 1000000,
-        "o1": 200000,
-        "o1-mini": 200000,
-        "claude-3-7-sonnet": 200000,
-        "gemini-2.0-flash": 1000000,
-    }
-    
-    api_token_limits = {
-        "gpt-5-mini": 272000,
-        "gpt-4o": 128000,
-        "gpt-4o-mini": 128000,
-        "gpt-4.1-mini": 1000000,
-        "o1": 200000,
-        "o1-mini": 200000,
-        "claude-3-7-sonnet": 200000,
-        "gemini-2.0-flash": 1000000,
-    }
+    model_context_windows = _get_model_context_windows()
+    api_token_limits = _get_api_token_limits()
     
     # Get model name and set context window, API token limit, and provider in config
     agent_config = config.get("agent", {})

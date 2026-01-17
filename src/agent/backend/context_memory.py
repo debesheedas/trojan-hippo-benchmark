@@ -25,6 +25,7 @@ import json
 from datetime import datetime, timezone
 import tiktoken
 from agent.utils import debug_info, debug_debug, debug_print_exception
+from benchmark.defense_backend import get_defense_backend_registry
 
 
 class ContextDefenseManager:
@@ -500,3 +501,58 @@ def get_context_defense_manager(
     return ContextDefenseManager(
         defense_type=defense_type
     )
+
+
+def get_context_memory_context(text: str, session_id: str, model_name: str, memory_config: dict, memory_backend: str) -> str:
+    """Retrieve context memory context if enabled."""
+    context_memory_config = memory_config.get("context_memory", {})
+    context_memory_enabled = context_memory_config.get("enabled", False) or (memory_backend == "context")
+    unified_defense_type = context_memory_config.get("defense_type", "none")
+    defense_registry = get_defense_backend_registry()
+    context_defense_type = defense_registry.map_defense("context", unified_defense_type)
+    
+    if not context_memory_enabled or context_defense_type == "disable_memory":
+        return ""
+    
+    try:
+        max_context_length = context_memory_config.get("max_context_length")
+        context_memory_manager = get_context_memory_manager(
+            context_path=context_memory_config.get("context_path", "data/agent/context_memory.json"),
+            max_context_length=max_context_length,
+            model_name=model_name,
+        )
+        context_memory_context = context_memory_manager.get_context(
+            text, session_id=session_id, defense_type=context_defense_type
+        )
+        return "\n\n# Relevant Context Memory\n" + context_memory_context + "\n" if context_memory_context else ""
+    except (OSError, IOError, ValueError, RuntimeError) as e:
+        debug_debug(f"Could not retrieve context memory: {e}")
+        return ""
+
+
+def index_context_memory(text: str, response_text: str, session_id: str, model_name: str, context_memory_config: dict, context_defense_type: str) -> None:
+    """Index conversation into context memory if enabled and defense allows."""
+    try:
+        defense_manager = get_context_defense_manager(defense_type=context_defense_type, session_id=session_id)
+        
+        if not defense_manager.should_index_memory(session_id, text, response_text):
+            return
+        
+        conversation_turn = defense_manager.filter_conversation_turn(text, response_text)
+        max_context_length = context_memory_config.get("max_context_length")
+        
+        context_memory_manager = get_context_memory_manager(
+            context_path=context_memory_config.get("context_path", "data/agent/context_memory.json"),
+            max_context_length=max_context_length,
+            model_name=model_name,
+        )
+        
+        if conversation_turn.strip():
+            context_memory_manager.add_memory(
+                conversation_turn,
+                metadata={"session_id": session_id, "type": "conversation", "defense_type": context_defense_type},
+                session_id=session_id,
+                defense_type=context_defense_type
+            )
+    except (OSError, IOError, ValueError, RuntimeError) as e:
+        debug_debug(f"Could not index context memory: {e}")
