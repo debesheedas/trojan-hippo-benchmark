@@ -32,7 +32,7 @@ python scripts/run_benchmark.py
 ```
 
 **What this does:**
-- Runs each test file (e.g., `test1.json`, `test2.json`) for **all 24 combinations** (5 backends × 5 defenses, minus 1 invalid combination)
+- Runs each test file (e.g., `test1.json`, `test2.json`) for **all 23 combinations** (5 backends × 5 defenses, minus 2 invalid combinations: context+limit_memory_length and explicit+user_prompt_only)
 - Uses the **exact same code path** as normal benchmarks (no special test code)
 - Saves results to `CI-tests/results/` with structure:
   ```

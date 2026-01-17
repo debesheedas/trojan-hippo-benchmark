@@ -526,10 +526,13 @@ def run_all_combinations(
     global _interrupted, _executor_ref
     # Generate all combinations
     # Treat "none" backend as a regular backend - run all defense types
+    # Skip invalid combinations (e.g., context+limit_memory_length, explicit+user_prompt_only)
+    from benchmark.benchmark_utils import is_valid_combination
     combinations = []
     for backend in memory_backends:
         for defense in defense_types:
-            combinations.append((backend, defense))
+            if is_valid_combination(backend, defense):
+                combinations.append((backend, defense))
     
     total_combinations = len(combinations)
     print(f"\n{'#'*80}")

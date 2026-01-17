@@ -84,8 +84,10 @@ def compare_results(
     
     for memory_backend in memory_backends:
         for defense_type in defense_types:
-            # Skip limit_memory_length for context backend (not applicable)
+            # Skip invalid combinations
             if memory_backend == "context" and defense_type == "limit_memory_length":
+                continue
+            if memory_backend == "explicit" and defense_type == "user_prompt_only":
                 continue
             
             # Get expected result

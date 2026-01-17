@@ -8,7 +8,7 @@ Generates comprehensive CSV tables and visualizations for each test suite:
 - Combined heatmap with all suites as subplots
 - Average heatmap across all test suites
 - Combined CSV listing all test suites one below the other
-- Average summary CSV with all 25 combinations (5 memory backends × 5 defense types)
+- Average summary CSV with all 23 valid combinations (5 memory backends × 5 defense types, minus 2 invalid combinations)
 - Separate files for each suite: benign, direct, indirect, memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory
 
 Usage:
@@ -47,6 +47,7 @@ from benchmark.benchmark_utils import (
     UNIFIED_DEFENSE_TYPES,
     get_combination_log_path,
     get_results_dir,
+    is_valid_combination,
 )
 
 # Constants
@@ -221,6 +222,9 @@ def collect_all_data(
     for defense_type in UNIFIED_DEFENSE_TYPES:
         data[defense_type] = {}
         for backend in MEMORY_BACKENDS:
+            # Skip invalid combinations
+            if not is_valid_combination(backend, defense_type):
+                continue
             # Treat "none" backend as a regular backend - collect results for each defense type
             # This allows provable_policy and other defenses to work correctly even without memory
             passed, total, rate, has_errors = collect_results_for_combination(
@@ -260,7 +264,11 @@ def generate_csv(
         for defense_type in UNIFIED_DEFENSE_TYPES:
             row = [defense_type.replace("_", " ").title()]
             for backend in MEMORY_BACKENDS:
-                _, total_steps, rate, has_errors = data[defense_type][backend]
+                # Skip invalid combinations
+                if not is_valid_combination(backend, defense_type):
+                    row.append("-")
+                    continue
+                _, total_steps, rate, has_errors = data[defense_type].get(backend, (0, 0, 0.0, False))
                 if has_errors:
                     row.append("ERR")
                 elif total_steps > 0:
@@ -283,9 +291,14 @@ def _prepare_heatmap_data(
         rate_row = []
         error_row = []
         for backend in MEMORY_BACKENDS:
-            _, _, rate, has_errors = data[defense_type][backend]
-            rate_row.append(rate)
-            error_row.append(has_errors)
+            # Skip invalid combinations (set to NaN for visualization)
+            if not is_valid_combination(backend, defense_type):
+                rate_row.append(np.nan)
+                error_row.append(False)
+            else:
+                _, _, rate, has_errors = data[defense_type].get(backend, (0, 0, 0.0, False))
+                rate_row.append(rate)
+                error_row.append(has_errors)
         rates_matrix.append(rate_row)
         has_errors_matrix.append(error_row)
     
@@ -755,7 +768,11 @@ def generate_combined_csv(
             for defense_type in UNIFIED_DEFENSE_TYPES:
                 row = [suite_label, defense_type.replace("_", " ").title()]
                 for backend in MEMORY_BACKENDS:
-                    _, total_steps, rate, has_errors = data[defense_type][backend]
+                    # Skip invalid combinations
+                    if not is_valid_combination(backend, defense_type):
+                        row.append("-")
+                        continue
+                    _, total_steps, rate, has_errors = data[defense_type].get(backend, (0, 0, 0.0, False))
                     if has_errors:
                         row.append("ERR")
                     elif total_steps > 0:
@@ -773,7 +790,7 @@ def generate_average_summary_csv(
     output_dir: Path
 ) -> Path:
     """
-    Generate a CSV file with average scores for all 25 combinations (5 memory backends × 5 defense types).
+    Generate a CSV file with average scores for all 23 valid combinations (5 memory backends × 5 defense types, minus 2 invalid combinations).
     Same numbers as the averaged heatmap.
     
     Args:
@@ -802,11 +819,12 @@ def generate_average_summary_csv(
                 
                 # Collect rates from all suites for this combination
                 for attack_type in all_data.keys():
-                    _, _, rate, has_errors = all_data[attack_type][defense_type][backend]
-                    if has_errors:
-                        has_any_errors = True
-                    else:
-                        rates.append(rate)
+                    if defense_type in all_data[attack_type] and backend in all_data[attack_type][defense_type]:
+                        _, _, rate, has_errors = all_data[attack_type][defense_type][backend]
+                        if has_errors:
+                            has_any_errors = True
+                        else:
+                            rates.append(rate)
                 
                 if has_any_errors:
                     row.append("ERR")
@@ -838,6 +856,9 @@ def generate_error_summary(
     
     for memory_backend in MEMORY_BACKENDS:
         for unified_defense in UNIFIED_DEFENSE_TYPES:
+            # Skip invalid combinations
+            if not is_valid_combination(memory_backend, unified_defense):
+                continue
             # Check result files for execution_success flag
             results_dir = get_results_dir(memory_backend, unified_defense, model_name, attack_type, results_base_dir)
             if results_dir.exists():

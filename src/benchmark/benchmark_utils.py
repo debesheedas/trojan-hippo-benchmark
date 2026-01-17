@@ -33,6 +33,32 @@ UNIFIED_DEFENSE_TYPES = [
 ]
 
 
+def is_valid_combination(memory_backend: str, unified_defense: str) -> bool:
+    """
+    Check if a memory backend and defense type combination is valid.
+    
+    Invalid combinations:
+    - context + limit_memory_length (not applicable for context backend)
+    - explicit + user_prompt_only (not applicable for explicit backend)
+    
+    Args:
+        memory_backend: Memory backend name
+        unified_defense: Unified defense name
+        
+    Returns:
+        True if combination is valid, False otherwise
+    """
+    # Skip limit_memory_length for context backend (not applicable)
+    if memory_backend == "context" and unified_defense == "limit_memory_length":
+        return False
+    
+    # Skip user_prompt_only for explicit backend (not applicable)
+    if memory_backend == "explicit" and unified_defense == "user_prompt_only":
+        return False
+    
+    return True
+
+
 def map_unified_defense_to_backend(memory_backend: str, unified_defense: str) -> str:
     """
     Map unified defense name to backend-specific defense type.

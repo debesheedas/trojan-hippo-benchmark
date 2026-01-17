@@ -19,11 +19,13 @@ CI-tests/
 
 ## Test Overview
 
-The regression test runs multiple test cases across all 24 combinations of:
+The regression test runs multiple test cases across all 23 combinations of:
 - **Memory backends**: `none`, `explicit`, `mem0`, `rag`, `context` (5 backends)
 - **Defense types**: `none`, `user_prompt_only`, `no_untrusted_tools`, `limit_memory_length`, `provable_policy` (5 defenses)
 
-Note: `limit_memory_length` is not applicable for the `context` backend, so there are 24 valid combinations.
+Note: Invalid combinations are skipped:
+- `limit_memory_length` is not applicable for the `context` backend
+- `user_prompt_only` is not applicable for the `explicit` backend
 
 ## How It Works
 
