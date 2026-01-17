@@ -29,8 +29,7 @@ from agent.utils import read_trace_events, load_config, ensure_data_directories,
 from agent.utils import debug_info, debug_debug, debug_print_exception, debug_print_long_content, set_debug_level, DebugLevel, get_debug_level
 from benchmark.test_validators import create_validator, CompositeValidator
 from agent.colored_trace_printer import get_colored_printer
-from benchmark.memory_backend import get_memory_backend_registry
-from benchmark.defense_backend import get_defense_backend_registry
+from benchmark.benchmark_utils import map_unified_defense_to_backend
 from benchmark.benchmark_utils import (
     get_memory_backend_from_config,
     get_unified_defense_from_config,
@@ -112,8 +111,7 @@ class TestBench:
         else:
             # Get memory backend from config
             self.memory_backend_name = get_memory_backend_from_config(self.config)
-            memory_registry = get_memory_backend_registry()
-            self.memory_backend = memory_registry.create(self.memory_backend_name, self.config)
+            # Note: memory_backend instance is no longer needed - we use functions directly
             
             # Get unified defense type
             if defense_type_override is not None:
@@ -144,8 +142,8 @@ class TestBench:
             # No memory backend = no defense
             self.backend_defense = "none"
         else:
-            defense_registry = get_defense_backend_registry()
-            self.backend_defense = defense_registry.map_defense(self.memory_backend_name, self.unified_defense)
+            # Use new mapper function
+            self.backend_defense = map_unified_defense_to_backend(self.memory_backend_name, self.unified_defense)
         
         # For backward compatibility, maintain old flags
         memory_config = self.config.get("memory", {})

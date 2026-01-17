@@ -581,3 +581,104 @@ def index_rag_memory(text: str, response_text: str, session_id: str, rag_memory_
                 print(f"Stored {len(valid_chunks)} chunks in RAG memory ({total_batches} batches)", flush=True)
     except (OSError, IOError, ValueError, RuntimeError) as e:
         debug_debug(f"Could not index RAG memory: {e}")
+
+
+# ============================================================================
+# Defense Mapping and Test Utilities
+# ============================================================================
+
+def map_unified_defense(unified_defense: str) -> str:
+    """
+    Map unified defense name to RAG backend-specific defense type.
+    
+    Args:
+        unified_defense: Unified defense name (e.g., "none", "user_prompt_only")
+        
+    Returns:
+        Backend-specific defense type string
+    """
+    # RAG uses "limit_chunk_size" instead of "limit_memory_length"
+    DEFENSE_MAP = {
+        "disable_memory": "disable_memory",
+        "none": "none",
+        "user_prompt_only": "user_prompt_only",
+        "no_untrusted_tools": "no_untrusted_tools",
+        "limit_memory_length": "limit_chunk_size",  # RAG uses "limit_chunk_size"
+        "provable_policy": "provable_policy",
+    }
+    return DEFENSE_MAP.get(unified_defense, unified_defense)
+
+
+def get_memory_state_for_test(test_dir: Path, config: Dict[str, Any]) -> List[str]:
+    """
+    Get RAG memory contents for test validation.
+    
+    This is a test utility function that reads memory state from the test directory.
+    For efficiency, it first checks for recent chunks added in the current step.
+    If no recent chunks file exists, it falls back to checking all documents.
+    
+    Args:
+        test_dir: Test-specific directory
+        config: Configuration dictionary
+        
+    Returns:
+        List of memory chunk strings
+    """
+    import json
+    
+    # First, try to get recent chunks (much faster - only checks what was added this step)
+    recent_chunks_file = test_dir / "rag_recent_chunks.json"
+    if recent_chunks_file.exists():
+        try:
+            with open(recent_chunks_file, 'r', encoding='utf-8') as f:
+                recent_chunks = json.load(f)
+            if recent_chunks:
+                # Return recent chunks - these are what were added in the current turn
+                # Extract text from dict format if needed
+                result = []
+                for chunk in recent_chunks:
+                    if isinstance(chunk, dict):
+                        text = chunk.get("text", "")
+                        if text:
+                            result.append(str(text))
+                    else:
+                        result.append(str(chunk))
+                return result
+        except Exception as e:
+            # If we can't read recent chunks, fall back to full retrieval
+            debug_debug(f"Could not read recent chunks file, falling back to full retrieval")
+            debug_print_exception(e, context="Reading recent chunks file", include_traceback=True)
+    
+    # Fallback: Get all memory chunks from the documents list
+    # This is slower but ensures we check everything if recent chunks aren't available
+    rag_config = config.get("memory", {}).get("rag_memory", {})
+    vectorstore_path = str(test_dir / "rag_vectorstore")
+    
+    try:
+        rag_memory_manager = get_rag_memory_manager(
+            embedding_model=rag_config.get("embedding_model", "text-embedding-3-small"),
+            top_k=rag_config.get("top_k", 3),
+            chunk_size=rag_config.get("chunk_size", 512),
+            vectorstore_path=vectorstore_path,
+        )
+        
+        # Get all memory chunks from the documents list
+        # RAGMemoryManager stores all chunks in self.documents
+        if hasattr(rag_memory_manager, 'documents') and rag_memory_manager.documents:
+            # documents is a list of strings (chunk texts)
+            return list(rag_memory_manager.documents)
+        
+        # Fallback: Try to retrieve from vectorstore using a broad query
+        if rag_memory_manager.vectorstore:
+            try:
+                results = rag_memory_manager.vectorstore.similarity_search("", k=1000)
+                return [doc.page_content for doc in results]
+            except Exception as e:
+                debug_debug("Could not retrieve from vectorstore, returning empty list")
+                debug_print_exception(e, context="Retrieving from RAG vectorstore", include_traceback=True)
+        
+        return []
+    except Exception as e:
+        debug_info("Could not read RAG memory")
+        debug_print_exception(e, context="Reading RAG memory", include_traceback=True)
+        return []

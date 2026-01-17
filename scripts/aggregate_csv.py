@@ -34,7 +34,7 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR / "src"))
 
-from benchmark.defense_backend import UNIFIED_DEFENSE_TYPES
+from benchmark.benchmark_utils import UNIFIED_DEFENSE_TYPES
 
 
 def parse_csv_file(csv_file: Path) -> Optional[Dict]:

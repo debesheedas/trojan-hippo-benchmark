@@ -8,9 +8,58 @@ import os
 import time
 import hashlib
 import shutil
+import copy
 from pathlib import Path
 from typing import Dict, Any, Optional, List
-from benchmark.defense_backend import get_defense_backend_registry
+from agent.utils import load_config
+
+# Import mapping functions from backend files
+from agent.backend.explicit_memory import map_unified_defense as explicit_map_defense
+from agent.backend.mem0_memory import map_unified_defense as mem0_map_defense
+from agent.backend.rag_memory import map_unified_defense as rag_map_defense
+from agent.backend.context_memory import map_unified_defense as context_map_defense
+
+# Old defense_backend.py has been removed - mapping functions are now in backend files
+
+# Unified defense names (used in config and CLI)
+# Note: To disable memory, use memory_backend="none" (no defense type needed)
+# When memory_backend="none", defense_type is automatically "none"
+UNIFIED_DEFENSE_TYPES = [
+    "none",
+    "user_prompt_only",
+    "no_untrusted_tools",
+    "limit_memory_length",
+    "provable_policy",
+]
+
+
+def map_unified_defense_to_backend(memory_backend: str, unified_defense: str) -> str:
+    """
+    Map unified defense name to backend-specific defense type.
+    
+    This is a simple mapper that routes to the correct backend's mapping function.
+    
+    Args:
+        memory_backend: Memory backend name ("explicit", "mem0", "rag", "context", or "none")
+        unified_defense: Unified defense name (e.g., "none", "user_prompt_only")
+        
+    Returns:
+        Backend-specific defense type string
+    """
+    if memory_backend == "none":
+        # For "none" backend, use unified defense name directly
+        return unified_defense
+    elif memory_backend == "explicit":
+        return explicit_map_defense(unified_defense)
+    elif memory_backend == "mem0":
+        return mem0_map_defense(unified_defense)
+    elif memory_backend == "rag":
+        return rag_map_defense(unified_defense)
+    elif memory_backend == "context":
+        return context_map_defense(unified_defense)
+    else:
+        # Unknown backend - return as-is
+        return unified_defense
 
 
 def _get_result_path_components(
@@ -43,8 +92,8 @@ def _get_result_path_components(
         # For "none" backend, use unified defense name directly (defenses like provable_policy work without memory)
         defense_folder = unified_defense
     else:
-        defense_registry = get_defense_backend_registry()
-        backend_defense = defense_registry.map_defense(memory_backend, unified_defense)
+        # Use new mapper function
+        backend_defense = map_unified_defense_to_backend(memory_backend, unified_defense)
         
         # Normalize defense folder name to unified name for consistency
         # All backends should use "none" for no defense, regardless of backend-specific name
@@ -558,4 +607,137 @@ def determine_attack_type(test_file: Path, test_def: Optional[Dict[str, Any]] = 
         return test_data.get("attack_type", "benign")
     except Exception:
         return "benign"
+
+
+def prepare_benchmark_config(
+    memory_backend: str,
+    unified_defense: str,
+    config_path: str = "benchmark_config.yaml",
+    target_model_name: Optional[str] = None,
+    results_base_dir: Optional[Path] = None
+) -> Dict[str, Any]:
+    """
+    Prepare configuration dictionary for a benchmark run.
+    
+    This function handles all the config manipulation needed to set up a benchmark:
+    - Loads and merges config files
+    - Sets memory backend and defense type
+    - Configures results directory
+    
+    Args:
+        memory_backend: Memory backend name ("explicit", "mem0", "rag", "context", or "none")
+        unified_defense: Unified defense name (e.g., "none", "user_prompt_only")
+        config_path: Path to benchmark config file
+        target_model_name: Optional model name override
+        results_base_dir: Optional results directory override
+        
+    Returns:
+        Prepared configuration dictionary
+        
+    Raises:
+        ValueError: If agent configuration is missing
+    """
+    # Load benchmark config and make a deep copy to avoid modifying the original
+    # This is important when multiple processes might be running in parallel
+    config = copy.deepcopy(load_config(config_path))
+    
+    # Load agent config from agent_config.yaml and merge it into benchmark config
+    # Agent settings (target_model_name, etc.) and memory settings are only in agent_config.yaml to avoid duplication
+    try:
+        agent_config = load_config("agent_config.yaml")
+        # Merge agent section
+        if "agent" in agent_config:
+            config["agent"] = agent_config["agent"].copy()
+        # Merge memory section (memory settings are only in agent_config.yaml)
+        if "memory" in agent_config:
+            config["memory"] = agent_config["memory"].copy()
+        # Merge seed if present
+        if "seed" in agent_config:
+            config["seed"] = agent_config["seed"]
+    except FileNotFoundError:
+        # If agent_config.yaml doesn't exist, that's okay - agent section will be missing
+        # and will be handled by the target_model_name check below
+        pass
+    
+    # Set target model name (command line arg takes precedence over config)
+    if target_model_name:
+        if "agent" not in config:
+            config["agent"] = {}
+        config["agent"]["target_model_name"] = target_model_name
+    elif "agent" not in config or "target_model_name" not in config.get("agent", {}):
+        # If no agent config was loaded and no target_model_name provided, raise error
+        raise ValueError(
+            "Agent configuration missing. Please ensure agent_config.yaml exists with an 'agent' section, "
+            "or provide target_model_name argument to specify target_model_name."
+        )
+    
+    # Handle no memory backend: disable all backends
+    if memory_backend == "none":
+        if "memory" not in config:
+            config["memory"] = {}
+        # Disable all memory backends
+        for backend_name in ["explicit", "mem0", "rag", "context"]:
+            if backend_name not in config["memory"]:
+                config["memory"][backend_name] = {}
+            config["memory"][backend_name]["enabled"] = False
+        # Set backend to "none" in config
+        config["memory"]["backend"] = "none"
+        # Store defense_type at top level for "none" backend (needed for provable_policy defense)
+        # This allows defenses to work even when memory is disabled
+        config["memory"]["defense_type"] = unified_defense
+    else:
+        # Set memory backend in config
+        if "memory" not in config:
+            config["memory"] = {}
+        config["memory"]["backend"] = memory_backend
+        
+        # Enable the specified backend and disable others
+        for backend_name in ["explicit", "mem0", "rag", "context"]:
+            # Ensure nested structure exists
+            if backend_name not in config["memory"]:
+                config["memory"][backend_name] = {}
+            elif config["memory"][backend_name] is None:
+                config["memory"][backend_name] = {}
+            
+            # Handle backend-specific naming (explicit_memory vs explicit, mem0_memory vs mem0, etc.)
+            backend_config_key = backend_name
+            if backend_name == "explicit":
+                backend_config_key = "explicit_memory"
+            elif backend_name == "mem0":
+                backend_config_key = "mem0_memory"
+            elif backend_name == "rag":
+                backend_config_key = "rag_memory"
+            elif backend_name == "context":
+                backend_config_key = "context_memory"
+            
+            # Ensure backend-specific config exists and is a dict (not None)
+            if backend_config_key not in config["memory"]:
+                config["memory"][backend_config_key] = {}
+            elif config["memory"][backend_config_key] is None:
+                config["memory"][backend_config_key] = {}
+            
+            if backend_name == memory_backend:
+                # Enable both the generic key and the specific key
+                config["memory"][backend_name]["enabled"] = True
+                config["memory"][backend_config_key]["enabled"] = True
+                # Set defense type (map unified to backend-specific)
+                # Use new mapper function
+                backend_defense = map_unified_defense_to_backend(memory_backend, unified_defense)
+                config["memory"][backend_name]["defense_type"] = backend_defense
+                config["memory"][backend_config_key]["defense_type"] = backend_defense
+            else:
+                # Disable both keys
+                config["memory"][backend_name]["enabled"] = False
+                config["memory"][backend_config_key]["enabled"] = False
+    
+    # Set results directory (command line arg takes precedence, default if not provided)
+    if results_base_dir is None:
+        results_base_dir = Path("data/benchmark/results")  # Hardcoded default
+    
+    # Set results_dir in config for TestBench (it reads from config)
+    if "benchmark" not in config:
+        config["benchmark"] = {}
+    config["benchmark"]["results_dir"] = str(results_base_dir)
+    
+    return config
 

@@ -278,3 +278,67 @@ def get_memory_manager(memory_file: str = "data/agent/agent_memory.json") -> Mem
     
     return _memory_manager_cache[cache_key]
 
+
+# ============================================================================
+# Defense Mapping and Test Utilities
+# ============================================================================
+
+def map_unified_defense(unified_defense: str) -> str:
+    """
+    Map unified defense name to explicit memory backend-specific defense type.
+    
+    Args:
+        unified_defense: Unified defense name (e.g., "none", "user_prompt_only")
+        
+    Returns:
+        Backend-specific defense type string
+    """
+    # Explicit memory uses the same names as unified defenses
+    DEFENSE_MAP = {
+        "disable_memory": "disable_memory",
+        "none": "none",
+        "user_prompt_only": "user_prompt_only",
+        "no_untrusted_tools": "no_untrusted_tools",
+        "limit_memory_length": "limit_memory_length",
+        "provable_policy": "provable_policy",
+    }
+    return DEFENSE_MAP.get(unified_defense, unified_defense)
+
+
+def get_memory_state_for_test(test_dir: Path, config: Dict[str, Any]) -> List[str]:  # noqa: ARG001
+    """
+    Get explicit memory contents for test validation.
+    
+    This is a test utility function that reads memory state from the test directory.
+    
+    Args:
+        test_dir: Test-specific directory
+        config: Configuration dictionary (not used for explicit memory)
+        
+    Returns:
+        List of memory strings
+    """
+    memory_file = test_dir / "agent_memory.json"
+    
+    if not memory_file.exists():
+        return []
+    
+    try:
+        with open(memory_file, 'r', encoding='utf-8') as f:
+            memory_data = json.load(f)
+        
+        long_term_memory = memory_data.get("long_term", [])
+        # Extract text from dict format or use string directly
+        result = []
+        for entry in long_term_memory:
+            if isinstance(entry, dict):
+                text = entry.get("text", "")
+                if text:
+                    result.append(str(text))
+            else:
+                result.append(str(entry))
+        return result
+    except Exception as e:
+        print(f"Could not read memory file {memory_file}: {e}")
+        return []
+

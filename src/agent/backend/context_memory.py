@@ -25,7 +25,8 @@ import json
 from datetime import datetime, timezone
 import tiktoken
 from agent.utils import debug_info, debug_debug, debug_print_exception
-from benchmark.defense_backend import get_defense_backend_registry
+# Note: We use the local map_unified_defense function instead of importing from benchmark_utils
+# to avoid circular import issues
 
 
 class ContextDefenseManager:
@@ -508,8 +509,8 @@ def get_context_memory_context(text: str, session_id: str, model_name: str, memo
     context_memory_config = memory_config.get("context_memory", {})
     context_memory_enabled = context_memory_config.get("enabled", False) or (memory_backend == "context")
     unified_defense_type = context_memory_config.get("defense_type", "none")
-    defense_registry = get_defense_backend_registry()
-    context_defense_type = defense_registry.map_defense("context", unified_defense_type)
+    # Use local mapper function (avoid circular import)
+    context_defense_type = map_unified_defense(unified_defense_type)
     
     if not context_memory_enabled or context_defense_type == "disable_memory":
         return ""
@@ -556,3 +557,99 @@ def index_context_memory(text: str, response_text: str, session_id: str, model_n
             )
     except (OSError, IOError, ValueError, RuntimeError) as e:
         debug_debug(f"Could not index context memory: {e}")
+
+
+# ============================================================================
+# Defense Mapping and Test Utilities
+# ============================================================================
+
+def map_unified_defense(unified_defense: str) -> str:
+    """
+    Map unified defense name to context backend-specific defense type.
+    
+    Args:
+        unified_defense: Unified defense name (e.g., "none", "user_prompt_only")
+        
+    Returns:
+        Backend-specific defense type string
+        
+    Note:
+        limit_memory_length is NOT applicable for context backend.
+    """
+    # Context uses the same names as unified defenses, except limit_memory_length is not applicable
+    DEFENSE_MAP = {
+        "disable_memory": "disable_memory",
+        "none": "none",
+        "user_prompt_only": "user_prompt_only",
+        "no_untrusted_tools": "no_untrusted_tools",
+        "provable_policy": "provable_policy",
+        # limit_memory_length is NOT included - not applicable for context
+    }
+    return DEFENSE_MAP.get(unified_defense, unified_defense)
+
+
+def get_memory_state_for_test(test_dir: Path, config: Dict[str, Any]) -> List[str]:
+    """
+    Get context memory contents for test validation.
+    
+    This is a test utility function that reads memory state from the test directory.
+    For efficiency, it first checks for recent entries added in the current step.
+    If no recent entries file exists, it falls back to checking all history.
+    
+    Args:
+        test_dir: Test-specific directory
+        config: Configuration dictionary
+        
+    Returns:
+        List of memory entry strings
+    """
+    import json
+    
+    # First, try to get recent entries (much faster - only checks what was added this step)
+    recent_entries_file = test_dir / "context_recent_chunks.json"
+    if recent_entries_file.exists():
+        try:
+            with open(recent_entries_file, 'r', encoding='utf-8') as f:
+                recent_entries = json.load(f)
+            if recent_entries:
+                # Return recent entries - these are what were added in the current turn
+                return [str(entry) for entry in recent_entries]
+        except Exception as e:
+            # If we can't read recent entries, fall back to full retrieval
+            debug_debug(f"Could not read recent entries file, falling back to full retrieval")
+            debug_print_exception(e, context="Reading recent entries file", include_traceback=True)
+    
+    # Fallback: Get all memory entries from the context file
+    # This is slower but ensures we check everything if recent entries aren't available
+    context_config = config.get("memory", {}).get("context_memory", {})
+    context_path = str(test_dir / "context_memory.json")
+    
+    try:
+        # Get max_context_length from config if specified
+        max_context_length = context_config.get("max_context_length")
+        model_name = config.get("agent", {}).get("target_model_name", "gpt-5-mini")
+        
+        context_manager = get_context_memory_manager(
+            context_path=context_path,
+            max_context_length=max_context_length,
+            model_name=model_name,
+        )
+        
+        # Get all history entries
+        if hasattr(context_manager, 'history') and context_manager.history:
+            # Extract text from dict format or use string directly
+            result = []
+            for entry in context_manager.history:
+                if isinstance(entry, dict):
+                    text = entry.get("text", "")
+                    if text:
+                        result.append(str(text))
+                else:
+                    result.append(str(entry))
+            return result
+        
+        return []
+    except Exception as e:
+        debug_info("Could not read context memory")
+        debug_print_exception(e, context="Reading context memory", include_traceback=True)
+        return []

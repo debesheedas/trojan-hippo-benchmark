@@ -32,11 +32,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR / "src"))
 
 from agent.utils import load_config
-from benchmark.defense_backend import get_defense_backend_registry, UNIFIED_DEFENSE_TYPES
 from benchmark.benchmark_utils import (
     should_skip_test,
     determine_attack_type,
-    discover_test_files
+    discover_test_files,
+    prepare_benchmark_config,
+    UNIFIED_DEFENSE_TYPES
 )
 from benchmark.test_bench import TestBench
 
@@ -115,108 +116,17 @@ def run_benchmark(
         print(f"Running {memory_backend.upper()} benchmark with defense: {unified_defense}")
         print(f"{'='*80}\n")
     
-    # Load benchmark config and make a deep copy to avoid modifying the original
-    # This is important when multiple processes might be running in parallel
-    import copy
-    config = copy.deepcopy(load_config(config_path))
+    # Prepare configuration using shared helper function
+    config = prepare_benchmark_config(
+        memory_backend=memory_backend,
+        unified_defense=unified_defense,
+        config_path=config_path,
+        target_model_name=target_model_name,
+        results_base_dir=results_base_dir
+    )
     
-    # Load agent config from agent_config.yaml and merge it into benchmark config
-    # Agent settings (target_model_name, etc.) and memory settings are only in agent_config.yaml to avoid duplication
-    try:
-        agent_config = load_config("agent_config.yaml")
-        # Merge agent section
-        if "agent" in agent_config:
-            config["agent"] = agent_config["agent"].copy()
-        # Merge memory section (memory settings are only in agent_config.yaml)
-        if "memory" in agent_config:
-            config["memory"] = agent_config["memory"].copy()
-        # Merge seed if present
-        if "seed" in agent_config:
-            config["seed"] = agent_config["seed"]
-    except FileNotFoundError:
-        # If agent_config.yaml doesn't exist, that's okay - agent section will be missing
-        # and will be handled by the target_model_name check below
-        pass
-    
-    # Set target model name (command line arg takes precedence over config)
-    if target_model_name:
-        if "agent" not in config:
-            config["agent"] = {}
-        config["agent"]["target_model_name"] = target_model_name
-    elif "agent" not in config or "target_model_name" not in config.get("agent", {}):
-        # If no agent config was loaded and no target_model_name provided, raise error
-        raise ValueError(
-            "Agent configuration missing. Please ensure agent_config.yaml exists with an 'agent' section, "
-            "or provide --model argument to specify target_model_name."
-        )
-    
-    # Handle no memory backend: disable all backends
-    if memory_backend == "none":
-        if "memory" not in config:
-            config["memory"] = {}
-        # Disable all memory backends
-        for backend_name in ["explicit", "mem0", "rag", "context"]:
-            if backend_name not in config["memory"]:
-                config["memory"][backend_name] = {}
-            config["memory"][backend_name]["enabled"] = False
-        # Set backend to "none" in config
-        config["memory"]["backend"] = "none"
-        # Store defense_type at top level for "none" backend (needed for provable_policy defense)
-        # This allows defenses to work even when memory is disabled
-        config["memory"]["defense_type"] = unified_defense
-    else:
-        # Set memory backend in config
-        if "memory" not in config:
-            config["memory"] = {}
-        config["memory"]["backend"] = memory_backend
-        
-        # Enable the specified backend and disable others
-        for backend_name in ["explicit", "mem0", "rag", "context"]:
-            # Ensure nested structure exists
-            if backend_name not in config["memory"]:
-                config["memory"][backend_name] = {}
-            elif config["memory"][backend_name] is None:
-                config["memory"][backend_name] = {}
-            
-            # Handle backend-specific naming (explicit_memory vs explicit, mem0_memory vs mem0, etc.)
-            backend_config_key = backend_name
-            if backend_name == "explicit":
-                backend_config_key = "explicit_memory"
-            elif backend_name == "mem0":
-                backend_config_key = "mem0_memory"
-            elif backend_name == "rag":
-                backend_config_key = "rag_memory"
-            elif backend_name == "context":
-                backend_config_key = "context_memory"
-            
-            # Ensure backend-specific config exists and is a dict (not None)
-            if backend_config_key not in config["memory"]:
-                config["memory"][backend_config_key] = {}
-            elif config["memory"][backend_config_key] is None:
-                config["memory"][backend_config_key] = {}
-            
-            if backend_name == memory_backend:
-                # Enable both the generic key and the specific key
-                config["memory"][backend_name]["enabled"] = True
-                config["memory"][backend_config_key]["enabled"] = True
-                # Set defense type (map unified to backend-specific)
-                defense_registry = get_defense_backend_registry()
-                backend_defense = defense_registry.map_defense(memory_backend, unified_defense)
-                config["memory"][backend_name]["defense_type"] = backend_defense
-                config["memory"][backend_config_key]["defense_type"] = backend_defense
-            else:
-                # Disable both keys
-                config["memory"][backend_name]["enabled"] = False
-                config["memory"][backend_config_key]["enabled"] = False
-    
-    # Set results directory (command line arg takes precedence, default if not provided)
-    if results_base_dir is None:
-        results_base_dir = Path("data/benchmark/results")  # Hardcoded default
-    
-    # Set results_dir in config for TestBench (it reads from config)
-    if "benchmark" not in config:
-        config["benchmark"] = {}
-    config["benchmark"]["results_dir"] = str(results_base_dir)
+    # Get results_base_dir from config (in case it was set to default)
+    results_base_dir = Path(config["benchmark"]["results_dir"])
     
     # Set test directory
     benchmark_config = config.get("benchmark", {})

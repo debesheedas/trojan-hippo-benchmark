@@ -1432,3 +1432,114 @@ def index_mem0_memory(text: str, response_text: str, session_id: str, mem0_memor
     except (OSError, IOError, ValueError, RuntimeError) as e:
         debug_debug(f"Could not index mem0 memory: {e}")
 
+
+# ============================================================================
+# Defense Mapping and Test Utilities
+# ============================================================================
+
+def map_unified_defense(unified_defense: str) -> str:
+    """
+    Map unified defense name to mem0 backend-specific defense type.
+    
+    Args:
+        unified_defense: Unified defense name (e.g., "none", "user_prompt_only")
+        
+    Returns:
+        Backend-specific defense type string
+    """
+    # Mem0 uses "no_defense" instead of "none"
+    DEFENSE_MAP = {
+        "disable_memory": "disable_memory",
+        "none": "no_defense",  # Mem0 uses "no_defense" instead of "none"
+        "user_prompt_only": "user_prompt_only",
+        "no_untrusted_tools": "no_untrusted_tools",
+        "limit_memory_length": "limit_memory_length",
+        "provable_policy": "provable_policy",
+    }
+    return DEFENSE_MAP.get(unified_defense, unified_defense)
+
+
+def get_memory_state_for_test(test_dir: Path, config: Dict[str, Any]) -> List[str]:
+    """
+    Get mem0 memory contents for test validation.
+    
+    This is a test utility function that reads memory state from the test directory.
+    For efficiency, it first checks for recent memories added in the current step.
+    If no recent memories file exists, it falls back to checking all memories from the vectorstore.
+    
+    Args:
+        test_dir: Test-specific directory
+        config: Configuration dictionary
+        
+    Returns:
+        List of memory strings
+    """
+    import json
+    
+    # First, try to get recent memories (much faster - only checks what was added this step)
+    recent_memories_file = test_dir / "mem0_recent_memories.json"
+    if recent_memories_file.exists():
+        try:
+            with open(recent_memories_file, 'r', encoding='utf-8') as f:
+                recent_memories = json.load(f)
+            if recent_memories:
+                # Return recent memories - these are what were extracted and added in the current turn
+                return recent_memories
+        except Exception as e:
+            # If we can't read recent memories, fall back to full retrieval
+            debug_debug(f"Could not read recent memories file, falling back to full retrieval")
+            debug_print_exception(e, context="Reading recent memories file", include_traceback=True)
+    
+    # Fallback: Get all memories from the vectorstore
+    # This is slower but ensures we check everything if recent memories aren't available
+    mem0_config = config.get("memory", {}).get("mem0_memory", {})
+    vectorstore_path = str(test_dir / "mem0_vectorstore")
+    user_id = mem0_config.get("user_id", "vince")
+    agent_id = mem0_config.get("agent_id", None)
+    
+    try:
+        mem0_manager = get_mem0_memory_manager(
+            llm_provider=mem0_config.get("llm_provider", "openai"),
+            llm_model=mem0_config.get("llm_model", "gpt-4o-mini"),
+            llm_temperature=mem0_config.get("llm_temperature", 0.0),
+            embedding_provider=mem0_config.get("embedding_provider", "openai"),
+            embedding_model=mem0_config.get("embedding_model", "text-embedding-3-small"),
+            vector_store_provider=mem0_config.get("vector_store_provider", "faiss"),
+            vectorstore_path=vectorstore_path,
+            top_k=mem0_config.get("top_k", 3),
+            user_id=user_id,
+            agent_id=agent_id,
+        )
+        
+        memories = mem0_manager.get_all_memories(user_id=user_id, agent_id=agent_id, limit=1000)
+        
+        memory_texts = []
+        for memory in memories:
+            if isinstance(memory, dict):
+                # Try multiple possible keys for mem0 memory content
+                # mem0 may return memories with different key names depending on version
+                memory_text = (
+                    memory.get("memory") or
+                    memory.get("memories") or
+                    memory.get("text") or
+                    memory.get("content") or
+                    memory.get("fact") or
+                    ""
+                )
+                # If still empty, try to get the first string value
+                if not memory_text:
+                    for value in memory.values():
+                        if isinstance(value, str) and value.strip():
+                            memory_text = value
+                            break
+                if memory_text:
+                    memory_texts.append(str(memory_text))
+            else:
+                memory_texts.append(str(memory))
+        
+        return memory_texts
+    except Exception as e:
+        debug_info("Could not read mem0 memory")
+        debug_print_exception(e, context="Reading mem0 memory", include_traceback=True)
+        return []
+

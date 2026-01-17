@@ -7,11 +7,9 @@ via parameters in the test JSON files.
 
 import json
 import re
-import os
 import fnmatch
 from pathlib import Path
-from typing import List, Dict, Any, Union, Optional
-from benchmark.memory_backend import MemoryBackend, get_memory_backend_registry
+from typing import List, Dict, Any, Union, Optional, Tuple
 from agent.utils import debug_info, debug_debug, debug_print_exception
 
 
@@ -32,6 +30,49 @@ class TestValidator:
             return 1.0 if self.validate(agent_response, session_id, traces) else 0.0
         except Exception:
             return 0.0
+    
+    @staticmethod
+    def _check_keywords_in_text(
+        text: str,
+        keywords_lower: List[str],
+        require_all: bool = False,
+        min_keywords: Optional[int] = None
+    ) -> bool:
+        """
+        Helper method to check if keywords are present in text.
+        
+        Args:
+            text: Text to search in (should be lowercase)
+            keywords_lower: List of lowercase keywords to find
+            require_all: If True, all keywords must be present
+            min_keywords: Minimum number of keywords that must be present
+            
+        Returns:
+            True if keywords match the requirements, False otherwise
+        """
+        if not keywords_lower:
+            return True
+        
+        found_keywords = set()
+        text_lower = text.lower()
+        
+        for keyword in keywords_lower:
+            if keyword in text_lower:
+                found_keywords.add(keyword)
+                # Early exit optimizations
+                if min_keywords is not None and len(found_keywords) >= min_keywords:
+                    break
+                elif min_keywords is None and not require_all and len(found_keywords) > 0:
+                    break
+        
+        found_count = len(found_keywords)
+        
+        if min_keywords is not None:
+            return found_count >= min_keywords
+        elif require_all:
+            return found_count == len(keywords_lower)
+        else:
+            return found_count > 0
 
 
 class KeywordValidator(TestValidator):
@@ -63,35 +104,37 @@ class KeywordValidator(TestValidator):
         text = agent_response if self._case_sensitive else agent_response.lower()
         
         if self._check_absence:
-            # For absence check, return False on first match found
-            for keyword in self._keywords_normalized:
-                if keyword in text:
-                    return False
-            return True
-        else:
-            # For presence check, use optimized logic
-            found_count = 0
+            # Check that none of the keywords are present
+            return not any(keyword in text for keyword in self._keywords_normalized)
+        
+        # For presence check, use the base class helper for case-insensitive or inline for case-sensitive
+        if self._case_sensitive:
+            # Case-sensitive: need to check against original text and keywords
+            found_keywords = set()
+            for keyword in self._keywords:
+                if keyword in agent_response:
+                    found_keywords.add(keyword)
+                    # Early exit optimizations
+                    if self._min_required is not None and len(found_keywords) >= self._min_required:
+                        break
+                    elif self._min_required is None and not self._require_all and len(found_keywords) > 0:
+                        break
             
+            found_count = len(found_keywords)
             if self._min_required is not None:
-                # Count until we reach the minimum required
-                for keyword in self._keywords_normalized:
-                    if keyword in text:
-                        found_count += 1
-                        if found_count >= self._min_required:
-                            return True
-                return False
+                return found_count >= self._min_required
             elif self._require_all:
-                # Count all matches
-                for keyword in self._keywords_normalized:
-                    if keyword in text:
-                        found_count += 1
                 return found_count == len(self._keywords)
             else:
-                # Return True on first match found
-                for keyword in self._keywords_normalized:
-                    if keyword in text:
-                        return True
-                return False
+                return found_count > 0
+        else:
+            # Case-insensitive: use the base class helper
+            return self._check_keywords_in_text(
+                text,
+                self._keywords_normalized,
+                self._require_all,
+                self._min_required
+            )
 
 
 class ToolCallValidator(TestValidator):
@@ -127,96 +170,104 @@ class ToolCallValidator(TestValidator):
                 else:
                     self._normalized_tool_params[tool_name][param_name] = expected_value
     
-    def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
-        if not traces or not self._required_tools:
-            return len(self._required_tools) == 0  # No tools to check
-        
-        # Count matching tools and collect their inputs for param validation
-        called_tools_count = 0
-        tool_inputs_for_params = {}
+    def _collect_tool_calls(self, traces: List[Dict]) -> Dict[str, Dict[str, Any]]:
+        """Collect tool calls from traces, returning dict mapping tool_name to inputs."""
+        tool_inputs = {}
+        if not traces:
+            return tool_inputs
         
         for trace in traces:
             if trace.get("event_type") == "tool_call":
                 payload = trace.get("payload", {})
                 tool_name = payload.get("tool_name", "")
-                
                 if tool_name in self._required_tools:
-                    called_tools_count += 1
-                    tool_inputs = payload.get("inputs", {})
-                    tool_inputs_for_params[tool_name] = tool_inputs
-        
-        # Validate tool count with early exit
+                    tool_inputs[tool_name] = payload.get("inputs", {})
+        return tool_inputs
+    
+    def _validate_tool_count(self, called_tools_count: int) -> bool:
+        """Validate that the number of called tools meets requirements."""
         if self._min_tools is not None:
-            if called_tools_count < self._min_tools:
-                return False
+            return called_tools_count >= self._min_tools
         elif self._require_all_tools:
-            if called_tools_count < len(self._required_tools):
-                return False
+            return called_tools_count >= len(self._required_tools)
+        else:
+            return called_tools_count > 0
+    
+    def _validate_param_value(self, actual_value: Any, expected_value: Any, normalized_value: Any, 
+                             min_required: Optional[int] = None) -> bool:
+        """Validate a single parameter value against expected value."""
+        if isinstance(expected_value, str):
+            return normalized_value in str(actual_value).lower()
         
-        # Validate tool parameters if requested
-        if self._check_params and self._tool_params:
-            for tool_name, actual_inputs in tool_inputs_for_params.items():
-                if tool_name in self._tool_params:
-                    expected_params = self._tool_params[tool_name]
-                    normalized_params = self._normalized_tool_params[tool_name]
-                    
-                    for param_name, expected_value in expected_params.items():
-                        # Skip validation-only parameters (not actual tool parameters)
-                        if param_name == 'min_required':
-                            continue
-                        
-                        if param_name not in actual_inputs:
-                            return False
-                        
-                        actual_value = actual_inputs[param_name]
-                        
-                        # Handle different types of parameter validation
-                        if isinstance(expected_value, str):
-                            # String matching (case-insensitive by default)
-                            if normalized_params[param_name] not in str(actual_value).lower():
-                                return False
-                        elif isinstance(expected_value, list):
-                            # List of keywords - check how many are present in the parameter
-                            actual_lower = str(actual_value).lower()
-                            # Normalize whitespace (newlines, tabs, multiple spaces -> single space)
-                            # This allows matching phrases that span multiple lines, which is common
-                            # in email bodies where signatures are on separate lines
-                            actual_normalized = re.sub(r'\s+', ' ', actual_lower)
-                            normalized_keywords = normalized_params[param_name]
-                            
-                            # Check if min_required is specified for this parameter
-                            min_required = expected_params.get('min_required')
-                            if min_required is not None:
-                                # Count how many keywords are found
-                                found_count = 0
-                                for keyword in normalized_keywords:
-                                    # Normalize whitespace in keyword too (handles cases where
-                                    # keyword definition has newlines or extra spaces)
-                                    keyword_normalized = re.sub(r'\s+', ' ', keyword)
-                                    if keyword_normalized in actual_normalized:
-                                        found_count += 1
-                                # Need at least min_required keywords
-                                if found_count < min_required:
-                                    return False
-                            else:
-                                # Default behavior: check if any keyword is present
-                                for keyword in normalized_keywords:
-                                    # Normalize whitespace in keyword too
-                                    keyword_normalized = re.sub(r'\s+', ' ', keyword)
-                                    if keyword_normalized in actual_normalized:
-                                        break
-                                else:
-                                    return False
-                        elif isinstance(expected_value, dict):
-                            # Nested parameter validation
-                            if not self._validate_nested_params(actual_value, expected_value):
-                                return False
-                        else:
-                            # Exact match
-                            if actual_value != expected_value:
-                                return False
+        elif isinstance(expected_value, list):
+            # List of keywords - normalize whitespace for multi-line matching
+            actual_normalized = re.sub(r'\s+', ' ', str(actual_value).lower())
+            normalized_keywords = normalized_value
+            
+            if min_required is not None:
+                # Count keywords found (with whitespace normalization)
+                found_count = sum(
+                    1 for kw in normalized_keywords
+                    if re.sub(r'\s+', ' ', kw) in actual_normalized
+                )
+                return found_count >= min_required
+            else:
+                # Check if any keyword is present
+                return any(re.sub(r'\s+', ' ', kw) in actual_normalized for kw in normalized_keywords)
+        
+        elif isinstance(expected_value, dict):
+            return self._validate_nested_params(actual_value, expected_value)
+        
+        else:
+            # Exact match
+            return actual_value == expected_value
+    
+    def _validate_tool_params(self, tool_inputs: Dict[str, Dict[str, Any]]) -> bool:
+        """Validate parameters for all tools that have parameter expectations."""
+        if not self._check_params or not self._tool_params:
+            return True
+        
+        for tool_name, actual_inputs in tool_inputs.items():
+            if tool_name not in self._tool_params:
+                continue
+            
+            expected_params = self._tool_params[tool_name]
+            normalized_params = self._normalized_tool_params[tool_name]
+            
+            for param_name, expected_value in expected_params.items():
+                # Skip validation-only parameters
+                if param_name == 'min_required':
+                    continue
+                
+                if param_name not in actual_inputs:
+                    return False
+                
+                actual_value = actual_inputs[param_name]
+                normalized_value = normalized_params.get(param_name, expected_value)
+                min_required = expected_params.get('min_required')
+                
+                if not self._validate_param_value(actual_value, expected_value, normalized_value, min_required):
+                    return False
         
         return True
+    
+    def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
+        if not self._required_tools:
+            return True  # No tools to check
+        
+        if not traces:
+            return False
+        
+        # Collect tool calls
+        tool_inputs = self._collect_tool_calls(traces)
+        called_tools_count = len(tool_inputs)
+        
+        # Validate tool count
+        if not self._validate_tool_count(called_tools_count):
+            return False
+        
+        # Validate tool parameters
+        return self._validate_tool_params(tool_inputs)
 
     def score(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> float:
         """
@@ -228,72 +279,53 @@ class ToolCallValidator(TestValidator):
             - Params mismatch -> half credit (0.5 share)
         - If no params expected or check_params is False -> full credit if called.
         """
-        if not traces or not self._required_tools:
-            return 1.0 if len(self._required_tools) == 0 else 0.0
+        if not self._required_tools:
+            return 1.0
+        
+        if not traces:
+            return 0.0
+        
+        # Collect tool calls
+        tool_inputs = self._collect_tool_calls(traces)
+        num_required = len(self._required_tools)
+        
+        # Score each required tool
         per_tool_scores = []
-        # Collect the last-seen inputs per tool (as in validate)
-        seen_inputs: Dict[str, Dict[str, Any]] = {}
-        called_tools: set[str] = set()
-        for trace in traces:
-            if trace.get("event_type") == "tool_call":
-                payload = trace.get("payload", {})
-                tool_name = payload.get("tool_name", "")
-                if tool_name in self._required_tools:
-                    called_tools.add(tool_name)
-                    seen_inputs[tool_name] = payload.get("inputs", {})
-        num_required = len(self._required_tools) if len(self._required_tools) > 0 else 1
         for tool_name in self._required_tools:
-            if tool_name not in called_tools:
+            if tool_name not in tool_inputs:
                 per_tool_scores.append(0.0)
                 continue
-            # Called
+            
+            # Tool was called
             if not self._check_params or tool_name not in self._tool_params:
                 per_tool_scores.append(1.0)
                 continue
+            
+            # Check parameters
+            actual_inputs = tool_inputs[tool_name]
             expected_params = self._tool_params[tool_name]
             normalized_params = self._normalized_tool_params.get(tool_name, {})
-            actual_inputs = seen_inputs.get(tool_name, {})
-            # Determine if params fully match according to validate logic
-            params_ok = True
+            
+            params_match = True
             for param_name, expected_value in expected_params.items():
-                # Skip validation-only parameters (not actual tool parameters)
                 if param_name == 'min_required':
                     continue
                 
                 if param_name not in actual_inputs:
-                    params_ok = False
+                    params_match = False
                     break
+                
                 actual_value = actual_inputs[param_name]
-                if isinstance(expected_value, str):
-                    if normalized_params.get(param_name, str(expected_value).lower()) not in str(actual_value).lower():
-                        params_ok = False
-                        break
-                elif isinstance(expected_value, list):
-                    actual_lower = str(actual_value).lower()
-                    normalized_keywords = normalized_params.get(param_name, [])
-                    
-                    # Check if min_required is specified for this parameter
-                    min_required = expected_params.get('min_required')
-                    if min_required is not None:
-                        # Count how many keywords are found
-                        found_count = sum(1 for kw in normalized_keywords if kw in actual_lower)
-                        if found_count < min_required:
-                            params_ok = False
-                            break
-                    else:
-                        # Default behavior: check if any keyword is present
-                        if not any(kw in actual_lower for kw in normalized_keywords):
-                            params_ok = False
-                            break
-                elif isinstance(expected_value, dict):
-                    if not self._validate_nested_params(actual_value, expected_value):
-                        params_ok = False
-                        break
-                else:
-                    if actual_value != expected_value:
-                        params_ok = False
-                        break
-            per_tool_scores.append(1.0 if params_ok else 0.5)
+                normalized_value = normalized_params.get(param_name, expected_value)
+                min_required = expected_params.get('min_required')
+                
+                if not self._validate_param_value(actual_value, expected_value, normalized_value, min_required):
+                    params_match = False
+                    break
+            
+            # Full credit if params match, half credit if called but params don't match
+            per_tool_scores.append(1.0 if params_match else 0.5)
+        
         return sum(per_tool_scores) / num_required if per_tool_scores else 0.0
     
     def _validate_nested_params(self, actual: Any, expected: Dict[str, Any]) -> bool:
@@ -317,52 +349,35 @@ class ToolCallValidator(TestValidator):
 
 class FileSystemValidator(TestValidator):
     """
-    Validates that specific files were created or modified in the filesystem.
+    Validates that specific files exist and match JSON field expectations.
+    
+    This validator is used to check if files (typically email JSON files) exist and have
+    specific field values (e.g., checking that an email was sent to a specific recipient).
+    Content validation is handled separately by semantic_judge validators.
     
     Config options:
-    - check_files: List of file patterns to check (supports glob patterns)
-    - file_content: Dict mapping file patterns to expected content keywords
-    - require_all_files: If True, all files must exist
+    - check_files: List of file patterns to check (supports glob patterns like "data/outbox/*.json")
+    - json_fields: Dict mapping file patterns to expected JSON field values
+      Example: {"data/outbox/*.json": {"to": "user@example.com"}}
+    - require_all_files: If True, all files must exist (default: True)
     - min_files: Minimum number of files that must exist
-    - json_fields: Dict mapping file patterns to expected JSON field values (for JSON files)
-    - require_all_subjects: List of subject strings that must appear in at least one file
-      (useful for checking that multiple emails were forwarded)
-    - min_keywords: Minimum number of keywords from file_content list that must be found (default: 2)
     """
     
     def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
         super().__init__(config, test_config)
-        # Pre-resolve paths for performance
         self._check_files = config.get("check_files", [])
-        self._file_content = config.get("file_content", {})
         self._json_fields = config.get("json_fields", {})
         self._require_all_files = config.get("require_all_files", True)
         self._min_files = config.get("min_files", None)
-        self._require_all_subjects = config.get("require_all_subjects", [])
-        self._min_keywords_global = config.get("min_keywords", 2)  # Default to 2
         
-        # Pre-resolve file patterns
+        # Pre-resolve file patterns to test environment paths
         self._resolved_files = [self._resolve_path(pattern) for pattern in self._check_files]
         
-        # Pre-normalize content expectations and track min_keywords per pattern
-        self._normalized_content = {}
-        self._min_keywords_per_pattern = {}
-        for pattern, content in self._file_content.items():
-            resolved_pattern = self._resolve_path(pattern)
-            if isinstance(content, str):
-                self._normalized_content[resolved_pattern] = content.lower()
-            elif isinstance(content, list):
-                self._normalized_content[resolved_pattern] = [kw.lower() for kw in content]
-                # Store min_keywords for this pattern (use global default)
-                self._min_keywords_per_pattern[resolved_pattern] = self._min_keywords_global
-            else:
-                self._normalized_content[resolved_pattern] = content
-        
         # Pre-resolve JSON field patterns
-        self._resolved_json_fields = {}
-        for pattern, fields in self._json_fields.items():
-            resolved_pattern = self._resolve_path(pattern)
-            self._resolved_json_fields[resolved_pattern] = fields
+        self._resolved_json_fields = {
+            self._resolve_path(pattern): fields 
+            for pattern, fields in self._json_fields.items()
+        }
     
     def _resolve_path(self, file_pattern: str) -> str:
         """Resolve file pattern to test environment path if test_config is available."""
@@ -390,249 +405,82 @@ class FileSystemValidator(TestValidator):
         
         return resolved_pattern
     
-    def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
-        if not self._check_files:
-            return True  # No files to check
-        
+    def _find_files_matching_patterns(self) -> Tuple[List[str], Dict[str, List[str]]]:
+        """Find all files matching the patterns, returning (all_files, pattern_to_files mapping)."""
         found_files = []
-        # Track which pattern found which files for efficient matching later
         pattern_to_files = {}
         
         for resolved_pattern in self._resolved_files:
             pattern_files = []
-            # Check if pattern contains glob characters
+            
+            # Handle glob patterns
             if '*' in resolved_pattern or '?' in resolved_pattern:
-                # Handle glob pattern - split into directory and pattern parts
-                # For patterns like "test_env_xxx/outbox/*.json", we need to extract the directory
                 pattern_str = str(resolved_pattern)
-                # Find the last path separator before the glob
                 last_sep_idx = max(pattern_str.rfind('/'), pattern_str.rfind('\\'))
+                
                 if last_sep_idx >= 0:
-                    # Split into directory and glob pattern
-                    dir_part = pattern_str[:last_sep_idx]
-                    glob_part = pattern_str[last_sep_idx + 1:]
+                    dir_part, glob_part = pattern_str[:last_sep_idx], pattern_str[last_sep_idx + 1:]
                     dir_path = Path(dir_part)
                     if dir_path.exists() and dir_path.is_dir():
-                        # Use the directory's glob method
-                        for file_path in dir_path.glob(glob_part):
-                            if file_path.is_file():
-                                file_str = str(file_path)
-                                found_files.append(file_str)
-                                pattern_files.append(file_str)
+                        pattern_files = [str(p) for p in dir_path.glob(glob_part) if p.is_file()]
                     else:
-                        # Directory doesn't exist, try as relative pattern
-                        for file_path in Path(".").glob(resolved_pattern):
-                            if file_path.is_file():
-                                file_str = str(file_path)
-                                found_files.append(file_str)
-                                pattern_files.append(file_str)
+                        pattern_files = [str(p) for p in Path(".").glob(resolved_pattern) if p.is_file()]
                 else:
-                    # No separator, treat as relative pattern
-                    for file_path in Path(".").glob(resolved_pattern):
-                        if file_path.is_file():
-                            file_str = str(file_path)
-                            found_files.append(file_str)
-                            pattern_files.append(file_str)
+                    pattern_files = [str(p) for p in Path(".").glob(resolved_pattern) if p.is_file()]
             else:
                 # No glob - check as regular path
                 pattern_path = Path(resolved_pattern)
                 if pattern_path.is_file():
-                    file_str = str(pattern_path)
-                    found_files.append(file_str)
-                    pattern_files.append(file_str)
+                    pattern_files = [str(pattern_path)]
                 elif pattern_path.is_dir():
-                    # If it's a directory, check for any files matching the pattern
-                    for file_path in pattern_path.glob("*"):
-                        if file_path.is_file():
-                            file_str = str(file_path)
-                            found_files.append(file_str)
-                            pattern_files.append(file_str)
+                    pattern_files = [str(p) for p in pattern_path.glob("*") if p.is_file()]
             
-            # Store mapping of pattern to files it found
+            found_files.extend(pattern_files)
             if pattern_files:
                 pattern_to_files[resolved_pattern] = pattern_files
         
-        # Remove duplicates from found_files while preserving order
+        # Remove duplicates while preserving order
         found_files = list(dict.fromkeys(found_files))
-        
-        # Validate file count with early exit
+        return found_files, pattern_to_files
+    
+    def _validate_file_count(self, found_files: List[str]) -> bool:
+        """Validate that the number of found files meets requirements."""
         if self._min_files is not None:
-            if len(found_files) < self._min_files:
-                return False
+            return len(found_files) >= self._min_files
         elif self._require_all_files:
-            if len(found_files) < len(self._check_files):
-                return False
+            return len(found_files) >= len(self._check_files)
+        return True
+    
+    def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
+        if not self._check_files:
+            return True  # No files to check
         
-        # For outbox emails with both JSON fields and content checks, we need to filter by recipient first
-        # So we'll handle this in the JSON fields validation section to avoid duplication
-        # For now, handle content validation normally (will be refined in JSON section if needed)
-        content_validation_passed = True  # Default to True, will be set to False if content validation fails
-        if self._normalized_content:
-            # For file content validation, we need at least one file to match
-            content_validation_passed = False
-            for resolved_pattern, expected_content in self._normalized_content.items():
-                # Get files that match this pattern (either from our mapping or by matching)
-                pattern_files = pattern_to_files.get(resolved_pattern, [])
-                if not pattern_files:
-                    # Fallback: check all found files
-                    pattern_files = [f for f in found_files if self._matches_pattern(f, resolved_pattern)]
-                
-                # Get min_keywords for this pattern
-                min_keywords = self._min_keywords_per_pattern.get(resolved_pattern, self._min_keywords_global)
-                
-                # For outbox emails, if we also have JSON fields, we'll handle it in the JSON section
-                # For now, just check all emails (will be refined if JSON fields are present)
-                if "outbox" in resolved_pattern.lower() and pattern_files:
-                    # Check if we also have JSON fields for this pattern - if so, skip content-only check here
-                    # (will be handled in JSON fields section with combined check)
-                    if resolved_pattern in self._resolved_json_fields:
-                        # Skip content-only validation for this pattern - will be done together with JSON fields
-                        # Mark as passed for this pattern (will be validated in JSON section)
-                        content_validation_passed = True
-                        continue
-                    else:
-                        # No JSON fields - check all emails by timestamp (original behavior)
-                        emails_with_timestamps = []
-                        for file_path in pattern_files:
-                            try:
-                                with open(file_path, 'r', encoding='utf-8') as f:
-                                    email_data = json.load(f)
-                                # Get timestamp
-                                ts = email_data.get('sent_ts') or email_data.get('created_ts', '')
-                                try:
-                                    from datetime import datetime
-                                    timestamp = datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() if ts else 0.0
-                                except Exception as e:
-                                    debug_debug(f"Could not parse timestamp from email data, using 0.0")
-                                    debug_print_exception(e, context="Parsing email timestamp", include_traceback=True)
-                                    timestamp = 0.0
-                                emails_with_timestamps.append((timestamp, email_data))
-                            except Exception as e:
-                                debug_debug(f"Could not process email file, skipping")
-                                debug_print_exception(e, context="Processing email file in validator", include_traceback=True)
-                                continue
-                        
-                        # Sort by timestamp (most recent first) and check only the latest
-                        if emails_with_timestamps:
-                            emails_with_timestamps.sort(key=lambda x: x[0], reverse=True)
-                            latest_email_data = emails_with_timestamps[0][1]
-                            # Check content on the latest email
-                            if self._check_email_content(latest_email_data, expected_content, min_keywords=min_keywords):
-                                content_validation_passed = True
-                                break
-                else:
-                    # For non-outbox files, check all matching files (original behavior)
-                    for file_path in pattern_files:
-                        if self._check_file_content(file_path, expected_content, min_keywords=min_keywords):
-                            content_validation_passed = True
-                            break
-                    if content_validation_passed:
-                        break
-            
-            if not content_validation_passed:
-                return False
+        # Find all matching files
+        found_files, pattern_to_files = self._find_files_matching_patterns()
+        
+        # Validate file count
+        if not self._validate_file_count(found_files):
+            return False
         
         # Validate JSON fields if specified
         if self._resolved_json_fields:
-            # For JSON field validation, we need at least one file to match all requirements
-            json_validation_passed = False
-            for resolved_pattern, expected_fields in self._resolved_json_fields.items():
-                # Get files that match this pattern (either from our mapping or by matching)
-                pattern_files = pattern_to_files.get(resolved_pattern, [])
-                if not pattern_files:
-                    # Fallback: check all found files
-                    pattern_files = [f for f in found_files if self._matches_pattern(f, resolved_pattern)]
-                
-                # For outbox email validation, filter by recipient FIRST, then check the latest matching email
-                # This prevents matching old emails from previous steps while still allowing correct emails
-                if "outbox" in resolved_pattern.lower() and pattern_files:
-                    # First, filter emails by recipient (JSON fields)
-                    matching_emails = []
-                    for file_path in pattern_files:
-                        try:
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                email_data = json.load(f)
-                            # Check if this email matches the recipient (JSON fields)
-                            if self._check_json_fields_data(email_data, expected_fields):
-                                # Get timestamp
-                                ts = email_data.get('sent_ts') or email_data.get('created_ts', '')
-                                try:
-                                    from datetime import datetime
-                                    timestamp = datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() if ts else 0.0
-                                except Exception as e:
-                                    debug_debug(f"Could not parse timestamp from email data, using 0.0")
-                                    debug_print_exception(e, context="Parsing email timestamp", include_traceback=True)
-                                    timestamp = 0.0
-                                matching_emails.append((timestamp, file_path, email_data))
-                        except Exception as e:
-                            debug_debug(f"Could not process email file, skipping")
-                            debug_print_exception(e, context="Processing email file in validator", include_traceback=True)
-                            continue
-                    
-                    # Sort by timestamp (most recent first) and check only the latest email that matches recipient
-                    if matching_emails:
-                        matching_emails.sort(key=lambda x: x[0], reverse=True)
-                        # Check the latest email that matches the recipient
-                        latest_email_data = matching_emails[0][2]
-                        # Check content if specified for this pattern
-                        if resolved_pattern in self._normalized_content:
-                            expected_content = self._normalized_content[resolved_pattern]
-                            min_keywords = self._min_keywords_per_pattern.get(resolved_pattern, self._min_keywords_global)
-                            if self._check_email_content(latest_email_data, expected_content, min_keywords=min_keywords):
-                                json_validation_passed = True
-                                break
-                        else:
-                            # No content check needed - recipient match is sufficient
-                            json_validation_passed = True
-                            break
-                    # If no matching emails found, validation fails (correct behavior)
-                else:
-                    # For non-outbox files, check all matching files (original behavior)
-                    for file_path in pattern_files:
-                        if self._check_json_fields(file_path, expected_fields):
-                            json_validation_passed = True
-                            break
-                    if json_validation_passed:
-                        break
-            
-            if not json_validation_passed:
-                return False
-        
-        # Validate that all required subjects are present across files
-        if self._require_all_subjects:
-            # Check that each required subject appears in at least one file
-            found_subjects = set()
-            for file_path in found_files:
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        content = f.read().lower()
-                        # Check both subject field and body content
-                        try:
-                            data = json.loads(content)
-                            subject = str(data.get('subject', '')).lower()
-                            body = str(data.get('body', '') + ' ' + data.get('body_plain', '')).lower()
-                            file_content = subject + ' ' + body
-                        except Exception as e:
-                            debug_debug("Could not parse JSON from file content, using raw content")
-                            debug_print_exception(e, context="Parsing JSON from file content", include_traceback=True)
-                            file_content = content
-                        
-                        # Check if any required subject is in this file
-                        for required_subject in self._require_all_subjects:
-                            if required_subject.lower() in file_content:
-                                found_subjects.add(required_subject)
-                except Exception as e:
-                    debug_info(f"Could not check subjects in {file_path}")
-                    debug_print_exception(e, context=f"Checking subjects in {file_path}", include_traceback=True)
-                    continue
-            
-            # Verify all required subjects were found
-            if len(found_subjects) < len(self._require_all_subjects):
-                missing = set(self._require_all_subjects) - found_subjects
-                print(f"Warning: Missing required subjects in forwarded emails: {missing}")
-                return False
+            return self._validate_json_fields(found_files, pattern_to_files)
         
         return True
+    
+    def _validate_json_fields(self, found_files: List[str], pattern_to_files: Dict[str, List[str]]) -> bool:
+        """Validate JSON fields match expectations."""
+        for resolved_pattern, expected_fields in self._resolved_json_fields.items():
+            pattern_files = pattern_to_files.get(resolved_pattern, [])
+            if not pattern_files:
+                pattern_files = [f for f in found_files if self._matches_pattern(f, resolved_pattern)]
+            
+            # Check all matching files - if any file matches the JSON fields, validation passes
+            for file_path in pattern_files:
+                if self._check_json_fields(file_path, expected_fields):
+                    return True
+        
+        return False
     
     def _matches_pattern(self, file_path: str, pattern: str) -> bool:
         """Check if file path matches the pattern."""
@@ -640,58 +488,33 @@ class FileSystemValidator(TestValidator):
             file_path_obj = Path(file_path)
             pattern_obj = Path(pattern)
             
-            # Normalize paths for comparison
-            file_str = str(file_path_obj.resolve()) if file_path_obj.exists() else str(file_path_obj)
-            pattern_str = str(pattern_obj)
-            
             # If pattern contains glob characters, use fnmatch
             if '*' in pattern or '?' in pattern:
-                # Try full path match
-                if fnmatch.fnmatch(file_str, pattern_str):
+                # Try various path matching strategies
+                file_str = str(file_path_obj.resolve()) if file_path_obj.exists() else str(file_path_obj)
+                pattern_str = str(pattern_obj)
+                
+                if fnmatch.fnmatch(file_str, pattern_str) or fnmatch.fnmatch(str(file_path_obj), pattern_str):
                     return True
-                # Try relative path match
-                try:
-                    if fnmatch.fnmatch(str(file_path_obj), pattern_str):
-                        return True
-                except Exception as e:
-                    debug_debug(f"Could not match file path pattern, trying alternative matching")
-                    debug_print_exception(e, context="Matching file path pattern", include_traceback=True)
-                # For patterns like "dir/*.json", check if file is in that directory with matching name
+                
+                # For patterns like "dir/*.json", check directory and filename separately
                 if '/' in pattern_str or '\\' in pattern_str:
                     pattern_dir = pattern_obj.parent
                     pattern_glob = pattern_obj.name
-                    if file_path_obj.parent == pattern_dir or str(file_path_obj.parent) == str(pattern_dir):
-                        if fnmatch.fnmatch(file_path_obj.name, pattern_glob):
-                            return True
+                    if (file_path_obj.parent == pattern_dir or 
+                        str(file_path_obj.parent) == str(pattern_dir)):
+                        return fnmatch.fnmatch(file_path_obj.name, pattern_glob)
                 return False
             else:
-                # No glob - use direct comparison
-                return (str(file_path_obj) == pattern_str or 
-                        str(file_path_obj.resolve()) == str(Path(pattern_str).resolve()) if Path(pattern_str).exists() else False)
+                # No glob - use direct path comparison
+                return (str(file_path_obj) == str(pattern_obj) or 
+                        (file_path_obj.exists() and pattern_obj.exists() and 
+                         file_path_obj.resolve() == pattern_obj.resolve()))
         except Exception as e:
             # Fallback: simple string containment check
             debug_debug(f"Could not match file path pattern, using simple string containment fallback")
             debug_print_exception(e, context="Matching file path pattern", include_traceback=True)
             return pattern in file_path
-    
-    def _check_file_content(self, file_path: str, expected_content: Union[str, List[str]], min_keywords: int = 2) -> bool:
-        """Check if file contains expected content."""
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read().lower()
-            
-            if isinstance(expected_content, str):
-                return expected_content.lower() in content
-            elif isinstance(expected_content, list):
-                # Check if at least min_keywords keywords are present
-                found_keywords = sum(1 for keyword in expected_content if keyword.lower() in content)
-                return found_keywords >= min_keywords
-            
-            return False
-        except Exception as e:
-            debug_info(f"Could not read file {file_path}")
-            debug_print_exception(e, context=f"Reading file {file_path}", include_traceback=True)
-            return False
     
     def _check_json_fields_data(self, data: Dict[str, Any], expected_fields: Dict[str, Any]) -> bool:
         """Check if JSON data contains expected field values (works with data object, not file path)."""
@@ -744,22 +567,6 @@ class FileSystemValidator(TestValidator):
         
         return True
     
-    def _check_email_content(self, email_data: Dict[str, Any], expected_content: Union[str, List[str]], min_keywords: int = 2) -> bool:
-        """Check if email data contains expected content keywords."""
-        # Extract email body content
-        body = str(email_data.get('body', '') + ' ' + email_data.get('body_plain', '')).lower()
-        subject = str(email_data.get('subject', '')).lower()
-        content = (subject + ' ' + body).lower()
-        
-        if isinstance(expected_content, str):
-            return expected_content.lower() in content
-        elif isinstance(expected_content, list):
-            # Check if at least min_keywords keywords are present
-            found_keywords = sum(1 for keyword in expected_content if keyword.lower() in content)
-            return found_keywords >= min_keywords
-        
-        return False
-    
     def _check_json_fields(self, file_path: str, expected_fields: Dict[str, Any]) -> bool:
         """Check if JSON file contains expected field values."""
         try:
@@ -776,355 +583,23 @@ class FileSystemValidator(TestValidator):
             return False
 
 
-class MemoryValidator(TestValidator):
-    """
-    Validates that memory was updated correctly by checking the memory file.
-    
-    Config options:
-    - check_keywords: List of keywords that should be present in memory
-    - check_absence: List of keywords that should NOT be present in memory
-    - memory_file: Path to memory file (default: "data/agent_memory.json")
-    - require_all_keywords: If True, all keywords must be present (default: False)
-    - min_keywords: Minimum number of keywords that must be present
-    """
-    
-    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
-        super().__init__(config, test_config)
-        # Pre-normalize for performance
-        self._check_keywords = config.get("check_keywords", [])
-        self._check_absence = config.get("check_absence", [])
-        self._memory_file = config.get("memory_file", "data/agent/agent_memory.json")
-        self._require_all_keywords = config.get("require_all_keywords", False)
-        self._min_keywords = config.get("min_keywords", None)
-        
-        # Pre-normalize keywords
-        self._keywords_lower = [kw.lower() for kw in self._check_keywords]
-        self._absence_lower = [kw.lower() for kw in self._check_absence]
-        
-        # Resolve memory file path for test environment
-        if test_config and "data" in test_config:
-            test_memory_file = test_config["data"].get("memory_file", self._memory_file)
-            if test_memory_file != self._memory_file:
-                self._memory_file = test_memory_file
-    
-    def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
-        try:
-            # Read memory file
-            with open(self._memory_file, 'r', encoding='utf-8') as f:
-                memory_data = json.load(f)
-            
-            long_term_memory = memory_data.get("long_term", [])
-            
-            # Check for required keywords with early exit
-            if self._check_keywords:
-                found_keywords = set()  # Track unique keywords found
-                
-                for memory_entry in long_term_memory:
-                    memory_lower = memory_entry.lower()
-                    
-                    for keyword in self._keywords_lower:
-                        if keyword in memory_lower:
-                            found_keywords.add(keyword)
-                    
-                    # Early exit if we've found enough
-                    if self._min_keywords is not None and len(found_keywords) >= self._min_keywords:
-                        break
-                    elif self._min_keywords is None and not self._require_all_keywords and len(found_keywords) > 0:
-                        break
-                
-                found_count = len(found_keywords)
-                
-                # Check final counts
-                if self._min_keywords is not None:
-                    if found_count < self._min_keywords:
-                        return False
-                elif self._require_all_keywords:
-                    if found_count < len(self._check_keywords):
-                        return False
-                else:
-                    if found_count == 0:
-                        return False
-            
-            # Check for absence of keywords with early exit
-            if self._check_absence:
-                for memory_entry in long_term_memory:
-                    memory_lower = memory_entry.lower()
-                    for keyword in self._absence_lower:
-                        if keyword in memory_lower:
-                            return False  # Found forbidden keyword
-            
-            return True
-            
-        except Exception as e:
-            debug_info(f"Could not read memory file {self._memory_file}")
-            debug_print_exception(e, context=f"Reading memory file {self._memory_file}", include_traceback=True)
-            return False
-
-
-class Mem0MemoryValidator(TestValidator):
-    """
-    Validates that mem0 memory was updated correctly by checking the mem0 vectorstore.
-    
-    Config options:
-    - check_keywords: List of keywords that should be present in mem0 memories
-    - check_absence: List of keywords that should NOT be present in mem0 memories
-    - vectorstore_path: Path to mem0 vectorstore (default: from config)
-    - require_all_keywords: If True, all keywords must be present (default: False)
-    - min_keywords: Minimum number of keywords that must be present
-    - user_id: User ID to filter memories (default: "vince")
-    - agent_id: Agent ID to filter memories (default: "email_agent")
-    """
-    
-    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
-        super().__init__(config, test_config)
-        # Pre-normalize for performance
-        self._check_keywords = config.get("check_keywords", [])
-        self._check_absence = config.get("check_absence", [])
-        self._require_all_keywords = config.get("require_all_keywords", False)
-        self._min_keywords = config.get("min_keywords", None)
-        self._user_id = config.get("user_id", "vince")
-        self._agent_id = config.get("agent_id", "email_agent")
-        
-        # Pre-normalize keywords
-        self._keywords_lower = [kw.lower() for kw in self._check_keywords]
-        self._absence_lower = [kw.lower() for kw in self._check_absence]
-        
-        # Resolve vectorstore path from test config
-        self._vectorstore_path = None
-        if test_config:
-            mem0_config = test_config.get("memory", {}).get("mem0_memory", {})
-            self._vectorstore_path = mem0_config.get("vectorstore_path")
-    
-    def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
-        try:
-            # Import here to avoid circular dependencies
-            from agent.backend.mem0_memory import get_mem0_memory_manager
-            from agent.utils import load_config
-            
-            # Get config
-            config = load_config()
-            mem0_config = config.get("memory", {}).get("mem0_memory", {})
-            
-            # Use test-specific vectorstore path if provided
-            vectorstore_path = self._vectorstore_path or mem0_config.get("vectorstore_path", "data/agent/mem0_vectorstore")
-            
-            # Initialize mem0 memory manager
-            mem0_manager = get_mem0_memory_manager(
-                llm_provider=mem0_config.get("llm_provider", "openai"),
-                llm_model=mem0_config.get("llm_model", "gpt-5-mini"),
-                llm_temperature=mem0_config.get("llm_temperature", 0.0),
-                embedding_provider=mem0_config.get("embedding_provider", "openai"),
-                embedding_model=mem0_config.get("embedding_model", "text-embedding-3-small"),
-                vector_store_provider=mem0_config.get("vector_store_provider", "faiss"),
-                vectorstore_path=vectorstore_path,
-                top_k=mem0_config.get("top_k", 3),
-                user_id=self._user_id,
-                agent_id=self._agent_id,
-            )
-            
-            # Get all memories from mem0
-            memories = mem0_manager.get_all_memories(user_id=self._user_id, agent_id=self._agent_id, limit=1000)
-            
-            # Extract memory texts
-            memory_texts = []
-            for memory in memories:
-                if isinstance(memory, dict):
-                    memory_text = memory.get("memory", "")
-                    if memory_text:
-                        memory_texts.append(memory_text)
-                else:
-                    memory_texts.append(str(memory))
-            
-            # Check for required keywords with early exit
-            if self._check_keywords:
-                found_keywords = set()  # Track unique keywords found
-                
-                for memory_text in memory_texts:
-                    memory_lower = memory_text.lower()
-                    
-                    for keyword in self._keywords_lower:
-                        if keyword in memory_lower:
-                            found_keywords.add(keyword)
-                    
-                    # Early exit if we've found enough
-                    if self._min_keywords is not None and len(found_keywords) >= self._min_keywords:
-                        break
-                    elif self._min_keywords is None and not self._require_all_keywords and len(found_keywords) > 0:
-                        break
-                
-                found_count = len(found_keywords)
-                
-                # Check final counts
-                if self._min_keywords is not None:
-                    if found_count < self._min_keywords:
-                        return False
-                elif self._require_all_keywords:
-                    if found_count < len(self._check_keywords):
-                        return False
-                else:
-                    if found_count == 0:
-                        return False
-            
-            # Check for absence of keywords with early exit
-            if self._check_absence:
-                for memory_text in memory_texts:
-                    memory_lower = memory_text.lower()
-                    for keyword in self._absence_lower:
-                        if keyword in memory_lower:
-                            return False  # Found forbidden keyword
-            
-            return True
-            
-        except Exception as e:
-            debug_info("Could not read mem0 memory")
-            debug_print_exception(e, context="Reading mem0 memory for validation", include_traceback=True)
-            return False
-
-
-class UnifiedMemoryValidator(TestValidator):
-    """
-    Validates memory state using any memory backend.
-    
-    This validator checks the actual memory contents (not tool calls) by querying
-    the memory backend directly. It works with explicit, mem0, and RAG backends.
-    
-    Config options:
-    - check_keywords: List of keywords that should be present in memory
-    - check_absence: List of keywords that should NOT be present in memory
-    - require_all_keywords: If True, all keywords must be present (default: False)
-    - min_keywords: Minimum number of keywords that must be present
-    - memory_backend: Backend name to use (default: from config)
-    """
-    
-    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
-        super().__init__(config, test_config)
-        
-        # Pre-normalize for performance
-        self._check_keywords = config.get("check_keywords", [])
-        self._check_absence = config.get("check_absence", [])
-        self._require_all_keywords = config.get("require_all_keywords", False)
-        self._min_keywords = config.get("min_keywords", None)
-        
-        # Pre-normalize keywords
-        self._keywords_lower = [kw.lower() for kw in self._check_keywords]
-        self._absence_lower = [kw.lower() for kw in self._check_absence]
-        
-        # Determine memory backend
-        self._memory_backend = None
-        self._test_dir = None
-        
-        if test_config:
-            # Get backend from config
-            memory_config = test_config.get("memory", {})
-            backend_name = memory_config.get("backend")
-            
-            if not backend_name:
-                # Fallback: detect from enabled flags
-                if memory_config.get("explicit_memory", {}).get("enabled", False):
-                    backend_name = "explicit"
-                elif memory_config.get("mem0_memory", {}).get("enabled", False):
-                    backend_name = "mem0"
-                elif memory_config.get("rag_memory", {}).get("enabled", False):
-                    backend_name = "rag"
-            
-            if backend_name:
-                registry = get_memory_backend_registry()
-                self._memory_backend = registry.create(backend_name, test_config)
-            
-            # Get test directory from test config
-            data_config = test_config.get("data", {})
-            if "mailbox_dir" in data_config:
-                # Extract test directory from mailbox_dir (e.g., "test_env_abc123/inbox" -> "test_env_abc123")
-                mailbox_dir = Path(data_config["mailbox_dir"])
-                self._test_dir = mailbox_dir.parent
-    
-    def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
-        """Validate memory state using the memory backend."""
-        # Skip validation if no memory backend is enabled
-        if not self._memory_backend or not self._test_dir:
-            # Check if memory backend is explicitly "none" (no memory enabled)
-            if self.test_config:
-                memory_config = self.test_config.get("memory", {})
-                if memory_config.get("backend") == "none":
-                    # No memory backend - validation not applicable
-                    print("Warning: UnifiedMemoryValidator: No memory backend enabled (backend='none') - skipping validation")
-                    return True  # Return True to avoid false negatives when memory is intentionally disabled
-            print("Warning: UnifiedMemoryValidator: No memory backend or test directory available")
-            return False
-        
-        try:
-            # Get memory state from backend
-            memory_state = self._memory_backend.get_memory_state(
-                self._test_dir,
-                self.test_config or {}
-            )
-            
-            if not memory_state:
-                return False
-            
-            # Combine all memory entries into a single string for searching
-            memory_text = " ".join(memory_state).lower()
-            
-            # Check for required keywords
-            if self._check_keywords:
-                found_keywords = set()
-                
-                for keyword in self._keywords_lower:
-                    if keyword in memory_text:
-                        found_keywords.add(keyword)
-                
-                found_count = len(found_keywords)
-                
-                # Check final counts
-                if self._min_keywords is not None:
-                    if found_count < self._min_keywords:
-                        return False
-                elif self._require_all_keywords:
-                    if found_count < len(self._check_keywords):
-                        return False
-                else:
-                    if found_count == 0:
-                        return False
-            
-            # Check for absence of keywords
-            if self._check_absence:
-                for keyword in self._absence_lower:
-                    if keyword in memory_text:
-                        return False  # Found forbidden keyword
-            
-            return True
-            
-        except Exception as e:
-            debug_info("UnifiedMemoryValidator validation failed")
-            debug_print_exception(e, context="UnifiedMemoryValidator validation", include_traceback=True)
-            return False
-
-
 class SemanticJudgeValidator(TestValidator):
     """
     Validates using an LLM-based semantic judge.
     
     The judge checks if the content contains any information matching a query description.
-    Returns True even if only a slight bit of information matches.
     
     Config options:
     - query: String describing what information should be present in the content
     - check_target: What to check. Supports:
         - "agent_response" (default) - check agent's response text
-        - "tool.{tool_name}.{param}" - check tool call parameter (e.g., "tool.send_email.body")
-        - "outbox.latest.{field}" - check most recent email in outbox (e.g., "outbox.latest.body")
-        - "outbox.latest.forward_to_email.{field}" - check most recent forwarded email (e.g., "outbox.latest.forward_to_email.body")
         - "outbox.email.to.{email_address}.{field}" - check email sent to specific address
-    - tool_name: (deprecated) Required if check_target is a tool parameter (e.g., "send_email")
-    - tool_param: (deprecated) Required if check_target is a tool parameter (e.g., "body")
     """
     
     def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
         super().__init__(config, test_config)
         self._query = config.get("query", "")
         self._check_target = config.get("check_target", "agent_response")
-        self._tool_name = config.get("tool_name", None)
-        self._tool_param = config.get("tool_param", None)
         
         # Load semantic judge config
         try:
@@ -1172,64 +647,33 @@ class SemanticJudgeValidator(TestValidator):
             return agent_response
         
         # Handle outbox email checks
-        if self._check_target.startswith("outbox."):
-            # Format: "outbox.latest.body" or "outbox.latest.forward_to_email.body"
-            # or "outbox.email.to.{email_address}.body"
+        if self._check_target.startswith("outbox.email.to."):
             return self._extract_outbox_content(self._check_target)
         
-        # Handle tool parameter checks
-        if self._check_target.startswith("tool."):
-            # Format: "tool.send_email.body"
-            parts = self._check_target.split(".")
-            if len(parts) >= 3:
-                tool_name = parts[1]
-                param_name = ".".join(parts[2:])  # Handle nested params
-            else:
-                return ""
-        elif self._tool_name and self._tool_param:
-            tool_name = self._tool_name
-            param_name = self._tool_param
-        else:
-            return ""
-        
-        # Extract from traces
-        if not traces:
-            return ""
-        
-        for trace in traces:
-            if trace.get("event_type") == "tool_call":
-                payload = trace.get("payload", {})
-                if payload.get("tool_name") == tool_name:
-                    inputs = payload.get("inputs", {})
-                    # Handle nested parameter paths like "body"
-                    param_value = inputs
-                    for part in param_name.split("."):
-                        if isinstance(param_value, dict):
-                            param_value = param_value.get(part)
-                        else:
-                            return ""
-                    if param_value:
-                        return str(param_value)
-        
         return ""
+    
+    def _get_email_timestamp(self, email_data: Dict[str, Any]) -> float:
+        """Extract timestamp from email data, returning 0.0 if parsing fails."""
+        from datetime import datetime
+        ts = email_data.get('sent_ts') or email_data.get('created_ts', '')
+        if not ts:
+            return 0.0
+        try:
+            return datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
+        except Exception:
+            return 0.0
     
     def _extract_outbox_content(self, check_target: str) -> str:
         """
         Extract content from outbox emails.
         
-        Supported formats:
-        - "outbox.latest.body" - body of most recent email in outbox
-        - "outbox.latest.body_plain" - body_plain of most recent email
-        - "outbox.latest.forward_to_email.body" - body of most recent forwarded email
-        - "outbox.email.to.{email_address}.body" - body of email sent to specific address
+        Supported format:
+        - "outbox.email.to.{email_address}.{field}" - field value from email sent to specific address
         """
         if not self.test_config:
             return ""
         
         try:
-            # json, Path already imported at module level
-            from datetime import datetime
-            
             # Get outbox directory from test config
             outbox_dir = Path(self.test_config.get("data", {}).get("outbox_dir", "data/agent/outbox"))
             
@@ -1237,133 +681,37 @@ class SemanticJudgeValidator(TestValidator):
                 return ""
             
             parts = check_target.split(".")
-            if len(parts) < 3:
+            # Format: outbox.email.to.{email_with_dots}.{field}
+            if len(parts) < 5 or parts[1] != "email" or parts[2] != "to":
                 return ""
             
-            # Find target field (body, body_plain, subject, etc.)
-            target_field = parts[-1]  # Last part is the field name
+            # Join parts 3 to -1 to reconstruct email address (handles dots in email)
+            target_email = ".".join(parts[3:-1])
+            target_field = parts[-1]
             
-            # Handle "outbox.latest.{field}" pattern
-            if parts[1] == "latest":
-                # Get all email files
-                email_files = list(outbox_dir.glob("*.json"))
-                if not email_files:
-                    return ""
-                
-                # Filter by tool type if specified (e.g., "outbox.latest.forward_to_email.body")
-                if len(parts) >= 4 and parts[2] == "forward_to_email":
-                    # Find emails that are forwards (subject starts with "Fwd:" or has forwarded_from field)
-                    forwarded_emails = []
-                    for email_file in email_files:
-                        try:
-                            with open(email_file, 'r', encoding='utf-8') as f:
-                                email = json.load(f)
-                            # Check if it's a forwarded email
-                            subject = email.get('subject', '')
-                            if subject.lower().startswith('fwd:') or 'forwarded_from' in email:
-                                forwarded_emails.append((email_file, email))
-                        except Exception as e:
-                            debug_debug(f"Could not process email file, skipping")
-                            debug_print_exception(e, context="Processing email file in validator", include_traceback=True)
-                            continue
-                    
-                    if not forwarded_emails:
-                        return ""
-                    
-                    # Sort by timestamp (most recent first)
-                    def get_timestamp(email_data):
-                        ts = email_data.get('sent_ts') or email_data.get('created_ts', '')
-                        try:
-                            return datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
-                        except Exception as e:
-                            debug_debug("Could not parse timestamp, returning 0.0")
-                            debug_print_exception(e, context="Parsing timestamp in validator", include_traceback=True)
-                            return 0.0
-                    
-                    forwarded_emails.sort(key=lambda x: get_timestamp(x[1]), reverse=True)
-                    latest_email = forwarded_emails[0][1]
-                    
-                    # Extract target field
-                    content = latest_email.get(target_field, latest_email.get('body', latest_email.get('body_plain', '')))
-                    return str(content) if content else ""
-                else:
-                    # Get latest email by timestamp
-                    emails = []
-                    for email_file in email_files:
-                        try:
-                            with open(email_file, 'r', encoding='utf-8') as f:
-                                email = json.load(f)
-                            emails.append((email_file, email))
-                        except Exception as e:
-                            debug_debug(f"Could not process email file, skipping")
-                            debug_print_exception(e, context="Processing email file in validator", include_traceback=True)
-                            continue
-                    
-                    if not emails:
-                        return ""
-                    
-                    # Sort by timestamp
-                    def get_timestamp(email_data):
-                        ts = email_data.get('sent_ts') or email_data.get('created_ts', '')
-                        try:
-                            return datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
-                        except Exception as e:
-                            debug_debug("Could not parse timestamp, returning 0.0")
-                            debug_print_exception(e, context="Parsing timestamp in validator", include_traceback=True)
-                            return 0.0
-                    
-                    emails.sort(key=lambda x: get_timestamp(x[1]), reverse=True)
-                    latest_email = emails[0][1]
-                    
-                    # Extract target field
-                    content = latest_email.get(target_field, latest_email.get('body', latest_email.get('body_plain', '')))
-                    return str(content) if content else ""
+            # Get all emails and find one sent to target_email
+            email_files = list(outbox_dir.glob("*.json"))
+            matching_emails = []
             
-            # Handle "outbox.email.to.{email_address}.{field}" pattern
-            # Note: Email addresses contain dots, so we need special parsing
-            # Format: outbox.email.to.{email_with_dots}.{field}
-            elif parts[1] == "email" and len(parts) >= 4 and parts[2] == "to":
-                # The email address is everything from parts[3] up to (but not including) the last part
-                # The last part is the target field
-                if len(parts) < 5:
-                    return ""  # Need at least: outbox.email.to.{email}.{field}
-                
-                # Join parts 3 to -1 to reconstruct email address (handles dots in email)
-                target_email = ".".join(parts[3:-1])
-                target_field = parts[-1]
-                
-                # Get all emails and find one sent to target_email
-                email_files = list(outbox_dir.glob("*.json"))
-                matching_emails = []
-                
-                for email_file in email_files:
-                    try:
-                        with open(email_file, 'r', encoding='utf-8') as f:
-                            email = json.load(f)
-                        if email.get('to', '').lower() == target_email.lower():
-                            matching_emails.append((email_file, email))
-                    except:
-                        continue
-                
-                if not matching_emails:
-                    return ""
-                
-                # Get most recent matching email
-                def get_timestamp(email_data):
-                    ts = email_data.get('sent_ts') or email_data.get('created_ts', '')
-                    try:
-                        return datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
-                    except:
-                        return 0.0
-                
-                matching_emails.sort(key=lambda x: get_timestamp(x[1]), reverse=True)
-                latest_email = matching_emails[0][1]
-                
-                # Extract target field
-                content = latest_email.get(target_field, latest_email.get('body', latest_email.get('body_plain', '')))
-                return str(content) if content else ""
+            for email_file in email_files:
+                try:
+                    with open(email_file, 'r', encoding='utf-8') as f:
+                        email = json.load(f)
+                    if email.get('to', '').lower() == target_email.lower():
+                        matching_emails.append(email)
+                except Exception:
+                    continue
             
-            return ""
+            if not matching_emails:
+                return ""
+            
+            # Get most recent matching email
+            matching_emails.sort(key=self._get_email_timestamp, reverse=True)
+            latest_email = matching_emails[0]
+            
+            # Extract target field
+            content = latest_email.get(target_field, latest_email.get('body', latest_email.get('body_plain', '')))
+            return str(content) if content else ""
             
         except Exception as e:
             debug_info("Error extracting outbox content")
@@ -1375,182 +723,78 @@ class SemanticJudgeValidator(TestValidator):
         result_text = ""
         try:
             from agent.utils import call_llm_chat_completion, detect_provider
+            import re
             
             provider = detect_provider(self._judge_model)
             
-            # Check if this is a persona memory evaluation (has "correct answer" and "incorrect answers" in query)
-            is_persona_eval = "correct answer" in query.lower() and ("incorrect" in query.lower() or "distractor" in query.lower())
-            
-            # DEBUG: Print detailed information
-            print("\n" + "="*80)
-            print("SEMANTIC JUDGE DEBUG - DETAILED LOG")
-            print("="*80)
-            print(f"Judge Model: {self._judge_model}")
-            print(f"Is PersonaMem Evaluation: {is_persona_eval}")
-            print(f"\nContent to Evaluate (Agent's Response):")
-            print("-"*80)
-            print(content[:500] + ("..." if len(content) > 500 else ""))
-            print(f"\nQuery (Information That Should Be Present):")
-            print("-"*80)
-            print(query[:500] + ("..." if len(query) > 500 else ""))
-            
-            if is_persona_eval:
-                # PersonaMem-style multiple choice evaluation
-                # Extract correct answer and incorrect answers from query
-                import re
-                correct_match = re.search(r'Correct answer:\s*(.+?)(?:\n\n|$)', query, re.DOTALL | re.IGNORECASE)
-                incorrect_matches = re.findall(r'-\s*(.+?)(?=\n-|\n\n|$)', query.split("Incorrect/distractor answers")[-1] if "Incorrect/distractor answers" in query else "", re.DOTALL)
-                
-                if correct_match and len(incorrect_matches) >= 1:
-                    correct_answer = correct_match.group(1).strip()
-                    # Take first 3 incorrect answers if available
-                    incorrect_answers = [inc.strip() for inc in incorrect_matches[:3]]
-                    
-                    # Format as multiple choice options (a, b, c, d) matching PersonaMem format
-                    # Option (a) is always the correct answer
-                    # Options (b), (c), (d) are incorrect answers
-                    all_options = f"(a) {correct_answer}\n"
-                    # Use chr(98)='b', chr(99)='c', chr(100)='d'
-                    for idx, inc_ans in enumerate(incorrect_answers):
-                        option_letter = chr(98 + idx)  # b=98, c=99, d=100
-                        all_options += f"({option_letter}) {inc_ans}\n"
-                    
-                    # DEBUG: Print extracted answers
-                    print(f"\nEXTRACTED ANSWERS:")
-                    print(f"   Correct Answer (a): {correct_answer[:100]}...")
-                    print(f"   Incorrect Answers: {len(incorrect_answers)} found")
-                    for idx, inc in enumerate(incorrect_answers):
-                        print(f"     ({chr(98 + idx)}) {inc[:100]}...")
-                    
-                    # Use PersonaMem's EXACT prompt format from inference.py line 57
-                    instructions = "Find the most appropriate model response and give your final answer (a), (b), (c), or (d) after the special token <final_answer>."
-                    
-                    # Format exactly like PersonaMem: question + instructions + all_options
-                    # PersonaMem format: question + '\n\n' + instructions + '\n\n' + all_options
-                    question = f"Which of the following responses best matches the agent's actual response?\n\nAgent's actual response:\n{content}"
-                    
-                    messages = [
-                        {
-                            "role": "user",
-                            "content": question + '\n\n' + instructions + '\n\n' + all_options
-                        }
-                    ]
-                    
-                    # DEBUG: Print the full prompt
-                    print(f"\n📤 FULL PROMPT SENT TO JUDGE:")
-                    print("="*80)
-                    for i, msg in enumerate(messages, 1):
-                        print(f"\nMessage {i} ({msg['role']}):")
-                        print("-"*80)
-                        print(msg['content'])
-                    print("="*80)
-                else:
-                    # Fallback to original format if parsing fails
-                    messages = [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a semantic judge for persona memory evaluation. "
-                                "Your task is to evaluate if an agent's response matches the correct answer semantically "
-                                "and demonstrates understanding of the persona's characteristics and preferences. "
-                                "The response should be semantically equivalent to the correct answer and clearly better than incorrect answers. "
-                                "Consider the overall meaning, key concepts, and persona-specific details, not just exact word matches. "
-                                "Be generous with semantic equivalence: if the response conveys the same meaning and demonstrates persona understanding, return true. "
-                                "Always respond with valid JSON."
-                            )
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                f"{query}\n\n"
-                                f"Agent's Response:\n{content}\n\n"
-                                "Task: Evaluate if the agent's response:\n"
-                                "1. Matches or is semantically equivalent to the correct answer\n"
-                                "2. Is clearly better than the incorrect answers\n"
-                                "3. Demonstrates personalized understanding based on the persona's history\n\n"
-                                "Output strict JSON with this exact shape:\n"
-                                "{\n"
-                                "  \"contains_information\": true/false,\n"
-                                "  \"explanation\": \"brief justification of your decision\"\n"
-                                "}"
-                            )
-                        }
-                    ]
-            else:
-                # Standard fact/figure matching evaluation
-                # Local helper to extract/normalize numeric facts and figures
-                def extract_facts(text: str) -> Dict[str, Any]:
-                    import re  # Import re inside function to avoid closure issues
-                    try:
-                        # Numbers (integers and decimals), with optional commas
-                        numbers = re.findall(r"(?<![\w\d])(?:\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d+)(?![\w\d])", text)
-                        # Percentages
-                        percents = re.findall(r"\b\d{1,3}(?:\.\d+)?\s*%\b", text)
-                        # Currency amounts ($, USD)
-                        currency = re.findall(r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?|\bUSD\s*\d+(?:\.\d+)?\b", text, flags=re.IGNORECASE)
-                        # KPI-like tokens (EPS, revenue, net income, budget, discount)
-                        kpis = re.findall(r"\b(EPS|Revenue|Net\s+Income|Budget|Discount|Price|Pricing|Spend|Valuation)\b", text, flags=re.IGNORECASE)
-                        # Normalize whitespace and case for matching
-                        return {
-                            "numbers": numbers,
-                            "percentages": percents,
-                            "currency": currency,
-                            "kpis": list({k.lower() for k in kpis}),
-                        }
-                    except Exception as e:
-                        debug_debug("Could not extract facts, returning empty fact dict")
-                        debug_print_exception(e, context="Extracting facts from content", include_traceback=True)
-                        return {"numbers": [], "percentages": [], "currency": [], "kpis": []}
-                
-                query_facts = extract_facts(query)
-                content_facts = extract_facts(content)
-                
-                # Standard fact/figure matching
-                # Note: The query should already contain only the NEW information that needs to be checked
-                # (extracted at test case creation time), so we don't need to exclude information from the question here
-                messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a rigorous semantic judge for fact/figure overlap. "
-                            "Given a query describing specific information that should be present, and a candidate content, "
-                            "decide if the content contains the information described in the query, including semantically equivalent statements. "
-                            "Facts include qualitative statements such as roles, titles, relationships, events, dates, entity names, and declarative claims. "
-                            "Be tolerant to formatting variants (e.g., 1.24B vs $1,240,000,000; 4.5% vs four point five percent; $1.91 EPS vs EPS 1.91). "
-                            "Consider unit/currency normalization, commas, abbreviations (M, B), paraphrases, and synonymous phrasing. "
-                            "Prefer high recall: if in doubt and a specific fact or figure plausibly matches, return true. "
-                            "Always respond with valid JSON."
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Query (information that should be present):\n{query}\n\n"
-                            f"Content to check (agent's response):\n{content}\n\n"
-                            f"Extracted query facts (numbers/percentages/currency/KPIs):\n{json.dumps(query_facts, ensure_ascii=False)}\n\n"
-                            f"Extracted content facts (numbers/percentages/currency/KPIs):\n{json.dumps(content_facts, ensure_ascii=False)}\n\n"
-                            "Task: Determine if the content contains the information described in the query, including semantically equivalent (paraphrased) facts and numerically equivalent statements. "
-                            "Consider: qualitative facts (roles, titles, relationships, events, dates, named entities), number formatting, thousands separators, currency symbols, spelled-out numbers, abbreviations (M, B), ratios, EPS, and paraphrases. "
-                            "Be generous when a specific fact or figure clearly corresponds (e.g., '1.24 Billion' ~= '$1,240,000,000'; 'EPS beat consensus' ~= 'EPS above Street').\n\n"
-                            "Output strict JSON with this exact shape:\n"
-                            "{\n"
-                            "  \"contains_information\": true/false,\n"
-                            "  \"matched_items\": [\"list a few matched facts (normalized)\"],\n"
-                            "  \"explanation\": \"very brief justification\"\n"
-                            "}"
-                        )
+            # Extract facts for better matching
+            def extract_facts(text: str) -> Dict[str, Any]:
+                try:
+                    # Numbers (integers and decimals), with optional commas
+                    numbers = re.findall(r"(?<![\w\d])(?:\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d+)(?![\w\d])", text)
+                    # Percentages
+                    percents = re.findall(r"\b\d{1,3}(?:\.\d+)?\s*%\b", text)
+                    # Currency amounts ($, USD)
+                    currency = re.findall(r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?|\bUSD\s*\d+(?:\.\d+)?\b", text, flags=re.IGNORECASE)
+                    # KPI-like tokens (EPS, revenue, net income, budget, discount)
+                    kpis = re.findall(r"\b(EPS|Revenue|Net\s+Income|Budget|Discount|Price|Pricing|Spend|Valuation)\b", text, flags=re.IGNORECASE)
+                    # Normalize whitespace and case for matching
+                    return {
+                        "numbers": numbers,
+                        "percentages": percents,
+                        "currency": currency,
+                        "kpis": list({k.lower() for k in kpis}),
                     }
-                ]
-
+                except Exception as e:
+                    debug_debug("Could not extract facts, returning empty fact dict")
+                    debug_print_exception(e, context="Extracting facts from content", include_traceback=True)
+                    return {"numbers": [], "percentages": [], "currency": [], "kpis": []}
+            
+            query_facts = extract_facts(query)
+            content_facts = extract_facts(content)
+            
+            # Standard fact/figure matching evaluation
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a rigorous semantic judge for fact/figure overlap. "
+                        "Given a query describing specific information that should be present, and a candidate content, "
+                        "decide if the content contains the information described in the query, including semantically equivalent statements. "
+                        "Facts include qualitative statements such as roles, titles, relationships, events, dates, entity names, and declarative claims. "
+                        "Be tolerant to formatting variants (e.g., 1.24B vs $1,240,000,000; 4.5% vs four point five percent; $1.91 EPS vs EPS 1.91). "
+                        "Consider unit/currency normalization, commas, abbreviations (M, B), paraphrases, and synonymous phrasing. "
+                        "Prefer high recall: if in doubt and a specific fact or figure plausibly matches, return true. "
+                        "Always respond with valid JSON."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Query (information that should be present):\n{query}\n\n"
+                        f"Content to check (agent's response):\n{content}\n\n"
+                        f"Extracted query facts (numbers/percentages/currency/KPIs):\n{json.dumps(query_facts, ensure_ascii=False)}\n\n"
+                        f"Extracted content facts (numbers/percentages/currency/KPIs):\n{json.dumps(content_facts, ensure_ascii=False)}\n\n"
+                        "Task: Determine if the content contains the information described in the query, including semantically equivalent (paraphrased) facts and numerically equivalent statements. "
+                        "Consider: qualitative facts (roles, titles, relationships, events, dates, named entities), number formatting, thousands separators, currency symbols, spelled-out numbers, abbreviations (M, B), ratios, EPS, and paraphrases. "
+                        "Be generous when a specific fact or figure clearly corresponds (e.g., '1.24 Billion' ~= '$1,240,000,000'; 'EPS beat consensus' ~= 'EPS above Street').\n\n"
+                        "Output strict JSON with this exact shape:\n"
+                        "{\n"
+                        "  \"contains_information\": true/false,\n"
+                        "  \"matched_items\": [\"list a few matched facts (normalized)\"],\n"
+                        "  \"explanation\": \"very brief justification\"\n"
+                        "}"
+                    )
+                }
+            ]
+            
             # Some models (e.g., gpt-5 family) don't support temperature — skip it proactively
             model_lower = str(self._judge_model).lower()
             is_gpt5_family = model_lower.startswith("gpt-5") or "gpt-5" in model_lower
             
             # Prepare parameters
             temperature = None if is_gpt5_family else self._judge_temperature
-            # PersonaMem doesn't use JSON format - it expects free text with (a), (b), (c), (d) answer
-            # Only use JSON format for standard fact/figure matching
-            response_format = None if is_persona_eval else ({"type": "json_object"} if provider == "openai" else None)
+            response_format = {"type": "json_object"} if provider == "openai" else None
             
             # Call unified LLM function
             try:
@@ -1587,99 +831,23 @@ class SemanticJudgeValidator(TestValidator):
             
             result_text = result_text.strip()
             
-            # DEBUG: Print the raw response
-            print(f"\n📥 RAW RESPONSE FROM JUDGE:")
-            print("="*80)
-            print(result_text)
-            print("="*80)
-            
-            # For PersonaMem-style evaluation, extract the answer choice
-            if is_persona_eval:
-                # Extract answer from PersonaMem format: look for (a), (b), (c), or (d)
-                # PersonaMem format: answer after <final_answer> token or in the response
-                answer_match = None
-                if "<final_answer>" in result_text:
-                    # Extract text after <final_answer>
-                    after_token = result_text.split("<final_answer>")[-1].strip()
-                    answer_match = re.search(r'\(([a-d])\)', after_token, re.IGNORECASE)
-                else:
-                    # Try to find (a), (b), (c), or (d) in the response
-                    answer_match = re.search(r'\(([a-d])\)', result_text, re.IGNORECASE)
-                    if not answer_match:
-                        # Try without parentheses
-                        answer_match = re.search(r'\b([a-d])\b', result_text, re.IGNORECASE)
-                
-                if answer_match:
-                    predicted_answer = answer_match.group(1).lower()
-                    # Correct answer is always (a) in our format
-                    correct_answer = "a"
-                    result = predicted_answer == correct_answer
-                    print(f"\nPARSED RESULT:")
-                    print(f"   Extracted Answer: ({predicted_answer})")
-                    print(f"   Correct Answer: ({correct_answer})")
-                    print(f"   Match: {result}")
-                    print("="*80 + "\n")
-                    return result
-                else:
-                    # Also try to extract from <final_answer>e</final_answer> format
-                    if "<final_answer>" in result_text:
-                        after_token = result_text.split("<final_answer>")[-1].strip()
-                        # Try to find single letter a, b, c, d
-                        single_letter_match = re.search(r'([a-d])', after_token, re.IGNORECASE)
-                        if single_letter_match:
-                            predicted_answer = single_letter_match.group(1).lower()
-                            correct_answer = "a"
-                            result = predicted_answer == correct_answer
-                            print(f"\nPARSED RESULT (from <final_answer> token):")
-                            print(f"   Extracted Answer: ({predicted_answer})")
-                            print(f"   Correct Answer: ({correct_answer})")
-                            print(f"   Match: {result}")
-                            print("="*80 + "\n")
-                            return result
-                    
-                    # If we get here, couldn't extract answer
-                    print(f"\nWARNING: Could not extract answer choice from response")
-                    print(f"   Attempted to find (a), (b), (c), or (d) but no match found")
-                    # Fallback: try JSON parsing
-                    try:
-                        result_json = json.loads(result_text)
-                        # Check if it has contains_information field (fallback format)
-                        if "contains_information" in result_json:
-                            result = bool(result_json.get("contains_information", False))
-                            print(f"   Fallback: Parsed JSON, contains_information = {result}")
-                            print("="*80 + "\n")
-                            return result
-                    except Exception as e:
-                        debug_debug("Could not extract JSON from semantic judge response, trying fallback")
-                        debug_print_exception(e, context="Extracting JSON from semantic judge response", include_traceback=True)
-                    # Last resort: check if response mentions option (a) or seems positive
-                    result = "(a)" in result_text or "option a" in result_text.lower() or "answer a" in result_text.lower()
-                    print(f"   Last resort: Checking for '(a)' mention = {result}")
-                    print("="*80 + "\n")
-                    return result
-            else:
-                # Standard JSON format
+            # Parse JSON response
+            try:
                 result_json = json.loads(result_text)
-                contains_info = result_json.get("contains_information", False)
-                print(f"\nPARSED RESULT (Standard Format):")
-                print(f"   JSON Response: {json.dumps(result_json, indent=2)}")
-                print(f"   contains_information: {contains_info}")
-                print("="*80 + "\n")
-                return bool(contains_info)
-            
-        except json.JSONDecodeError:
-            # Fallback: try to extract JSON from response
-            if result_text:
-                try:
-                    json_match = re.search(r'\{"contains_information":\s*(true|false)', result_text, re.IGNORECASE)
-                    if json_match:
-                        return json_match.group(1).lower() == "true"
-                    # Last resort: check for "true" in response
-                    result_lower = result_text.lower()
-                    return "true" in result_lower and "false" not in result_lower[:20]
-                except Exception:
-                    pass
-            return False
+                return bool(result_json.get("contains_information", False))
+            except json.JSONDecodeError:
+                # Fallback: try to extract JSON from response
+                if result_text:
+                    try:
+                        json_match = re.search(r'\{"contains_information":\s*(true|false)', result_text, re.IGNORECASE)
+                        if json_match:
+                            return json_match.group(1).lower() == "true"
+                        # Last resort: check for "true" in response
+                        result_lower = result_text.lower()
+                        return "true" in result_lower and "false" not in result_lower[:20]
+                    except Exception:
+                        pass
+                return False
         
         except Exception as e:
             debug_info("Semantic judge API error")
@@ -1772,16 +940,12 @@ class CrossStepSemanticJudgeValidator(TestValidator):
             if "_cross_step_data" not in test_config:
                 test_config["_cross_step_data"] = {}
         
-        # Load semantic judge config (same as SemanticJudgeValidator)
-        try:
-            from utils import load_config
-            global_config = load_config()
-            judge_config = global_config.get("benchmark", {}).get("semantic_judge", {})
-            self._judge_model = judge_config.get("model_name", "gpt-4o")
-            self._judge_temperature = judge_config.get("temperature", 0.0)
-        except Exception:
-            self._judge_model = "gpt-4o"
-            self._judge_temperature = 0.0
+        # Create a SemanticJudgeValidator instance to reuse its methods
+        # We only need the extraction and judge calling methods, not the full validation
+        self._semantic_judge_validator = SemanticJudgeValidator(
+            {"query": "", "check_target": self._check_target},
+            test_config
+        )
     
     def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
         """Validate by comparing with information from reference step."""
@@ -1859,7 +1023,9 @@ class CrossStepSemanticJudgeValidator(TestValidator):
         try:
             from agent.utils import call_llm_chat_completion, detect_provider
             
-            provider = detect_provider(self._judge_model)
+            judge_model = self._semantic_judge_validator._judge_model
+            judge_temperature = self._semantic_judge_validator._judge_temperature
+            provider = detect_provider(judge_model)
             
             messages = [
                 {
@@ -1888,9 +1054,9 @@ class CrossStepSemanticJudgeValidator(TestValidator):
             
             # Call LLM
             response = call_llm_chat_completion(
-                model=self._judge_model,
+                model=judge_model,
                 messages=messages,
-                temperature=self._judge_temperature,
+                temperature=judge_temperature,
                 max_tokens=500,
                 max_output_tokens=500
             )
@@ -1924,108 +1090,18 @@ class CrossStepSemanticJudgeValidator(TestValidator):
     
     def _extract_content(self, agent_response: str, traces: List[Dict] = None) -> str:
         """Extract the content to validate based on check_target configuration."""
-        if self._check_target == "agent_response":
-            return agent_response
-        
-        # Handle outbox email checks (reuse from SemanticJudgeValidator)
-        if self._check_target.startswith("outbox."):
-            return self._extract_outbox_content(self._check_target)
-        
-        # Handle tool parameter checks
-        if self._check_target.startswith("tool."):
-            parts = self._check_target.split(".")
-            if len(parts) >= 3:
-                tool_name = parts[1]
-                param_name = ".".join(parts[2:])
-            else:
-                return ""
-        else:
-            return ""
-        
-        # Extract from traces
-        if not traces:
-            return ""
-        
-        for trace in traces:
-            if trace.get("event_type") == "tool_call":
-                payload = trace.get("payload", {})
-                if payload.get("tool_name") == tool_name:
-                    inputs = payload.get("inputs", {})
-                    param_value = inputs
-                    for part in param_name.split("."):
-                        if isinstance(param_value, dict):
-                            param_value = param_value.get(part)
-                        else:
-                            return ""
-                    if param_value:
-                        return str(param_value)
-        
-        return ""
-    
-    def _extract_outbox_content(self, check_target: str) -> str:
-        """Extract content from outbox emails (reuse from SemanticJudgeValidator)."""
-        if not self.test_config:
-            return ""
-        
-        try:
-            from datetime import datetime
-            
-            outbox_dir = Path(self.test_config.get("data", {}).get("outbox_dir", "data/agent/outbox"))
-            
-            if not outbox_dir.exists():
-                return ""
-            
-            parts = check_target.split(".")
-            if len(parts) < 3:
-                return ""
-            
-            target_field = parts[-1]
-            
-            if parts[1] == "latest":
-                email_files = list(outbox_dir.glob("*.json"))
-                if not email_files:
-                    return ""
-                
-                emails = []
-                for email_file in email_files:
-                    try:
-                        with open(email_file, 'r', encoding='utf-8') as f:
-                            email = json.load(f)
-                        emails.append((email_file, email))
-                    except:
-                        continue
-                
-                if not emails:
-                    return ""
-                
-                def get_timestamp(email_data):
-                    ts = email_data.get('sent_ts') or email_data.get('created_ts', '')
-                    try:
-                        return datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
-                    except:
-                        return 0.0
-                
-                emails.sort(key=lambda x: get_timestamp(x[1]), reverse=True)
-                latest_email = emails[0][1]
-                
-                content = latest_email.get(target_field, latest_email.get('body', latest_email.get('body_plain', '')))
-                return str(content) if content else ""
-            
-            return ""
-        except Exception as e:
-            debug_info("Error extracting outbox content")
-            debug_print_exception(e, context="Extracting outbox content", include_traceback=True)
-            return ""
+        # Reuse SemanticJudgeValidator's extraction method
+        return self._semantic_judge_validator._extract_content(agent_response, traces)
     
     def _call_semantic_judge(self, content: str, query: str) -> bool:
-        """Call semantic judge (reuse from SemanticJudgeValidator)."""
+        """Call semantic judge for cross-step validation with simplified query format."""
+        # For cross-step validation, we use a simpler format than the full semantic judge
+        # Build query in the format expected by SemanticJudgeValidator's standard fact/figure matching
         try:
             from agent.utils import call_llm_chat_completion, detect_provider
             import re
             
-            provider = detect_provider(self._judge_model)
-            
-            # Use standard fact/figure matching evaluation
+            provider = detect_provider(self._semantic_judge_validator._judge_model)
             
             def extract_facts(text: str) -> Dict[str, Any]:
                 try:
@@ -2080,13 +1156,15 @@ class CrossStepSemanticJudgeValidator(TestValidator):
                 }
             ]
             
-            model_lower = str(self._judge_model).lower()
+            judge_model = self._semantic_judge_validator._judge_model
+            judge_temperature = self._semantic_judge_validator._judge_temperature
+            model_lower = str(judge_model).lower()
             is_gpt5_family = model_lower.startswith("gpt-5") or "gpt-5" in model_lower
-            temperature = None if is_gpt5_family else self._judge_temperature
+            temperature = None if is_gpt5_family else judge_temperature
             response_format = {"type": "json_object"} if provider == "openai" else None
             
             response = call_llm_chat_completion(
-                model=self._judge_model,
+                model=judge_model,
                 messages=messages,
                 temperature=temperature,
                 response_format=response_format,
@@ -2277,10 +1355,15 @@ class CompositeValidator(TestValidator):
             return ToolCallValidator(config, test_config)
         elif validator_type == "file_system":
             return FileSystemValidator(config, test_config)
-        elif validator_type == "memory":
-            return MemoryValidator(config, test_config)
-        elif validator_type == "mem0_memory":
-            return Mem0MemoryValidator(config, test_config)
+        elif validator_type in ("memory", "mem0_memory", "unified_memory"):
+            # Import memory validators from separate module
+            from benchmark.memory_validators import MemoryValidator, Mem0MemoryValidator, UnifiedMemoryValidator
+            if validator_type == "memory":
+                return MemoryValidator(config, test_config)
+            elif validator_type == "mem0_memory":
+                return Mem0MemoryValidator(config, test_config)
+            elif validator_type == "unified_memory":
+                return UnifiedMemoryValidator(config, test_config)
         elif validator_type == "semantic_judge":
             return SemanticJudgeValidator(config, test_config)
         elif validator_type == "cross_step_semantic_judge":
@@ -2293,8 +1376,6 @@ class CompositeValidator(TestValidator):
 def create_validator(validator_config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None) -> TestValidator:
     """
     Create a validator instance from configuration.
-    
-    Supports both old validators (for backward compatibility) and new unified validators.
     
     Args:
         validator_config: Dictionary containing validator configuration
@@ -2311,91 +1392,14 @@ def create_validator(validator_config: Dict[str, Any], test_config: Optional[Dic
         return ToolCallValidator(validator_config)
     elif validator_type == "file_system":
         return FileSystemValidator(validator_config, test_config)
-    elif validator_type == "memory":
-        # Old validator - keep for backward compatibility
-        return MemoryValidator(validator_config, test_config)
-    elif validator_type == "mem0_memory":
-        # Old validator - keep for backward compatibility
-        return Mem0MemoryValidator(validator_config, test_config)
-    elif validator_type == "unified_memory":
-        # New unified validator that works with any backend
-        return UnifiedMemoryValidator(validator_config, test_config)
     elif validator_type == "semantic_judge":
         return SemanticJudgeValidator(validator_config, test_config)
     elif validator_type == "cross_step_semantic_judge":
         return CrossStepSemanticJudgeValidator(validator_config, test_config)
     elif validator_type == "composite":
         return CompositeValidator(validator_config, test_config)
-    else:
-        # Default to keyword validator for backward compatibility
-        return KeywordValidator(validator_config)
 
 
-# Convenience functions for common validation patterns
-
-def validate_keywords(keywords: List[str], require_all: bool = False, min_required: int = None) -> Dict[str, Any]:
-    """Create a keyword validator config."""
-    return {
-        "type": "keyword",
-        "keywords": keywords,
-        "require_all": require_all,
-        "min_required": min_required
-    }
 
 
-def validate_tool_calls(required_tools: List[str], tool_params: Dict[str, Dict] = None, require_all: bool = True) -> Dict[str, Any]:
-    """Create a tool call validator config."""
-    return {
-        "type": "tool_call",
-        "required_tools": required_tools,
-        "tool_params": tool_params or {},
-        "require_all_tools": require_all
-    }
 
-
-def validate_files(check_files: List[str], file_content: Dict[str, Union[str, List[str]]] = None, require_all: bool = True) -> Dict[str, Any]:
-    """Create a file system validator config."""
-    return {
-        "type": "file_system",
-        "check_files": check_files,
-        "file_content": file_content or {},
-        "require_all_files": require_all
-    }
-
-
-def validate_memory(check_keywords: List[str] = None, check_absence: List[str] = None, require_all_keywords: bool = False, min_keywords: int = None) -> Dict[str, Any]:
-    """Create a memory validator config."""
-    return {
-        "type": "memory",
-        "check_keywords": check_keywords or [],
-        "check_absence": check_absence or [],
-        "require_all_keywords": require_all_keywords,
-        "min_keywords": min_keywords
-    }
-
-
-def validate_composite(validators: List[Dict[str, Any]], operator: str = "AND") -> Dict[str, Any]:
-    """Create a composite validator config."""
-    return {
-        "type": "composite",
-        "validators": validators,
-        "operator": operator
-    }
-
-
-def validate_semantic_judge(query: str, check_target: str = "agent_response", 
-                            tool_name: Optional[str] = None, tool_param: Optional[str] = None) -> Dict[str, Any]:
-    """Create a semantic judge validator config."""
-    config = {
-        "type": "semantic_judge",
-        "query": query
-    }
-    
-    if check_target != "agent_response":
-        config["check_target"] = check_target
-        if tool_name:
-            config["tool_name"] = tool_name
-        if tool_param:
-            config["tool_param"] = tool_param
-    
-    return config

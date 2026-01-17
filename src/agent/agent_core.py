@@ -19,7 +19,7 @@ from agent.backend.rag_memory import get_rag_memory_context, index_rag_memory
 from agent.backend.mem0_memory import get_mem0_memory_context, index_mem0_memory
 from agent.backend.context_memory import get_context_memory_context, index_context_memory
 from benchmark.benchmark_utils import get_unified_defense_from_config
-from benchmark.defense_backend import get_defense_backend_registry
+from benchmark.benchmark_utils import map_unified_defense_to_backend
 
 load_dotenv()
 _session_store: Dict[str, list] = {}
@@ -444,8 +444,8 @@ def invoke_agent(text: str, session_id: str, config: dict) -> Dict[str, Any]:
     context_memory_config = memory_config.get("context_memory", {}) if not memory_disabled else {}
     context_memory_enabled = context_memory_config.get("enabled", False) or (memory_backend == "context") if not memory_disabled else False
     unified_defense_type = context_memory_config.get("defense_type", "none") if not memory_disabled else "none"
-    defense_registry = get_defense_backend_registry() if not memory_disabled else None
-    context_defense_type = defense_registry.map_defense("context", unified_defense_type) if defense_registry else "none"
+    # Use new mapper function
+    context_defense_type = map_unified_defense_to_backend("context", unified_defense_type) if not memory_disabled else "none"
     
     session_messages = _get_session_memory(session_id)
     
