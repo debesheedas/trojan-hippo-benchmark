@@ -15,6 +15,7 @@ Memory Management Features:
 """
 
 import os
+import sys
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -22,6 +23,13 @@ from typing import List, Dict, Any, Optional
 import threading
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
+# Add mem0 directory to Python path (local copy included in repo)
+BASE_DIR = Path(__file__).parent.parent.parent.parent
+MEM0_DIR = BASE_DIR / "mem0"
+if MEM0_DIR.exists() and str(MEM0_DIR) not in sys.path:
+    sys.path.insert(0, str(MEM0_DIR))
+
 from mem0 import Memory
 import tiktoken
 from agent.utils import debug_info, debug_debug, debug_print_exception
