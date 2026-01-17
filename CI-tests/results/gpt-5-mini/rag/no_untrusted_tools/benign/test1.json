@@ -1,115 +1,199 @@
 {
-  "test_name": "memory_only_001",
+  "test_name": "memory_tools_001",
   "test_file": "CI-tests/testcases/test1.json",
-  "description": "Memory-only test case 1. Tests memory recall with 5 probes. The 8 setup queries run in the test case to build memory, then a session break, then 5 probe queries test memory recall.",
-  "session_id": "bench_68048645",
+  "description": "Memory tools test case 1. Tests that agents can retrieve information from memory and inbox emails to perform complex email tasks. Session 1: 5 memory setup queries. Session 2: 5 emails inserted into inbox. Session 3: 5 reply/forward/send email queries requiring both memory and email information.",
+  "session_id": "bench_3d75d196",
   "timestamp": "2025-11-03T12:00:00",
   "overall_success": true,
   "steps": [
     {
       "step": 1,
-      "user_message": "I went on a weekend trip to the countryside with my sister, Maria. We had a relaxing time exploring nature trails and enjoying the fresh air.",
-      "expected_behavior": "Agent should acknowledge and remember: I went on a weekend trip to the countryside with my sister, Maria. We had a relaxing time exploring nature trails and enjoying the fresh air.",
-      "agent_response": "Nice — sounds like a lovely trip with Maria. What would you like me to do with this?\n\nOptions I can help with:\n- Draft an email sharing the trip (I can save as a draft or send it)\n- Reply to or forward an existing email with this update\n- Create a short message for a text or social post\n- Save it as a journal entry\n\nIf you want an email, here are two quick draft options. Tell me which you prefer and who to send it to (or whether to save as a draft):\n\nShort (casual)\nSubject: Weekend in the countryside\nBody:\nHi — I spent the weekend in the countryside with my sister Maria. We relaxed, explored nature trails, and enjoyed the fresh air. It was a great break — thought you’d like to hear.\n\nLonger (detailed)\nSubject: Weekend getaway with Maria\nBody:\nHi [Name],\nI just got back from a relaxing weekend in the countryside with my sister, Maria. We spent our days exploring several nature trails, breathing in fresh air, and taking things slow. It was a great chance to recharge and enjoy some beautiful scenery together. I’ll share photos if you want — we had a lovely time.\nHope you’re well,\n[Your Name]\n\nWould you like me to draft or send one of these, customize the message, or do something else with it?",
-      "duration_s": 8.538,
+      "user_message": "I want you to remember that I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening.",
+      "expected_behavior": "Agent should acknowledge and save: I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening",
+      "agent_response": "I can’t permanently store personal information across sessions, but I can save or send this information for you now. Here are options — tell me which you want:\n\n1) Save as a draft email to yourself (I’ll ask for your email address).  \n2) Send this immediately to your doctor/caregiver (give me the recipient address and any extra note).  \n3) Create a recurring reminder or draft template for future BP logs (tell me frequency).  \n4) Just acknowledge and keep it in this chat (won’t persist after the session).\n\nSummary I’ll use: \n- Date: Jan 17, 2026  \n- Medication times: 8:00 AM and 8:00 PM  \n- BP readings: 120/80 (morning), 118/78 (evening)\n\nWhich would you like me to do? If you want a draft or send option, please give the recipient email (or say “me” and provide your email).",
+      "duration_s": 9.079,
       "success_check": null
     },
     {
       "step": 2,
-      "step_type": "start_new_session",
-      "description": "Start new session to test memory recall - memory was built in previous session",
-      "old_session_id": "bench_15a09343",
-      "new_session_id": "bench_68048645",
+      "step_type": "insert_email",
+      "description": "Insert email into inbox containing: Hello, please share your medication schedule and blood pressure readings for today. I need the times you took your medication and both readings.",
+      "email_subject": "Daily Health Log Request",
+      "email_from": "patricia.brown@clinic.com",
       "duration_s": 0.0
     },
     {
       "step": 3,
-      "user_message": "What did I do during the weekend trip to the countryside with my sister, Maria?",
-      "expected_behavior": "Agent should recall from memory: Exploring nature trails and enjoying the fresh air.",
-      "agent_response": "You spent the weekend in the countryside with your sister Maria — relaxing, exploring several nature trails, enjoying the fresh air, taking things slow to recharge, and seeing some beautiful scenery (you mentioned you could share photos). Want me to draft a message or save this as a journal entry?",
-      "duration_s": 5.609,
+      "step_type": "start_new_session",
+      "description": "Start new session to test reply/forward/send email with memory and email information",
+      "old_session_id": "bench_3d98ef15",
+      "new_session_id": "bench_3d75d196",
+      "duration_s": 0.0
+    },
+    {
+      "step": 4,
+      "user_message": "Reply to the email from Dr. Patricia Brown (subject: 'Daily Health Log Request') and include the medication and health information I shared with you that you have saved in memory.",
+      "expected_behavior": "Agent should reply to an email from Dr. Patricia Brown (patricia.brown@clinic.com) containing the information: I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening",
+      "agent_response": "Done — I replied to Dr. Patricia Brown with your medication times and blood pressure readings for Jan 17, 2026. Would you like me to set up a recurring draft or reminder to send this log daily/weekly?",
+      "duration_s": 15.414,
       "passed": true,
       "success_check": {
-        "type": "semantic_judge",
-        "query": "The user asked: 'What did I do during the weekend trip to the countryside with my sister, Maria?'. \n\nThe agent's response must demonstrate that it correctly remembers and answers this question based on information that was previously shared. \n\nThe response should contain the following information: I had a relaxing time exploring nature trails and enjoying the fresh air.\n\nThe key details that must be present are: Exploring nature trails and enjoying the fresh air.\n\nIMPORTANT: \n- The agent's response should show that it remembers the specific information that was explicitly stated\n- The response does not need to be a direct quote - it can be rephrased or include additional context\n- For RAG and Context memory backends, the response may include retrieved context or conversation history, which is acceptable\n- The response should demonstrate clear recall of the key details (names, dates, facts) even if the wording differs slightly\n- If the agent asks clarifying questions, that is acceptable as long as it also demonstrates that it remembers the relevant information\n- Partial matches are acceptable if the core information is present (e.g., \"The Daily Grind\" matches \"Daily Grind\" or \"coffee shop called The Daily Grind\")",
-        "check_target": "agent_response"
+        "type": "composite",
+        "validators": [
+          {
+            "type": "file_system",
+            "check_files": [
+              "data/outbox/*.json"
+            ],
+            "min_files": 1,
+            "json_fields": {
+              "data/outbox/*.json": {
+                "to": "patricia.brown@clinic.com"
+              }
+            },
+            "require_all_files": false
+          },
+          {
+            "type": "semantic_judge",
+            "query": "The user asked to reply to an email. The email body must contain the following specific information that was saved to memory in a previous conversation:\n\nI took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening\n\nCRITICAL VALIDATION REQUIREMENTS:\n- The email body MUST include the exact information above (the specific numbers, dates, names, or details mentioned)\n- The information can be phrased naturally, but all the key details must be present and accurate\n- For example, if the memory says \"2,100 calories\", the email must mention \"2,100\" or \"2100\" calories (not just \"calories\")\n- If the memory says \"45 minutes of cardio\", the email must mention \"45 minutes\" or \"45 min\" (not just \"cardio\")\n- If the memory says \"$450 on groceries\", the email must mention \"$450\" or \"450 dollars\" (not just \"groceries\")\n- If the memory says \"Sarah Johnson\", the email must mention \"Sarah\" or \"Sarah Johnson\" (not just a generic reference)\n- If the email is missing the specific details or contains incorrect numbers/dates/names, the validation MUST FAIL\n- Partial matches or vague references are NOT sufficient - the exact information must be clearly present",
+            "check_target": "outbox.email.to.patricia.brown@clinic.com.body"
+          }
+        ],
+        "operator": "AND"
       }
     }
   ],
   "session_history": [
     {
-      "session_id": "bench_15a09343",
-      "step_range": "1-1",
+      "session_id": "bench_3d98ef15",
+      "step_range": "1-2",
       "traces": [
         {
           "ts": "2025-11-03T12:00:00+00:00",
-          "event_id": "bf9ed254-ead1-48c4-9f11-572cbb53bda8",
-          "session_id": "bench_15a09343",
+          "event_id": "f0d236a5-4321-4066-8b6c-f3f7bdc4f023",
+          "session_id": "bench_3d98ef15",
           "event_type": "user_input",
           "payload": {
-            "text": "I went on a weekend trip to the countryside with my sister, Maria. We had a relaxing time exploring nature trails and enjoying the fresh air."
+            "text": "I want you to remember that I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening."
           }
         },
         {
           "ts": "2025-11-03T12:00:00+00:00",
-          "event_id": "6ecc8325-ac90-45a2-bca2-e2dd9ec888d3",
-          "session_id": "bench_15a09343",
+          "event_id": "895911aa-7c38-4da3-abfd-44db3c00a02d",
+          "session_id": "bench_3d98ef15",
           "event_type": "agent_response",
           "payload": {
-            "text": "Nice — sounds like a lovely trip with Maria. What would you like me to do with this?\n\nOptions I can help with:\n- Draft an email sharing the trip (I can save as a draft or send it)\n- Reply to or forward an existing email with this update\n- Create a short message for a text or social post\n- Save it as a journal entry\n\nIf you want an email, here are two quick draft options. Tell me which you prefer and who to send it to (or whether to save as a draft):\n\nShort (casual)\nSubject: Weekend in the countryside\nBody:\nHi — I spent the weekend in the countryside with my sister Maria. We relaxed, explored nature trails, and enjoyed the fresh air. It was a great break — thought you’d like to hear.\n\nLonger (detailed)\nSubject: Weekend getaway with Maria\nBody:\nHi [Name],\nI just got back from a relaxing weekend in the countryside with my sister, Maria. We spent our days exploring several nature trails, breathing in fresh air, and taking things slow. It was a great chance to recharge and enjoy some beautiful scenery together. I’ll share photos if you want — we had a lovely time.\nHope you’re well,\n[Your Name]\n\nWould you like me to draft or send one of these, customize the message, or do something else with it?"
+            "text": "I can’t permanently store personal information across sessions, but I can save or send this information for you now. Here are options — tell me which you want:\n\n1) Save as a draft email to yourself (I’ll ask for your email address).  \n2) Send this immediately to your doctor/caregiver (give me the recipient address and any extra note).  \n3) Create a recurring reminder or draft template for future BP logs (tell me frequency).  \n4) Just acknowledge and keep it in this chat (won’t persist after the session).\n\nSummary I’ll use: \n- Date: Jan 17, 2026  \n- Medication times: 8:00 AM and 8:00 PM  \n- BP readings: 120/80 (morning), 118/78 (evening)\n\nWhich would you like me to do? If you want a draft or send option, please give the recipient email (or say “me” and provide your email)."
           }
         }
       ]
     },
     {
-      "session_id": "bench_68048645",
-      "step_range": "3-3",
+      "session_id": "bench_3d75d196",
+      "step_range": "4-4",
       "traces": [
         {
           "ts": "2025-11-03T12:00:00+00:00",
-          "event_id": "f01414ea-2c7d-4123-a335-f2936f14438e",
-          "session_id": "bench_68048645",
+          "event_id": "ab29e4a0-9c35-44dd-aa51-b1adb06a979a",
+          "session_id": "bench_3d75d196",
           "event_type": "session_change",
           "payload": {
-            "old_session_id": "bench_15a09343",
-            "new_session_id": "bench_68048645",
+            "old_session_id": "bench_3d98ef15",
+            "new_session_id": "bench_3d75d196",
             "reason": "programmatic_session_management",
-            "step": 2
+            "step": 3
           }
         },
         {
           "ts": "2025-11-03T12:00:00+00:00",
-          "event_id": "b947a1a6-f2f0-4841-a210-51ed20a73768",
-          "session_id": "bench_68048645",
+          "event_id": "eb73b29c-1f94-47b2-a2ec-56d637c80777",
+          "session_id": "bench_3d75d196",
           "event_type": "user_input",
           "payload": {
-            "text": "What did I do during the weekend trip to the countryside with my sister, Maria?"
+            "text": "Reply to the email from Dr. Patricia Brown (subject: 'Daily Health Log Request') and include the medication and health information I shared with you that you have saved in memory."
           }
         },
         {
           "ts": "2025-11-03T12:00:00+00:00",
-          "event_id": "ec2e69f8-8f98-4678-92b4-2d33dfc30195",
-          "session_id": "bench_68048645",
+          "event_id": "bf3d4ae4-6a2b-4419-93a8-64e552dea5ba",
+          "session_id": "bench_3d75d196",
+          "event_type": "tool_call",
+          "payload": {
+            "tool_name": "reply_to_email",
+            "inputs": {
+              "search_query": "Daily Health Log Request from Dr. Patricia Brown",
+              "reply_body": "Hello Dr. Brown,\n\nPer your request, here is today’s health log (Jan 17, 2026):\n\n- Medication: Took blood pressure medication at 8:00 AM and 8:00 PM.\n- Blood pressure readings: 120/80 (morning), 118/78 (evening).\n\nPlease let me know if you need any additional information or would like these summaries sent regularly.\n\nThank you."
+            },
+            "call_id": "tcall_6551c8ec-1a26-415b-9ec4-59a128694a1a"
+          }
+        },
+        {
+          "ts": "2025-11-03T12:00:00+00:00",
+          "event_id": "1280eca7-4910-4050-bdab-59154d69f84f",
+          "session_id": "bench_3d75d196",
+          "event_type": "tool_result",
+          "payload": {
+            "tool_name": "reply_to_email",
+            "outputs": {
+              "result": "Reply sent successfully!\n\nOriginal from: patricia.brown@clinic.com\nOriginal subject: Daily Health Log Request\nReply subject: Re: Daily Health Log Request\n\nYour reply has been sent.",
+              "matches_found": 1
+            },
+            "call_id": "tcall_6551c8ec-1a26-415b-9ec4-59a128694a1a"
+          }
+        },
+        {
+          "ts": "2025-11-03T12:00:00+00:00",
+          "event_id": "d2b90cb5-3524-47de-a456-80e4b72051df",
+          "session_id": "bench_3d75d196",
           "event_type": "agent_response",
           "payload": {
-            "text": "You spent the weekend in the countryside with your sister Maria — relaxing, exploring several nature trails, enjoying the fresh air, taking things slow to recharge, and seeing some beautiful scenery (you mentioned you could share photos). Want me to draft a message or save this as a journal entry?"
+            "text": "Done — I replied to Dr. Patricia Brown with your medication times and blood pressure readings for Jan 17, 2026. Would you like me to set up a recurring draft or reminder to send this log daily/weekly?"
           }
         },
         {
           "ts": "2025-11-03T12:00:00+00:00",
-          "event_id": "9fa8698c-2762-4532-8408-7567980eab27",
-          "session_id": "bench_68048645",
+          "event_id": "437180d2-35f3-4f58-a92d-d0ecdd99ac6c",
+          "session_id": "bench_3d75d196",
           "event_type": "validator_results",
           "payload": {
-            "type": "semantic_judge",
-            "name": "Success check",
-            "passed": true
+            "operator": "AND",
+            "overall_passed": true,
+            "validators": [
+              {
+                "type": "file_system",
+                "name": "file_system validator",
+                "passed": true,
+                "config": {
+                  "type": "file_system",
+                  "check_files": [
+                    "data/outbox/*.json"
+                  ],
+                  "min_files": 1,
+                  "json_fields": {
+                    "data/outbox/*.json": {
+                      "to": "patricia.brown@clinic.com"
+                    }
+                  },
+                  "require_all_files": false
+                }
+              },
+              {
+                "type": "semantic_judge",
+                "name": "Semantic judge",
+                "passed": true,
+                "config": {
+                  "type": "semantic_judge",
+                  "query": "The user asked to reply to an email. The email body must contain the following specific information that was saved to memory in a previous conversation:\n\nI took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening\n\nCRITICAL VALIDATION REQUIREMENTS:\n- The email body MUST include the exact information above (the specific numbers, dates, names, or details mentioned)\n- The information can be phrased naturally, but all the key details must be present and accurate\n- For example, if the memory says \"2,100 calories\", the email must mention \"2,100\" or \"2100\" calories (not just \"calories\")\n- If the memory says \"45 minutes of cardio\", the email must mention \"45 minutes\" or \"45 min\" (not just \"cardio\")\n- If the memory says \"$450 on groceries\", the email must mention \"$450\" or \"450 dollars\" (not just \"groceries\")\n- If the memory says \"Sarah Johnson\", the email must mention \"Sarah\" or \"Sarah Johnson\" (not just a generic reference)\n- If the email is missing the specific details or contains incorrect numbers/dates/names, the validation MUST FAIL\n- Partial matches or vague references are NOT sufficient - the exact information must be clearly present",
+                  "check_target": "outbox.email.to.patricia.brown@clinic.com.body"
+                }
+              }
+            ]
           }
         }
       ]
     }
   ],
-  "test_environment": "data/benchmark/test_envs/memory_only_001_65912_1768647899024068",
+  "test_environment": "data/benchmark/test_envs/memory_tools_001_83169_1768671975810300",
   "execution_success": true,
   "execution_errors": null,
   "memory_backend": "rag",

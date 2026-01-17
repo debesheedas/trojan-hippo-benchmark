@@ -45,11 +45,11 @@ jobs:
           exit 1
         fi
     
-    - name: Run regression benchmark
+    - name: Run regression benchmark for test1
       env:
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       run: |
-        # Run benchmark for all combinations of the test file
+        # Run benchmark for all combinations of test1.json
         # Using --num-workers 1 for serial execution (safer for CI/CD, avoids rate limits)
         # Results will be saved to CI-tests/results/ directory
         python scripts/run_benchmark.py \
@@ -60,11 +60,30 @@ jobs:
           --num-workers 1 \
           --force
     
-    - name: Compare results with ground truth
+    - name: Run regression benchmark for test2
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      run: |
+        # Run benchmark for all combinations of test2.json
+        python scripts/run_benchmark.py \
+          --test CI-tests/testcases/test2.json \
+          --memory-backend none explicit mem0 rag context \
+          --defense-type none user_prompt_only no_untrusted_tools limit_memory_length provable_policy \
+          --results-dir CI-tests/results \
+          --num-workers 1 \
+          --force
+    
+    - name: Compare results with ground truth for test1
       run: |
         python CI-tests/compare_results.py \
           --results-dir CI-tests/results \
           --test-file CI-tests/testcases/test1.json
+    
+    - name: Compare results with ground truth for test2
+      run: |
+        python CI-tests/compare_results.py \
+          --results-dir CI-tests/results \
+          --test-file CI-tests/testcases/test2.json
     
     - name: Clean up test results
       if: always()

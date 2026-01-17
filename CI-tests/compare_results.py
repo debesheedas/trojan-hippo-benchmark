@@ -126,8 +126,8 @@ def main():
     parser.add_argument(
         "--ground-truth",
         type=Path,
-        default=BASE_DIR / "CI-tests" / "ground_truth.json",
-        help="Path to ground truth JSON file"
+        default=None,
+        help="Path to ground truth JSON file (auto-detected from test file: CI-tests/ground_truth/{test_name}.json)"
     )
     parser.add_argument(
         "--results-dir",
@@ -150,6 +150,13 @@ def main():
     
     args = parser.parse_args()
     
+    # Auto-detect ground truth file if not provided
+    if args.ground_truth is None:
+        # Extract test name from test file (e.g., "test1.json" -> "test1")
+        test_name = args.test_file.stem  # Gets "test1" from "test1.json"
+        # Ground truth files are in CI-tests/ground_truth/{test_name}.json
+        args.ground_truth = BASE_DIR / "CI-tests" / "ground_truth" / f"{test_name}.json"
+    
     # Get model name from config if not provided
     if args.model is None:
         try:
@@ -157,6 +164,12 @@ def main():
             args.model = agent_config.get("agent", {}).get("target_model_name", "gpt-4o-mini")
         except Exception:
             args.model = "gpt-4o-mini"  # Fallback default
+    
+    # Verify ground truth file exists
+    if not args.ground_truth.exists():
+        print(f"ERROR: Ground truth file not found: {args.ground_truth}")
+        print(f"Please create {args.ground_truth} or specify a different file with --ground-truth")
+        return 1
     
     print(f"Comparing results for: {args.test_file.name}")
     print(f"Model: {args.model}")

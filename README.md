@@ -229,36 +229,64 @@ memory-agent-security-benchmark/
 ├── README.md                    # This file
 ├── requirements.txt             # Python dependencies
 ├── agent_config.yaml            # Agent configuration (model, temperature, etc.)
-├── benchmark_config.yaml         # Benchmark-specific settings
+├── benchmark_config.yaml        # Benchmark-specific settings
+├── proof.md                     # Security proofs and formal analysis
+├── .github/
+│   └── workflows/              # GitHub Actions CI/CD workflows
+│       └── regression_test.yml  # Regression testing workflow
 ├── src/
 │   ├── agent/                   # Core agent implementation
 │   │   ├── agent_core.py        # Main agent execution logic
-│   │   ├── tools_registry.py    # Tool registration
-│   │   ├── utils.py             # Helper functions
-│   │   ├── memory_prompt.txt    # Memory behavior prompt
+│   │   ├── attack_utils.py      # Attack-related utility functions
+│   │   ├── tools_registry.py    # Tool registration and management
+│   │   ├── utils.py             # Helper functions and utilities
+│   │   ├── memory_prompt.txt    # Memory behavior prompt template
+│   │   ├── user_only_memory_prompt.txt  # User-only memory prompt template
 │   │   ├── tool_specifications/ # Tool implementations
 │   │   │   ├── email_tools.py   # Email management tools
-│   │   │   └── memory_tools.py # Memory management tools
-│   │   └── backend/             # Backend services
-│   │       └── memory_manager.py
-│   ├── benchmark/               # Benchmarking system
-│   │   ├── test_bench.py        # Main benchmark entry point
-│   │   ├── test_validators.py  # Test validation logic
-│   │   ├── memory_backend.py    # Memory backend abstractions
-│   │   ├── defense_backend.py   # Defense backend abstractions
-│   │   ├── benchmark_utils.py  # Benchmark utilities
-│   │   ├── test_case_normalizer.py # Test case normalization
-│   │   ├── unified_validator.py # Unified memory validator
-│   │   ├── environment_state.py # Environment state management
-│   │   └── adaptive_attacks/   # Adaptive attack optimizers
-│   │       ├── base_optimizer.py
-│   │       ├── dspy_optimizer.py
-│   │       ├── openevolve_optimizer.py
-│   │       └── scorer.py
+│   │   │   └── memory_tools.py  # Memory management tools
+│   │   └── backend/             # Memory backend implementations
+│   │       ├── context_memory.py    # Context-based memory backend
+│   │       ├── explicit_memory.py  # JSON-based explicit memory backend
+│   │       ├── mem0_memory.py      # Mem0 vector-based memory backend
+│   │       └── rag_memory.py       # RAG-based memory backend
+│   └── benchmark/               # Benchmarking system
+│       ├── test_bench.py        # Main benchmark entry point
+│       ├── test_validators.py  # Test validation logic
+│       ├── benchmark_utils.py  # Benchmark utilities
+│       ├── environment_state.py # Environment state management
+│       ├── memory_validators.py # Memory validation utilities
+│       ├── adaptive_attacks/   # Adaptive attack optimizers
+│       │   ├── base_optimizer.py      # Base optimizer interface
+│       │   ├── dspy_optimizer.py      # DSPy-based optimizer
+│       │   ├── openevolve_optimizer.py # OpenEvolve-based optimizer
+│       │   ├── scorer.py              # Attack scoring logic
+│       │   ├── mutator_prompt.txt     # Mutation prompt template
+│       │   └── numeric_judge_prompt.txt # Numeric judgment prompt
+│       └── dataset_generation/  # Test case generation scripts
+│           ├── 01_memory_only/  # Memory-only test case generation
+│           ├── 02_assistant_responses/ # Assistant response test cases
+│           ├── 03_untrusted_probe/    # Untrusted probe test cases
+│           ├── 04_untrusted_send/     # Untrusted send test cases
+│           ├── 05_disable_send/       # Disable send test cases
+│           ├── 06_memory_tools/       # Memory tools test cases
+│           └── 07_long_memory/        # Long memory test cases
 ├── scripts/                     # Utility scripts
 │   ├── run_benchmark.py        # Unified benchmark runner
 │   ├── consolidate_results.py  # Unified results consolidation
-│   └── migrate_test_cases.py  # Test case migration tool
+│   └── aggregate_csv.py        # CSV aggregation utilities
+├── CI-tests/                    # Continuous integration test suite
+│   ├── compare_results.py      # Result comparison utilities
+│   ├── testcases/              # CI test cases
+│   │   ├── test1.json
+│   │   └── test2.json
+│   ├── ground_truth/           # Ground truth files
+│   │   ├── test1.json          # Ground truth for test1
+│   │   └── test2.json          # Ground truth for test2
+│   ├── results/                # CI test results
+│   ├── README.md               # CI tests documentation
+│   ├── GITHUB_ACTIONS_EXPLANATION.md  # GitHub Actions guide
+│   └── GITHUB_ACTIONS_SETUP.md        # GitHub Actions setup guide
 ├── data/
 │   ├── agent/                   # Agent data (mailbox, drafts, outbox, memory)
 │   └── benchmark/              # Benchmark data
@@ -280,7 +308,18 @@ memory-agent-security-benchmark/
 │       ├── few_shot_examples/ # Few-shot examples for optimizers
 │       ├── attack_bench_cache/ # Cached optimized attacks
 │       └── test_envs/          # Isolated test environments
-└── logs/                       # Application logs
+├── html_reports/               # HTML visualization reports
+│   ├── index.html              # Reports index
+│   └── gpt-4o/                 # Model-specific reports
+│       └── indirect/           # Attack type reports
+├── logs/                       # Application logs
+├── mem0/                       # Mem0 library (dependency)
+└── useful_temp/                # Temporary utility scripts and notes
+    ├── extract_mutators.py
+    ├── format_body_plain.py
+    ├── generate_html_reports.py
+    ├── validate_cache.py
+    └── notes/                  # Development notes and scratchpad
 ```
 
 ## Installation

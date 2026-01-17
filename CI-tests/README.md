@@ -7,16 +7,19 @@ This directory contains continuous integration (CI) tests to ensure that refacto
 ```
 CI-tests/
   ├── testcases/          # Test case files
-  │   └── test1.json     # The regression test case
+  │   ├── test1.json     # Regression test case 1
+  │   └── test2.json     # Regression test case 2
+  ├── ground_truth/       # Ground truth files
+  │   ├── test1.json     # Expected results for test1
+  │   └── test2.json     # Expected results for test2
   ├── results/            # Benchmark results (generated during CI runs)
-  ├── ground_truth.json   # Expected results for each combination
   ├── compare_results.py  # Script to compare results against ground truth
   └── README.md          # This file
 ```
 
 ## Test Overview
 
-The regression test runs a single test case (`testcases/test1.json`) across all 24 combinations of:
+The regression test runs multiple test cases across all 24 combinations of:
 - **Memory backends**: `none`, `explicit`, `mem0`, `rag`, `context` (5 backends)
 - **Defense types**: `none`, `user_prompt_only`, `no_untrusted_tools`, `limit_memory_length`, `provable_policy` (5 defenses)
 
@@ -33,7 +36,12 @@ This ensures we're testing the exact same code path as normal benchmarks.
 
 ## Ground Truth
 
-The `ground_truth.json` file contains the expected pass/fail results for each combination. You need to manually populate this file after running the test case once to establish the baseline.
+Each test case has its own ground truth file in the `ground_truth/` directory:
+- `ground_truth/test1.json` - Expected results for `test1.json`
+- `ground_truth/test2.json` - Expected results for `test2.json`
+- For additional tests, use `ground_truth/{test_name}.json` format
+
+The `compare_results.py` script automatically detects the correct ground truth file based on the test file name (e.g., `test1.json` → `ground_truth/test1.json`).
 
 ### Format
 
@@ -48,6 +56,8 @@ The `ground_truth.json` file contains the expected pass/fail results for each co
 - `true` = test should pass
 - `false` = test should fail
 
+You need to manually populate the ground truth file after running each test case once to establish the baseline.
+
 ## Running Tests Locally
 
 1. Make sure you have your OpenAI API key set in `.env`:
@@ -55,8 +65,9 @@ The `ground_truth.json` file contains the expected pass/fail results for each co
    echo "OPENAI_API_KEY=your-key-here" > .env
    ```
 
-2. Run the benchmark for all combinations:
+2. Run the benchmark for all combinations (for each test case):
    ```bash
+   # For test1
    python scripts/run_benchmark.py \
      --test CI-tests/testcases/test1.json \
      --memory-backend none explicit mem0 rag context \
@@ -64,16 +75,32 @@ The `ground_truth.json` file contains the expected pass/fail results for each co
      --results-dir CI-tests/results \
      --num-workers 1 \
      --force
+   
+   # For test2
+   python scripts/run_benchmark.py \
+     --test CI-tests/testcases/test2.json \
+     --memory-backend none explicit mem0 rag context \
+     --defense-type none user_prompt_only no_untrusted_tools limit_memory_length provable_policy \
+     --results-dir CI-tests/results \
+     --num-workers 1 \
+     --force
    ```
 
-3. Compare results against ground truth:
+3. Compare results against ground truth (for each test case):
    ```bash
+   # For test1 (uses ground_truth.json)
    python CI-tests/compare_results.py \
      --results-dir CI-tests/results \
      --test-file CI-tests/testcases/test1.json
+   
+   # For test2 (auto-detects ground_truth_test2.json)
+   python CI-tests/compare_results.py \
+     --results-dir CI-tests/results \
+     --test-file CI-tests/testcases/test2.json
    ```
 
    (Model name is automatically read from `agent_config.yaml`)
+   (Ground truth file is auto-detected from test file name)
 
 ## GitHub Actions
 
@@ -91,15 +118,18 @@ To enable the GitHub Actions workflow, you need to add your OpenAI API key as a 
 6. Click **Add secret**
 
 The workflow will automatically:
-1. Run the benchmark for all combinations (serial execution, `--num-workers 1`)
-2. Compare results against ground truth
-3. Fail if any results don't match
+1. Run the benchmark for all combinations for each test case (serial execution, `--num-workers 1`)
+2. Compare results against ground truth for each test case
+3. Fail if any results don't match their respective ground truth
 
 ## Updating Ground Truth
 
-If you make changes that intentionally affect test results, you'll need to update `ground_truth.json`:
+If you make changes that intentionally affect test results, you'll need to update the corresponding ground truth file:
 
-1. Run the benchmark locally (see "Running Tests Locally" above)
+1. Run the benchmark locally for the specific test case (see "Running Tests Locally" above)
 2. Check the results in `CI-tests/results/`
-3. Update `CI-tests/ground_truth.json` with the new expected results
+3. Update the appropriate ground truth file:
+   - `CI-tests/ground_truth/test1.json` for test1
+   - `CI-tests/ground_truth/test2.json` for test2
+   - `CI-tests/ground_truth/{test_name}.json` for other tests
 4. Commit the updated ground truth file

@@ -1,12 +1,5 @@
-#!/usr/bin/env python3
 """
 Unified Benchmark Runner
-
-Replaces the three duplicate scripts:
-- run_explicit_defense_benchmarks.py
-- run_mem0_defense_benchmarks.py
-- run_rag_defense_benchmarks.py
-
 This script runs benchmarks for any memory backend with any defense type.
 Uses unified abstractions and result structure.
 """

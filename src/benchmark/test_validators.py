@@ -8,9 +8,14 @@ via parameters in the test JSON files.
 import json
 import re
 import fnmatch
+from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Union, Optional, Tuple
-from agent.utils import debug_info, debug_debug, debug_print_exception
+from typing import List, Dict, Any, Optional, Tuple
+from agent.utils import (
+    debug_info, debug_debug, debug_print_exception, load_config,
+    call_llm_chat_completion, detect_provider, append_trace_event
+)
+from agent.utils import print_validator_result
 
 
 class TestValidator:
@@ -603,7 +608,6 @@ class SemanticJudgeValidator(TestValidator):
         
         # Load semantic judge config
         try:
-            from agent.utils import load_config
             global_config = load_config()
             judge_config = global_config.get("benchmark", {}).get("semantic_judge", {})
             self._judge_model = judge_config.get("model_name", "gpt-4o")  # Uses benchmark.semantic_judge.model_name
@@ -654,7 +658,6 @@ class SemanticJudgeValidator(TestValidator):
     
     def _get_email_timestamp(self, email_data: Dict[str, Any]) -> float:
         """Extract timestamp from email data, returning 0.0 if parsing fails."""
-        from datetime import datetime
         ts = email_data.get('sent_ts') or email_data.get('created_ts', '')
         if not ts:
             return 0.0
@@ -722,9 +725,6 @@ class SemanticJudgeValidator(TestValidator):
         """Call LLM API to judge if content contains information matching the query."""
         result_text = ""
         try:
-            from agent.utils import call_llm_chat_completion, detect_provider
-            import re
-            
             provider = detect_provider(self._judge_model)
             
             # Extract facts for better matching
@@ -936,12 +936,10 @@ class CrossStepSemanticJudgeValidator(TestValidator):
         self._check_target = config.get("check_target", "agent_response")
         
         # Initialize cross-step data storage in test_config if needed
-        if test_config is not None:
-            if "_cross_step_data" not in test_config:
-                test_config["_cross_step_data"] = {}
+        if test_config is not None and "_cross_step_data" not in test_config:
+            test_config["_cross_step_data"] = {}
         
-        # Create a SemanticJudgeValidator instance to reuse its methods
-        # We only need the extraction and judge calling methods, not the full validation
+        # Create a SemanticJudgeValidator instance to reuse its extraction and judge methods
         self._semantic_judge_validator = SemanticJudgeValidator(
             {"query": "", "check_target": self._check_target},
             test_config
@@ -953,22 +951,15 @@ class CrossStepSemanticJudgeValidator(TestValidator):
             print("Warning: CrossStepSemanticJudgeValidator requires reference_step")
             return False
         
-        # Get current step number from test_config
-        current_step = None
-        if self.test_config:
-            current_step = self.test_config.get("_current_step_num")
-        
-        # Get step results from test_config
-        step_results = []
-        if self.test_config:
-            step_results = self.test_config.get("_step_results", [])
+        if not self.test_config:
+            return False
         
         # Find reference step result
-        reference_result = None
-        for step_result in step_results:
-            if step_result.get("step") == self._reference_step:
-                reference_result = step_result
-                break
+        step_results = self.test_config.get("_step_results", [])
+        reference_result = next(
+            (sr for sr in step_results if sr.get("step") == self._reference_step),
+            None
+        )
         
         if not reference_result:
             debug_info(f"Could not find step {self._reference_step} in step results")
@@ -982,13 +973,12 @@ class CrossStepSemanticJudgeValidator(TestValidator):
         
         # Extract the specific information we need
         extracted_info = self._extract_information(reference_response, self._extract_focus)
-        
         if not extracted_info:
             debug_info(f"Could not extract {self._extract_focus} from step {self._reference_step}")
             return False
         
         # Store extracted information for debugging
-        if self.test_config and "_cross_step_data" in self.test_config:
+        if "_cross_step_data" in self.test_config:
             key = f"step_{self._reference_step}_{self._extract_focus}"
             self.test_config["_cross_step_data"][key] = extracted_info
         
@@ -997,10 +987,14 @@ class CrossStepSemanticJudgeValidator(TestValidator):
         if not current_content:
             return False
         
+        # Pre-check: If the agent explicitly states it doesn't have the information saved,
+        # fail immediately even if the correct answer appears later in suggestions
+        if self._has_explicit_failure_indicators(current_content):
+            debug_info("Agent explicitly stated it doesn't have the information saved - validation fails")
+            return False
+        
         # Build comparison query
         if self._comparison_query:
-            # If custom comparison_query is provided, inject the extracted information into it
-            # This ensures the semantic judge knows what to look for
             query = (
                 f"{self._comparison_query}\n\n"
                 f"Previously discussed information to verify:\n{extracted_info}\n\n"
@@ -1011,8 +1005,7 @@ class CrossStepSemanticJudgeValidator(TestValidator):
         
         # Use semantic judge to compare
         try:
-            result = self._call_semantic_judge(current_content, query)
-            return result
+            return self._call_semantic_judge(current_content, query)
         except Exception as e:
             debug_info("Cross-step semantic judge validation failed")
             debug_print_exception(e, context="Cross-step semantic judge validation", include_traceback=True)
@@ -1021,11 +1014,8 @@ class CrossStepSemanticJudgeValidator(TestValidator):
     def _extract_information(self, text: str, focus: str) -> str:
         """Extract specific information from text using LLM."""
         try:
-            from agent.utils import call_llm_chat_completion, detect_provider
-            
             judge_model = self._semantic_judge_validator._judge_model
             judge_temperature = self._semantic_judge_validator._judge_temperature
-            provider = detect_provider(judge_model)
             
             messages = [
                 {
@@ -1052,7 +1042,6 @@ class CrossStepSemanticJudgeValidator(TestValidator):
                 }
             ]
             
-            # Call LLM
             response = call_llm_chat_completion(
                 model=judge_model,
                 messages=messages,
@@ -1065,10 +1054,7 @@ class CrossStepSemanticJudgeValidator(TestValidator):
                 return ""
             
             extracted = response.choices[0].message.content.strip()
-            if extracted == "NOT_FOUND" or not extracted:
-                return ""
-            
-            return extracted
+            return "" if extracted == "NOT_FOUND" or not extracted else extracted
         except Exception as e:
             debug_info("Error extracting information")
             debug_print_exception(e, context="Extracting information from response", include_traceback=True)
@@ -1088,111 +1074,68 @@ class CrossStepSemanticJudgeValidator(TestValidator):
             f"Be tolerant to paraphrasing and formatting differences, but strict on factual correctness."
         )
     
+    def _has_explicit_failure_indicators(self, content: str) -> bool:
+        """
+        Check if the agent's response explicitly states it doesn't have the information saved.
+        
+        This catches cases where the agent says it can't recall, doesn't have the information,
+        or searched but didn't find it - even if it then suggests the correct answer.
+        """
+        if not content:
+            return False
+        
+        content_lower = content.lower()
+        
+        # Patterns that indicate the agent doesn't have the information saved
+        failure_patterns = [
+            # Direct statements
+            r"i don't have (that|this|it) (saved|stored|remembered|recorded)",
+            r"i can't (recall|remember|find|retrieve)",
+            r"i couldn't (recall|remember|find|retrieve)",
+            r"i do not have (that|this|it) (saved|stored|remembered|recorded)",
+            r"i cannot (recall|remember|find|retrieve)",
+            
+            # Search failure patterns
+            r"(searched|looked|checked).*but (didn't|did not|couldn't|could not) find",
+            r"(searched|looked|checked).*and (didn't|did not|couldn't|could not) find",
+            r"didn't find (any|a|the).*that (clearly|explicitly|specifically)",
+            r"did not find (any|a|the).*that (clearly|explicitly|specifically)",
+            r"couldn't find (any|a|the).*that (clearly|explicitly|specifically)",
+            r"could not find (any|a|the).*that (clearly|explicitly|specifically)",
+            r"no (email|message|record|document|note).*that (clearly|explicitly|specifically|records)",
+            
+            # Memory/recall failure
+            r"don't (have|recall|remember) (that|this|it) (saved|stored|in memory)",
+            r"do not (have|recall|remember) (that|this|it) (saved|stored|in memory)",
+            r"can't (recall|remember) (that|this|it)",
+            r"cannot (recall|remember) (that|this|it)",
+            
+            # Information not available
+            r"i don't (have|know|see) (that|this|it) (information|data|record)",
+            r"i do not (have|know|see) (that|this|it) (information|data|record)",
+            r"i can't (access|retrieve|find) (that|this|it) (information|data|record)",
+            r"i cannot (access|retrieve|find) (that|this|it) (information|data|record)",
+            
+            # Not found in searches
+            r"not (found|available|stored|saved) (in|on|at)",
+            r"no record (of|for)",
+        ]
+        
+        for pattern in failure_patterns:
+            if re.search(pattern, content_lower):
+                return True
+        
+        return False
+    
     def _extract_content(self, agent_response: str, traces: List[Dict] = None) -> str:
         """Extract the content to validate based on check_target configuration."""
         # Reuse SemanticJudgeValidator's extraction method
         return self._semantic_judge_validator._extract_content(agent_response, traces)
     
     def _call_semantic_judge(self, content: str, query: str) -> bool:
-        """Call semantic judge for cross-step validation with simplified query format."""
-        # For cross-step validation, we use a simpler format than the full semantic judge
-        # Build query in the format expected by SemanticJudgeValidator's standard fact/figure matching
-        try:
-            from agent.utils import call_llm_chat_completion, detect_provider
-            import re
-            
-            provider = detect_provider(self._semantic_judge_validator._judge_model)
-            
-            def extract_facts(text: str) -> Dict[str, Any]:
-                try:
-                    numbers = re.findall(r"(?<![\w\d])(?:\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d+)(?![\w\d])", text)
-                    percents = re.findall(r"\b\d{1,3}(?:\.\d+)?\s*%\b", text)
-                    currency = re.findall(r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?|\bUSD\s*\d+(?:\.\d+)?\b", text, flags=re.IGNORECASE)
-                    kpis = re.findall(r"\b(EPS|Revenue|Net\s+Income|Budget|Discount|Price|Pricing|Spend|Valuation)\b", text, flags=re.IGNORECASE)
-                    return {
-                        "numbers": numbers,
-                        "percentages": percents,
-                        "currency": currency,
-                        "kpis": list({k.lower() for k in kpis}),
-                    }
-                except Exception:
-                    return {"numbers": [], "percentages": [], "currency": [], "kpis": []}
-            
-            query_facts = extract_facts(query)
-            content_facts = extract_facts(content)
-            
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a rigorous semantic judge for fact/figure overlap and memory recall. "
-                        "Given a query describing what should be recalled and a candidate content, decide if the content correctly recalls the information from the query. "
-                        "For information involving mappings or relationships (e.g., items to values, entities to attributes), "
-                        "verify that the exact mappings match. "
-                        "For numbers, amounts, dates, or other quantitative information, verify that the values match "
-                        "(allowing for formatting variants like $1,000 vs 1000 vs one thousand dollars). "
-                        "For qualitative information, verify semantic equivalence while preserving key details. "
-                        "Be tolerant to paraphrasing and formatting variants but strict on factual correctness. "
-                        "Always respond with valid JSON."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Query (what should be recalled):\n{query}\n\n"
-                        f"Content to check (agent's response):\n{content}\n\n"
-                        f"Extracted query facts (numbers/percentages/currency/KPIs):\n{json.dumps(query_facts, ensure_ascii=False)}\n\n"
-                        f"Extracted content facts (numbers/percentages/currency/KPIs):\n{json.dumps(content_facts, ensure_ascii=False)}\n\n"
-                        "Task: Determine if the content correctly recalls the information from the query. "
-                        "For colors, ensure exact matches with correct mappings. "
-                        "For budget/numbers, ensure amounts match (allowing formatting variations).\n\n"
-                        "Output strict JSON with this exact shape:\n"
-                        "{\n"
-                        "  \"contains_information\": true/false,\n"
-                        "  \"matched_items\": [\"list matched facts\"],\n"
-                        "  \"explanation\": \"brief justification\"\n"
-                        "}"
-                    )
-                }
-            ]
-            
-            judge_model = self._semantic_judge_validator._judge_model
-            judge_temperature = self._semantic_judge_validator._judge_temperature
-            model_lower = str(judge_model).lower()
-            is_gpt5_family = model_lower.startswith("gpt-5") or "gpt-5" in model_lower
-            temperature = None if is_gpt5_family else judge_temperature
-            response_format = {"type": "json_object"} if provider == "openai" else None
-            
-            response = call_llm_chat_completion(
-                model=judge_model,
-                messages=messages,
-                temperature=temperature,
-                response_format=response_format,
-                max_tokens=2000,
-                max_output_tokens=2000
-            )
-            
-            if not response or not response.choices or not response.choices[0].message:
-                return False
-            
-            result_text = response.choices[0].message.content.strip()
-            if not result_text:
-                return False
-            
-            try:
-                result_json = json.loads(result_text)
-                contains_info = result_json.get("contains_information", False)
-                return bool(contains_info)
-            except json.JSONDecodeError:
-                # Fallback: try to extract JSON from response
-                json_match = re.search(r'\{"contains_information":\s*(true|false)', result_text, re.IGNORECASE)
-                if json_match:
-                    return json_match.group(1).lower() == "true"
-                return "true" in result_text.lower() and "false" not in result_text.lower()[:20]
-        except Exception as e:
-            debug_info("Cross-step semantic judge API error")
-            debug_print_exception(e, context="Calling cross-step semantic judge API", include_traceback=True)
-            return False
+        """Call semantic judge for cross-step validation - reuse SemanticJudgeValidator's method."""
+        # The query already contains all context needed, so we can directly use SemanticJudgeValidator's method
+        return self._semantic_judge_validator._call_semantic_judge(content, query)
     
     def score(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> float:
         """Score is same as validate for cross-step semantic judge (binary)."""
@@ -1208,35 +1151,15 @@ class CompositeValidator(TestValidator):
     - operator: "AND" or "OR" (default: "AND")
     """
     
-    def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
-        validators = self.config.get("validators", [])
-        operator = self.config.get("operator", "AND").upper()
-        
-        if not validators:
-            return True
-        
-        results = []
-        for validator_config in validators:
-            validator_type = validator_config.get("type")
-            validator = self._create_validator(validator_type, validator_config, self.test_config)
-            if validator:
-                result = validator.validate(agent_response, session_id, traces)
-                results.append(result)
-        
-        if operator == "OR":
-            return any(results)
-        else:  # AND
-            return all(results)
-    
-    def validate_with_print(self, agent_response: str, session_id: str, traces: List[Dict] = None, prefix: str = "", trace_file: Optional[str] = None) -> bool:
+    def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None, prefix: str = "", trace_file: Optional[str] = None) -> bool:
         """
-        Validate and print individual validator results.
+        Validate with optional printing and trace logging.
         
         Args:
             agent_response: Agent response text
             session_id: Session identifier
             traces: Trace events
-            prefix: Prefix for nested validators (for indentation)
+            prefix: Prefix for nested validators (for indentation), empty string means no printing
             trace_file: Optional trace file path for logging validator results
             
         Returns:
@@ -1249,43 +1172,48 @@ class CompositeValidator(TestValidator):
             return True
         
         results = []
-        validator_results = []  # Store results for trace logging
+        validator_results: List[Dict[str, Any]] = []  # Store results for trace logging
+        print_results = bool(prefix)  # Print if prefix is provided
         
         for i, validator_config in enumerate(validators):
             validator_type = validator_config.get("type")
-            validator = self._create_validator(validator_type, validator_config, self.test_config)
-            if validator:
-                result = validator.validate(agent_response, session_id, traces)
-                results.append(result)
-                
-                # Generate validator name for display
-                validator_name = self._get_validator_display_name(validator_config, validator_type, i)
-                
-                # Print result to terminal
-                from agent.colored_trace_printer import print_validator_result
+            validator = create_validator(validator_config, self.test_config)
+            if not validator:
+                continue
+            
+            result = validator.validate(agent_response, session_id, traces)
+            results.append(result)
+            
+            # Handle nested composite validators
+            if validator_type == "composite" and isinstance(validator, CompositeValidator):
+                composite_validator = validator  # Type narrowing for type checker
+                if print_results:
+                    nested_prefix = prefix + "  "
+                    result = composite_validator.validate(agent_response, session_id, traces, prefix=nested_prefix, trace_file=trace_file)
+                    results[-1] = result
+                elif trace_file:
+                    # Still need to validate nested for trace logging
+                    nested_result = composite_validator.validate(agent_response, session_id, traces, prefix="", trace_file=trace_file)
+                    results[-1] = nested_result
+            
+            # Print result if requested
+            if print_results:
+                validator_name = self._get_validator_display_name(validator_config, validator_type)
                 print_validator_result(validator_type, f"{prefix}{validator_name}", result)
-                
-                # Store result for trace logging
+            
+            # Store result for trace logging
+            if trace_file:
+                validator_name = self._get_validator_display_name(validator_config, validator_type)
                 validator_results.append({
                     "type": validator_type,
                     "name": validator_name,
                     "passed": result,
                     "config": validator_config
                 })
-                
-                # If composite, also print nested validators
-                if validator_type == "composite" and isinstance(validator, CompositeValidator):
-                    nested_prefix = prefix + "  "
-                    # Pass trace_file to nested validators
-                    if hasattr(validator, 'validate_with_print'):
-                        nested_result = validator.validate_with_print(agent_response, session_id, traces, nested_prefix, trace_file)
-                        # Update result with nested result
-                        results[-1] = nested_result
         
         # Log validator results to trace file if provided
         if trace_file and validator_results:
             try:
-                from agent.utils import append_trace_event
                 append_trace_event(
                     trace_file,
                     "validator_results",
@@ -1300,33 +1228,33 @@ class CompositeValidator(TestValidator):
                 debug_info("Could not log validator results to trace")
                 debug_print_exception(e, context="Logging validator results to trace", include_traceback=True)
         
-        if operator == "OR":
-            return any(results)
-        else:  # AND
-            return all(results)
+        return any(results) if operator == "OR" else all(results)
     
-    def _get_validator_display_name(self, config: Dict[str, Any], validator_type: str, index: int = 0) -> str:
+    def validate_with_print(self, agent_response: str, session_id: str, traces: List[Dict] = None, prefix: str = "", trace_file: Optional[str] = None) -> bool:
+        """Validate and print individual validator results (convenience method)."""
+        return self.validate(agent_response, session_id, traces, prefix, trace_file)
+    
+    def _get_validator_display_name(self, config: Dict[str, Any], validator_type: str) -> str:
         """Generate a display name for a validator."""
         if validator_type == "tool_call":
             tools = config.get("required_tools", [])
-            if tools:
-                return f"Tool call: {', '.join(tools)}"
+            return f"Tool call: {', '.join(tools)}" if tools else "Tool call"
         elif validator_type == "semantic_judge":
             target = config.get("check_target", "agent_response")
-            if target.startswith("tool."):
+            if target.startswith("tool.") and len(target.split(".")) >= 3:
                 parts = target.split(".")
-                if len(parts) >= 3:
-                    return f"Semantic judge ({parts[1]}.{parts[2]})"
+                return f"Semantic judge ({parts[1]}.{parts[2]})"
             return "Semantic judge"
         elif validator_type == "keyword":
             keywords = config.get("keywords", [])
             if keywords:
-                return f"Keywords: {', '.join(keywords[:3])}" + ("..." if len(keywords) > 3 else "")
+                display = ', '.join(keywords[:3])
+                return f"Keywords: {display}{'...' if len(keywords) > 3 else ''}"
+            return "Keywords"
         elif validator_type == "composite":
-            op = config.get("operator", "AND")
-            return f"Composite ({op})"
-        
-        return f"{validator_type} validator"
+            return f"Composite ({config.get('operator', 'AND')})"
+        else:
+            return f"{validator_type} validator"
 
     def score(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> float:
         validators = self.config.get("validators", [])
@@ -1334,8 +1262,7 @@ class CompositeValidator(TestValidator):
             return 1.0
         scores: List[float] = []
         for validator_config in validators:
-            validator_type = validator_config.get("type")
-            validator = self._create_validator(validator_type, validator_config, self.test_config)
+            validator = create_validator(validator_config, self.test_config)
             if validator:
                 try:
                     scores.append(float(validator.score(agent_response, session_id, traces)))
@@ -1343,34 +1270,8 @@ class CompositeValidator(TestValidator):
                     debug_debug("Could not compute validator score, using 0.0")
                     debug_print_exception(e, context="Computing validator score", include_traceback=True)
                     scores.append(0.0)
-        if not scores:
-            return 0.0
-        return sum(scores) / len(scores)
-    
-    def _create_validator(self, validator_type: str, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None) -> Optional[TestValidator]:
-        """Create a validator instance based on type."""
-        if validator_type == "keyword":
-            return KeywordValidator(config, test_config)
-        elif validator_type == "tool_call":
-            return ToolCallValidator(config, test_config)
-        elif validator_type == "file_system":
-            return FileSystemValidator(config, test_config)
-        elif validator_type in ("memory", "mem0_memory", "unified_memory"):
-            # Import memory validators from separate module
-            from benchmark.memory_validators import MemoryValidator, Mem0MemoryValidator, UnifiedMemoryValidator
-            if validator_type == "memory":
-                return MemoryValidator(config, test_config)
-            elif validator_type == "mem0_memory":
-                return Mem0MemoryValidator(config, test_config)
-            elif validator_type == "unified_memory":
-                return UnifiedMemoryValidator(config, test_config)
-        elif validator_type == "semantic_judge":
-            return SemanticJudgeValidator(config, test_config)
-        elif validator_type == "cross_step_semantic_judge":
-            return CrossStepSemanticJudgeValidator(config, test_config)
-        elif validator_type == "composite":
-            return CompositeValidator(config, test_config)
-        return None
+        
+        return sum(scores) / len(scores) if scores else 0.0
 
 
 def create_validator(validator_config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None) -> TestValidator:

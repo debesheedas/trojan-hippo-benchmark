@@ -28,7 +28,7 @@ from agent.agent_core import invoke_agent, clear_session_agent, clear_agent_cach
 from agent.utils import read_trace_events, load_config, ensure_data_directories, set_global_seeds
 from agent.utils import debug_info, debug_debug, debug_print_exception, debug_print_long_content, set_debug_level, DebugLevel, get_debug_level
 from benchmark.test_validators import create_validator, CompositeValidator
-from agent.colored_trace_printer import get_colored_printer
+from agent.utils import get_colored_printer
 from benchmark.benchmark_utils import map_unified_defense_to_backend
 from benchmark.benchmark_utils import (
     get_memory_backend_from_config,
@@ -176,13 +176,16 @@ class TestBench:
         if self.force:
             print(f"Force mode: Will overwrite existing results")
         
+        # Initialize state manager for environment state tracking (used in both static and adaptive modes)
+        from benchmark.environment_state import StateManager
+        self.state_manager = StateManager()
+        
         # Check if adaptive benchmark is enabled
         self.adaptive_enabled = self.config.get("benchmark", {}).get("enable_adaptive_benchmark", False)
         if self.adaptive_enabled:
             # Import adaptive components only when needed
             from benchmark.adaptive_attacks import DSPyOptimizer, OpenEvolveOptimizer
             from agent.attack_utils import compare_attack_bench_files
-            from benchmark.environment_state import StateManager
             
             # Initialize optimization strategies based on config
             self.optimizers = {}
@@ -203,9 +206,6 @@ class TestBench:
             # Cache directory for successful attacks
             self.cache_dir = Path("data/benchmark/attack_bench_cache")
             self.cache_dir.mkdir(exist_ok=True)
-            
-            # Initialize state manager for environment state tracking
-            self.state_manager = StateManager()
 
             # Set up logging for optimizers when running via TestBench
             self._setup_optimizer_logging()
@@ -1185,7 +1185,7 @@ class TestBench:
                                     else:
                                         user_goal_passed = validator.validate(response, session_id, step_traces)
                                         # Print single validator result
-                                        from agent.colored_trace_printer import print_validator_result
+                                        from agent.utils import print_validator_result
                                         validator_type = user_goal_check.get("type", "validator")
                                         print_validator_result(validator_type, "User goal", user_goal_passed)
                                         # Log to trace
@@ -1233,7 +1233,7 @@ class TestBench:
                                     else:
                                         attack_goal_passed = validator.validate(response, session_id, step_traces)
                                         # Print single validator result
-                                        from agent.colored_trace_printer import print_validator_result
+                                        from agent.utils import print_validator_result
                                         validator_type = attack_goal_check.get("type", "validator")
                                         print_validator_result(validator_type, "Attack goal", attack_goal_passed)
                                         # Log to trace
@@ -1309,7 +1309,7 @@ class TestBench:
                                     else:
                                         step_passed = validator.validate(response, session_id, step_traces)
                                         # Print single validator result
-                                        from agent.colored_trace_printer import print_validator_result
+                                        from agent.utils import print_validator_result
                                         validator_type = step["success_check"].get("type", "validator")
                                         print_validator_result(validator_type, "Success check", step_passed)
                                         # Log to trace

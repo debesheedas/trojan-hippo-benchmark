@@ -18,11 +18,13 @@ Usage:
     python scripts/consolidate_results.py --model gpt-5-mini
 """
 
-import json
+import argparse
 import csv
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Try to import plotting libraries (optional)
 try:
@@ -41,8 +43,19 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR / "src"))
 
-from benchmark.benchmark_utils import UNIFIED_DEFENSE_TYPES
-from benchmark.benchmark_utils import get_results_dir
+from benchmark.benchmark_utils import (
+    UNIFIED_DEFENSE_TYPES,
+    get_combination_log_path,
+    get_results_dir,
+)
+
+# Constants
+MEMORY_BACKENDS = ["none", "explicit", "mem0", "rag", "context"]
+BACKEND_LABELS = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
+VALID_ATTACK_TYPES = [
+    "benign", "direct", "indirect", "memory_only", "assistant_responses",
+    "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"
+]
 
 
 def parse_result_file(result_file: Path) -> Optional[Dict]:
@@ -59,9 +72,10 @@ def parse_result_file(result_file: Path) -> Optional[Dict]:
         else:
             # Fallback: count steps with success_check
             steps = result.get("steps", [])
+            excluded_types = {"start_new_session", "insert_attack_email"}
             test_steps = [
                 step for step in steps 
-                if (step.get("step_type") not in ["start_new_session", "insert_attack_email"]
+                if (step.get("step_type") not in excluded_types
                     and (step.get("success_check") is not None 
                          or step.get("user_goal") is not None
                          or step.get("attack_goal") is not None))
@@ -69,8 +83,8 @@ def parse_result_file(result_file: Path) -> Optional[Dict]:
             total_steps = len(test_steps)
             passed_steps = sum(1 for step in test_steps if step.get("passed") is True)
         
-        # Check execution_success flag
-        execution_success = result.get("execution_success", True)  # Default to True for backward compatibility
+        # Check execution_success flag (default to True for backward compatibility)
+        execution_success = result.get("execution_success", True)
         execution_errors = result.get("execution_errors", [])
         
         return {
@@ -93,31 +107,31 @@ def parse_log_file(log_file: Path) -> Optional[Dict]:
     
     try:
         with open(log_file, 'r', encoding='utf-8') as f:
-            log_content = f.read()
+            lines = f.readlines()
         
         errors = []
-        warnings = []
         
         # Look for error patterns
-        lines = log_content.split('\n')
-        for i, line in enumerate(lines):
+        for i, line in enumerate(lines, start=1):
             line_lower = line.lower()
+            line_stripped = line.strip()
+            
             # Check for API errors
-            if "rate limit error (final)" in line_lower or "connection error (final" in line_lower:
-                errors.append(f"Line {i+1}: {line.strip()}")
-            elif "api error" in line_lower and "final" in line_lower:
-                errors.append(f"Line {i+1}: {line.strip()}")
-            elif "error:" in line_lower or "exception:" in line_lower:
+            if any(phrase in line_lower for phrase in [
+                "rate limit error (final)",
+                "connection error (final",
+                "api error"
+            ]) and "final" in line_lower:
+                errors.append(f"Line {i}: {line_stripped}")
+            elif ("error:" in line_lower or "exception:" in line_lower):
                 # Check if it's a real error (not just a test failure)
                 if "traceback" in line_lower or "failed" not in line_lower[:50]:
-                    errors.append(f"Line {i+1}: {line.strip()}")
-            elif "warning:" in line_lower and ("error" in line_lower or "failed" in line_lower):
-                warnings.append(f"Line {i+1}: {line.strip()}")
+                    errors.append(f"Line {i}: {line_stripped}")
         
         return {
             "has_errors": len(errors) > 0,
             "errors": errors,
-            "warnings": warnings
+            "warnings": []
         }
     except Exception as e:
         return {"has_errors": False, "errors": [f"Could not parse log: {e}"], "warnings": []}
@@ -173,19 +187,23 @@ def discover_models_and_attack_types(results_base_dir: Path) -> Tuple[List[str],
     
     # Structure: {model_name}/{memory_backend}/{defense_type}/{attack_type}/
     for model_dir in results_base_dir.iterdir():
-        if model_dir.is_dir():
-            models.add(model_dir.name)
+        if not model_dir.is_dir():
+            continue
             
-            # Look for attack types in subdirectories
-            for backend_dir in model_dir.iterdir():
-                if backend_dir.is_dir():
-                    for defense_dir in backend_dir.iterdir():
-                        if defense_dir.is_dir():
-                            for attack_dir in defense_dir.iterdir():
-                                if attack_dir.is_dir() and attack_dir.name in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"]:
-                                    attack_types.add(attack_dir.name)
+        models.add(model_dir.name)
+        
+        # Look for attack types in subdirectories
+        for backend_dir in model_dir.iterdir():
+            if not backend_dir.is_dir():
+                continue
+            for defense_dir in backend_dir.iterdir():
+                if not defense_dir.is_dir():
+                    continue
+                for attack_dir in defense_dir.iterdir():
+                    if attack_dir.is_dir() and attack_dir.name in VALID_ATTACK_TYPES:
+                        attack_types.add(attack_dir.name)
     
-    return (sorted(list(models)), sorted(list(attack_types)))
+    return (sorted(models), sorted(attack_types))
 
 
 def collect_all_data(
@@ -199,13 +217,10 @@ def collect_all_data(
     Returns:
         Dictionary: {defense_type: {memory_backend: (passed, total, success_rate, has_execution_errors)}}
     """
-    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
-    defense_types = UNIFIED_DEFENSE_TYPES
-    
     data = {}
-    for defense_type in defense_types:
+    for defense_type in UNIFIED_DEFENSE_TYPES:
         data[defense_type] = {}
-        for backend in memory_backends:
+        for backend in MEMORY_BACKENDS:
             # Treat "none" backend as a regular backend - collect results for each defense type
             # This allows provable_policy and other defenses to work correctly even without memory
             passed, total, rate, has_errors = collect_results_for_combination(
@@ -231,40 +246,50 @@ def generate_csv(
     """
     output_file = output_dir / f"{model_name}_{attack_type}_consolidated.csv"
     
-    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
-    defense_types = UNIFIED_DEFENSE_TYPES
-    
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         
         # Header row
         header = ["Defense Type"]
-        for backend in memory_backends:
-            backend_label = "No Memory" if backend == "none" else backend.capitalize()
+        for backend in MEMORY_BACKENDS:
+            backend_label = BACKEND_LABELS[MEMORY_BACKENDS.index(backend)]
             header.append(f"{backend_label} (%)")
         writer.writerow(header)
         
         # Data rows
-        for defense_type in defense_types:
+        for defense_type in UNIFIED_DEFENSE_TYPES:
             row = [defense_type.replace("_", " ").title()]
-            for backend in memory_backends:
+            for backend in MEMORY_BACKENDS:
                 _, total_steps, rate, has_errors = data[defense_type][backend]
                 if has_errors:
-                    # Show "ERR" instead of percentage when execution errors occurred
                     row.append("ERR")
                 elif total_steps > 0:
-                    # Show percentage even if 0% (results exist, just 0% success rate)
                     row.append(f"{rate:.1f}%")
                 else:
-                    # No results available
                     row.append("-")
             writer.writerow(row)
     
     return output_file
 
 
-# Bar chart generation temporarily removed per user request
-# def generate_bar_chart(...) - commented out
+def _prepare_heatmap_data(
+    data: Dict[str, Dict[str, Tuple[int, int, float, bool]]]
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Prepare data matrices for heatmap visualization."""
+    rates_matrix = []
+    has_errors_matrix = []
+    
+    for defense_type in UNIFIED_DEFENSE_TYPES:
+        rate_row = []
+        error_row = []
+        for backend in MEMORY_BACKENDS:
+            _, _, rate, has_errors = data[defense_type][backend]
+            rate_row.append(rate)
+            error_row.append(has_errors)
+        rates_matrix.append(rate_row)
+        has_errors_matrix.append(error_row)
+    
+    return np.array(rates_matrix), np.array(has_errors_matrix)
 
 
 def generate_heatmap(
@@ -280,26 +305,9 @@ def generate_heatmap(
     if not PLOTTING_AVAILABLE:
         raise ImportError("matplotlib and seaborn are required for plotting. Install with: pip install matplotlib seaborn")
     
-    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
-    backend_labels = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
-    defense_types = UNIFIED_DEFENSE_TYPES
-    defense_labels = [dt.replace("_", " ").title() for dt in defense_types]
+    defense_labels = [dt.replace("_", " ").title() for dt in UNIFIED_DEFENSE_TYPES]
     
-    # Prepare data matrix (use -1 for error cases, which we'll display as "ERR")
-    rates_matrix = []
-    has_errors_matrix = []
-    for defense_type in defense_types:
-        rate_row = []
-        error_row = []
-        for backend in memory_backends:
-            _, _, rate, has_errors = data[defense_type][backend]
-            rate_row.append(rate)
-            error_row.append(has_errors)
-        rates_matrix.append(rate_row)
-        has_errors_matrix.append(error_row)
-    
-    rates_matrix = np.array(rates_matrix)
-    has_errors_matrix = np.array(has_errors_matrix)
+    rates_matrix, has_errors_matrix = _prepare_heatmap_data(data)
     
     # Create heatmap
     _, ax = plt.subplots(figsize=(10, 8))
@@ -308,8 +316,7 @@ def generate_heatmap(
     display_matrix = rates_matrix.copy().astype(float)
     display_matrix[has_errors_matrix] = np.nan
     
-    # Create heatmap with custom colormap
-    # Use a colormap that shows errors differently
+    # Create heatmap
     sns.heatmap(display_matrix, 
                 annot=True, 
                 fmt='.1f',
@@ -317,16 +324,16 @@ def generate_heatmap(
                 vmin=0, 
                 vmax=100,
                 cbar_kws={'label': 'Success Rate (%)'},
-                xticklabels=backend_labels,
+                xticklabels=BACKEND_LABELS,
                 yticklabels=defense_labels,
                 linewidths=1,
                 linecolor='gray',
                 ax=ax,
-                mask=has_errors_matrix)  # Mask error cells
+                mask=has_errors_matrix)
     
-    # Add custom annotations for error cases (overlay "ERR" text)
-    for i in range(len(defense_types)):
-        for j in range(len(memory_backends)):
+    # Add custom annotations for error cases
+    for i in range(len(UNIFIED_DEFENSE_TYPES)):
+        for j in range(len(MEMORY_BACKENDS)):
             if has_errors_matrix[i, j]:
                 ax.text(j + 0.5, i + 0.5, 'ERR', 
                        ha='center', va='center', fontsize=10, fontweight='bold', 
@@ -364,18 +371,15 @@ def generate_combined_heatmaps_subplot(
     if not PLOTTING_AVAILABLE:
         raise ImportError("matplotlib and seaborn are required for plotting. Install with: pip install matplotlib seaborn")
     
-    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
-    backend_labels = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
-    defense_types = UNIFIED_DEFENSE_TYPES
-    defense_labels = [dt.replace("_", " ").title() for dt in defense_types]
+    defense_labels = [dt.replace("_", " ").title() for dt in UNIFIED_DEFENSE_TYPES]
     
     # Get all attack types sorted
     attack_types = sorted(all_data.keys())
     n_suites = len(attack_types)
     
     # Calculate grid dimensions
-    n_cols = min(3, n_suites)  # 3 columns max
-    n_rows = (n_suites + n_cols - 1) // n_cols  # Ceiling division
+    n_cols = min(3, n_suites)
+    n_rows = (n_suites + n_cols - 1) // n_cols
     
     # Create figure with subplots
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
@@ -389,21 +393,7 @@ def generate_combined_heatmaps_subplot(
         ax = axes[idx]
         data = all_data[attack_type]
         
-        # Prepare data matrix
-        rates_matrix = []
-        has_errors_matrix = []
-        for defense_type in defense_types:
-            rate_row = []
-            error_row = []
-            for backend in memory_backends:
-                _, _, rate, has_errors = data[defense_type][backend]
-                rate_row.append(rate)
-                error_row.append(has_errors)
-            rates_matrix.append(rate_row)
-            has_errors_matrix.append(error_row)
-        
-        rates_matrix = np.array(rates_matrix)
-        has_errors_matrix = np.array(has_errors_matrix)
+        rates_matrix, has_errors_matrix = _prepare_heatmap_data(data)
         
         # For error cases, set to NaN
         display_matrix = rates_matrix.copy().astype(float)
@@ -417,7 +407,7 @@ def generate_combined_heatmaps_subplot(
                     vmin=0, 
                     vmax=100,
                     cbar_kws={'label': 'Success Rate (%)'},
-                    xticklabels=backend_labels,
+                    xticklabels=BACKEND_LABELS,
                     yticklabels=defense_labels,
                     linewidths=0.5,
                     linecolor='gray',
@@ -425,8 +415,8 @@ def generate_combined_heatmaps_subplot(
                     mask=has_errors_matrix)
         
         # Add error annotations
-        for i in range(len(defense_types)):
-            for j in range(len(memory_backends)):
+        for i in range(len(UNIFIED_DEFENSE_TYPES)):
+            for j in range(len(MEMORY_BACKENDS)):
                 if has_errors_matrix[i, j]:
                     ax.text(j + 0.5, i + 0.5, 'ERR', 
                            ha='center', va='center', fontsize=8, fontweight='bold', 
@@ -473,20 +463,16 @@ def generate_average_heatmap(
     if not PLOTTING_AVAILABLE:
         raise ImportError("matplotlib and seaborn are required for plotting. Install with: pip install matplotlib seaborn")
     
-    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
-    backend_labels = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
-    defense_types = UNIFIED_DEFENSE_TYPES
-    defense_labels = [dt.replace("_", " ").title() for dt in defense_types]
+    defense_labels = [dt.replace("_", " ").title() for dt in UNIFIED_DEFENSE_TYPES]
     
     # Calculate averages across all suites
-    # For each defense/backend combination, average the rates (excluding error cases)
     rates_matrix = []
     has_errors_matrix = []
     
-    for defense_type in defense_types:
+    for defense_type in UNIFIED_DEFENSE_TYPES:
         rate_row = []
         error_row = []
-        for backend in memory_backends:
+        for backend in MEMORY_BACKENDS:
             rates = []
             has_any_errors = False
             
@@ -496,11 +482,9 @@ def generate_average_heatmap(
                 if has_errors:
                     has_any_errors = True
                 else:
-                    # Only include non-error rates in average
                     rates.append(rate)
             
             if has_any_errors:
-                # If any suite has errors, mark as error
                 avg_rate = 0.0
                 error_row.append(True)
             elif len(rates) > 0:
@@ -533,7 +517,7 @@ def generate_average_heatmap(
                 vmin=0, 
                 vmax=100,
                 cbar_kws={'label': 'Average Success Rate (%)'},
-                xticklabels=backend_labels,
+                xticklabels=BACKEND_LABELS,
                 yticklabels=defense_labels,
                 linewidths=1,
                 linecolor='gray',
@@ -541,8 +525,8 @@ def generate_average_heatmap(
                 mask=has_errors_matrix)
     
     # Add error annotations
-    for i in range(len(defense_types)):
-        for j in range(len(memory_backends)):
+    for i in range(len(UNIFIED_DEFENSE_TYPES)):
+        for j in range(len(MEMORY_BACKENDS)):
             if has_errors_matrix[i, j]:
                 ax.text(j + 0.5, i + 0.5, 'ERR', 
                        ha='center', va='center', fontsize=10, fontweight='bold', 
@@ -565,8 +549,6 @@ def generate_average_heatmap(
 
 def main():
     """Main function to consolidate all results."""
-    import argparse
-    
     parser = argparse.ArgumentParser(
         description="Consolidate benchmark results into CSV files and visualizations"
     )
@@ -594,7 +576,7 @@ def main():
     parser.add_argument(
         "--suite",
         type=str,
-        choices=["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"],
+        choices=VALID_ATTACK_TYPES,
         help="Specific test suite to consolidate (default: all suites)"
     )
     
@@ -750,16 +732,13 @@ def generate_combined_csv(
     """
     output_file = output_dir / f"{model_name}_all_suites_combined.csv"
     
-    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
-    defense_types = UNIFIED_DEFENSE_TYPES
-    
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         
         # Header row
         header = ["Test Suite", "Defense Type"]
-        for backend in memory_backends:
-            backend_label = "No Memory" if backend == "none" else backend.capitalize()
+        for backend in MEMORY_BACKENDS:
+            backend_label = BACKEND_LABELS[MEMORY_BACKENDS.index(backend)]
             header.append(f"{backend_label} (%)")
         writer.writerow(header)
         
@@ -773,9 +752,9 @@ def generate_combined_csv(
                 writer.writerow([])
             
             # Write data rows for this suite
-            for defense_type in defense_types:
+            for defense_type in UNIFIED_DEFENSE_TYPES:
                 row = [suite_label, defense_type.replace("_", " ").title()]
-                for backend in memory_backends:
+                for backend in MEMORY_BACKENDS:
                     _, total_steps, rate, has_errors = data[defense_type][backend]
                     if has_errors:
                         row.append("ERR")
@@ -804,23 +783,20 @@ def generate_average_summary_csv(
     """
     output_file = output_dir / f"{model_name}_average_summary.csv"
     
-    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
-    defense_types = UNIFIED_DEFENSE_TYPES
-    
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         
         # Header row
         header = ["Defense Type"]
-        for backend in memory_backends:
-            backend_label = "No Memory" if backend == "none" else backend.capitalize()
+        for backend in MEMORY_BACKENDS:
+            backend_label = BACKEND_LABELS[MEMORY_BACKENDS.index(backend)]
             header.append(f"{backend_label} (%)")
         writer.writerow(header)
         
         # Calculate averages and write rows
-        for defense_type in defense_types:
+        for defense_type in UNIFIED_DEFENSE_TYPES:
             row = [defense_type.replace("_", " ").title()]
-            for backend in memory_backends:
+            for backend in MEMORY_BACKENDS:
                 rates = []
                 has_any_errors = False
                 
@@ -830,7 +806,6 @@ def generate_average_summary_csv(
                     if has_errors:
                         has_any_errors = True
                     else:
-                        # Only include non-error rates in average
                         rates.append(rate)
                 
                 if has_any_errors:
@@ -858,23 +833,15 @@ def generate_error_summary(
     Returns:
         Path to error summary file, or None if no errors found
     """
-    # Import get_combination_log_path which uses internal function
-    from benchmark.benchmark_utils import get_combination_log_path
-    
     logs_base_dir = Path("data/benchmark/logs")
-    memory_backends = ["explicit", "mem0", "rag", "context", "none"]
-    defense_types = UNIFIED_DEFENSE_TYPES
-    
     errors_found = []
     
-    for memory_backend in memory_backends:
-        for unified_defense in defense_types:
-            # Treat "none" backend as a regular backend - check all defense types
+    for memory_backend in MEMORY_BACKENDS:
+        for unified_defense in UNIFIED_DEFENSE_TYPES:
             # Check result files for execution_success flag
             results_dir = get_results_dir(memory_backend, unified_defense, model_name, attack_type, results_base_dir)
             if results_dir.exists():
-                result_files = list(results_dir.glob("*.json"))
-                for result_file in result_files:
+                for result_file in results_dir.glob("*.json"):
                     result_data = parse_result_file(result_file)
                     if result_data and not result_data.get("execution_success", True):
                         errors_found.append({
@@ -904,17 +871,18 @@ def generate_error_summary(
                 })
     
     if not errors_found:
-        return None  # No errors found
+        return None
     
     # Generate error summary file
     summary_file = output_dir / f"{model_name}_{attack_type}_execution_errors.txt"
     with open(summary_file, 'w', encoding='utf-8') as f:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         f.write(f"{'='*80}\n")
         f.write(f"EXECUTION ERROR SUMMARY\n")
         f.write(f"{'='*80}\n")
         f.write(f"Model: {model_name}\n")
         f.write(f"Test Suite: {attack_type}\n")
-        f.write(f"Generated: {Path(__file__).stat().st_mtime}\n")
+        f.write(f"Generated: {timestamp}\n")
         f.write(f"{'='*80}\n\n")
         f.write(f"WARNING: {len(errors_found)} combination(s) had execution errors!\n")
         f.write(f"   These results may be unreliable. Rerun these combinations.\n\n")
@@ -928,10 +896,11 @@ def generate_error_summary(
             if 'log_file' in error:
                 f.write(f"Log File: {error['log_file']}\n")
             f.write(f"\nErrors:\n")
-            for err in error.get('errors', [])[:10]:  # Limit to first 10 errors
+            error_list = error.get('errors', [])
+            for err in error_list[:10]:  # Limit to first 10 errors
                 f.write(f"  - {err}\n")
-            if len(error.get('errors', [])) > 10:
-                f.write(f"  ... and {len(error['errors']) - 10} more errors\n")
+            if len(error_list) > 10:
+                f.write(f"  ... and {len(error_list) - 10} more errors\n")
             f.write(f"\n")
         
         f.write(f"{'='*80}\n")

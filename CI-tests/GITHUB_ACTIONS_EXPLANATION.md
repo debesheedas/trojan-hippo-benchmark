@@ -18,6 +18,9 @@ The GitHub Actions workflow runs a regression test that:
 - Creates `.env` file with `OPENAI_API_KEY` from GitHub Secrets
 
 ### 2. Run Benchmark
+
+The workflow runs benchmarks for multiple test cases. For each test case:
+
 ```bash
 python scripts/run_benchmark.py 
   --test CI-tests/testcases/test1.json 
@@ -29,7 +32,7 @@ python scripts/run_benchmark.py
 ```
 
 **What this does:**
-- Runs the test file `CI-tests/testcases/test1.json` for **all 24 combinations** (5 backends × 5 defenses, minus 1 invalid combination)
+- Runs each test file (e.g., `test1.json`, `test2.json`) for **all 24 combinations** (5 backends × 5 defenses, minus 1 invalid combination)
 - Uses the **exact same code path** as normal benchmarks (no special test code)
 - Saves results to `CI-tests/results/` with structure:
   ```
@@ -38,19 +41,26 @@ python scripts/run_benchmark.py
       {memory_backend}/
         {defense_type}/
           {attack_type}/
-            test1.json
+            {test_file_name}.json
   ```
 
 ### 3. Compare Results
+
+For each test case, the workflow compares results:
+
 ```bash
-python CI-tests/compare_results.py \
-  --results-dir CI-tests/results \
+python CI-tests/compare_results.py 
+  --results-dir CI-tests/results 
   --test-file CI-tests/testcases/test1.json
 ```
 
 **What this does:**
 - Reads each result file from `CI-tests/results/`
-- Compares `overall_success` from each result against `CI-tests/ground_truth.json`
+- Auto-detects the ground truth file:
+  - `test1.json` → `ground_truth/test1.json`
+  - `test2.json` → `ground_truth/test2.json`
+  - `testN.json` → `ground_truth/testN.json`
+- Compares `overall_success` from each result against the corresponding ground truth file
 - Reports mismatches
 - Exits with code 0 (success) if all match, 1 (failure) if any don't match
 
@@ -94,7 +104,14 @@ The `compare_results.py` script uses the same `get_result_path()` function that 
 
 ## Ground Truth Format
 
-`CI-tests/ground_truth.json` contains expected results:
+Each test case has its own ground truth file in the `ground_truth/` directory:
+- `CI-tests/ground_truth/test1.json` - Expected results for `test1.json`
+- `CI-tests/ground_truth/test2.json` - Expected results for `test2.json`
+- `CI-tests/ground_truth/{test_name}.json` - Expected results for other tests
+
+The `compare_results.py` script automatically detects the correct ground truth file based on the test file name (e.g., `test1.json` → `ground_truth/test1.json`).
+
+Each ground truth file contains expected results:
 ```json
 {
   "none": {
