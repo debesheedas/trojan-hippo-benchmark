@@ -860,9 +860,9 @@ def run_all_combinations(
         if summary["failed_combinations"] > 0:
             print(f"\n{summary['failed_combinations']} combination(s) failed completely (could not run).")
     else:
-        print(f"{'SUCCESS' * 40}")
-        print("SUCCESS: All combinations completed without EXECUTION ERRORS. Results are reliable!")
-        print(f"{'SUCCESS' * 40}")
+        print(f"{'-' * 40}")
+        print("-: All combinations completed without EXECUTION ERRORS. Results are reliable!")
+        print(f"{'-' * 40}")
         print(f"\nNote: Test failures (some tests passing, some failing) are expected and normal.")
         print(f"      Only execution errors (API failures, connection errors, etc.) are reported here.")
     
@@ -1103,10 +1103,33 @@ Examples:
         )
     
     # Exit with appropriate code
-    if result.get("success") and result.get("tests_failed", 0) == 0:
-        sys.exit(0)
+    # For CI/CD: Only exit with error code if execution failed (API errors, crashes, etc.)
+    # Test validation failures are expected and are checked by compare_results.py step
+    if running_multiple_combinations:
+        # Multiple combinations: Check for execution errors (not test validation failures)
+        # Execution errors are tracked in combinations_with_errors list and failed_combinations count
+        combinations_with_errors = result.get("combinations_with_errors", [])
+        failed_combinations = result.get("failed_combinations", 0)
+        has_execution_errors = (
+            len(combinations_with_errors) > 0 or 
+            failed_combinations > 0
+        )
+        if has_execution_errors:
+            print("\nExiting with code 1 due to execution errors (API failures, crashes, etc.)")
+            sys.exit(1)
+        else:
+            print("\nExiting with code 0 - all combinations executed successfully")
+            print("Note: Test validation results will be checked by compare_results.py step")
+            sys.exit(0)
     else:
-        sys.exit(1)
+        # Single combination: Check if execution succeeded (not test validation results)
+        if result.get("success"):
+            print("\nExiting with code 0 - execution succeeded")
+            print("Note: Test validation results will be checked by compare_results.py step")
+            sys.exit(0)
+        else:
+            print(f"\nExiting with code 1 due to execution error: {result.get('error', 'Unknown error')}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
