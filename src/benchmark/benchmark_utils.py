@@ -144,6 +144,7 @@ def get_result_path(
     Generate result file path using unified structure.
     
     Path structure: {model_name}/{memory_backend}/{defense_type}/{attack_type}/{test_file}.json
+    For attack_bench tests: {model_name}/{memory_backend}/{defense_type}/{test_file}.json (no attack_type folder)
     
     Args:
         memory_backend: Memory backend name ("explicit", "mem0", "rag", or "none" for disable_memory)
@@ -160,15 +161,29 @@ def get_result_path(
         memory_backend, unified_defense, model_name, attack_type
     )
     
-    # Construct path: results/{model_name}/{memory_backend}/{defense_folder}/{attack_type}/{test_file_name}.json
-    result_path = (
-        results_base_dir /
-        model_name /
-        backend_for_path /
-        defense_folder /
-        attack_type /
-        test_file.name
-    )
+    # Check if test is in attack_bench (skip attack_type folder for attack_bench tests)
+    test_file_str = str(test_file)
+    is_attack_bench = "attack_bench" in test_file_str
+    
+    if is_attack_bench:
+        # For attack_bench tests, skip the attack_type folder (all are indirect attacks)
+        result_path = (
+            results_base_dir /
+            model_name /
+            backend_for_path /
+            defense_folder /
+            test_file.name
+        )
+    else:
+        # Construct path: results/{model_name}/{memory_backend}/{defense_folder}/{attack_type}/{test_file_name}.json
+        result_path = (
+            results_base_dir /
+            model_name /
+            backend_for_path /
+            defense_folder /
+            attack_type /
+            test_file.name
+        )
     
     return result_path
 
@@ -185,6 +200,7 @@ def get_log_path(
     Generate log file path using the same structure as results.
     
     Path structure: {model_name}/{memory_backend}/{defense_type}/{attack_type}/{test_file}.log
+    For attack_bench tests: {model_name}/{memory_backend}/{defense_type}/{test_file}.log (no attack_type folder)
     
     Args:
         memory_backend: Memory backend name ("explicit", "mem0", "rag", or "none" for disable_memory)
@@ -201,15 +217,29 @@ def get_log_path(
         memory_backend, unified_defense, model_name, attack_type
     )
     
-    # Construct path: logs/{model_name}/{memory_backend}/{defense_folder}/{attack_type}/{test_file_name}.log
-    log_path = (
-        logs_base_dir /
-        model_name /
-        backend_for_path /
-        defense_folder /
-        attack_type /
-        test_file.with_suffix('.log').name
-    )
+    # Check if test is in attack_bench (skip attack_type folder for attack_bench tests)
+    test_file_str = str(test_file)
+    is_attack_bench = "attack_bench" in test_file_str
+    
+    if is_attack_bench:
+        # For attack_bench tests, skip the attack_type folder (all are indirect attacks)
+        log_path = (
+            logs_base_dir /
+            model_name /
+            backend_for_path /
+            defense_folder /
+            test_file.with_suffix('.log').name
+        )
+    else:
+        # Construct path: logs/{model_name}/{memory_backend}/{defense_folder}/{attack_type}/{test_file_name}.log
+        log_path = (
+            logs_base_dir /
+            model_name /
+            backend_for_path /
+            defense_folder /
+            attack_type /
+            test_file.with_suffix('.log').name
+        )
     
     return log_path
 

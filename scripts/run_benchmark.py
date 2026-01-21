@@ -974,7 +974,7 @@ Examples:
         "--model",
         type=str,
         dest="target_model_name",
-        help="Target model name (e.g., 'gpt-5-mini', 'gpt-4o'). Overrides config value."
+        help="Target model name (e.g., 'gpt-5-mini', 'gpt-4o-mini', 'gpt-4o'). Overrides config value."
     )
     
     parser.add_argument(

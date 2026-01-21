@@ -68,7 +68,7 @@ def debug_print(
     truncate: bool = True,
     max_length: int = 200,
     prefix: str = "",
-    file=sys.stdout,
+    file=None,
     flush: bool = True
 ) -> None:
     """
@@ -80,7 +80,7 @@ def debug_print(
         truncate: Whether to truncate long messages
         max_length: Maximum length before truncation (default: 200)
         prefix: Optional prefix to add before message
-        file: File to write to (default: stdout)
+        file: File to write to (default: sys.stdout, but uses current stdout at call time)
         flush: Whether to flush output immediately
     """
     current_level = get_debug_level()
@@ -91,7 +91,9 @@ def debug_print(
         message = message[:max_length] + "..."
     
     output = f"{prefix}{message}" if prefix else message
-    print(output, file=file, flush=flush)
+    # Use current sys.stdout (which may be redirected to log file) instead of default parameter
+    output_file = file if file is not None else sys.stdout
+    print(output, file=output_file, flush=flush)
 
 
 def debug_info(message: str, truncate: bool = True, max_length: int = 200, **kwargs) -> None:

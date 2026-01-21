@@ -162,6 +162,9 @@ class TestBench:
         self.results_base_dir = results_base_dir
         self.results_base_dir.mkdir(parents=True, exist_ok=True)
         
+        # Store default results base dir for attack_bench detection
+        self.default_results_base_dir = self.results_base_dir
+        
         # Unified test directory
         test_dir = benchmark_config.get("test_dir", "data/benchmark/tests")
         self.test_bench_dir = Path(test_dir)
@@ -208,7 +211,11 @@ class TestBench:
             self.cache_dir.mkdir(exist_ok=True)
 
             # Set up logging for optimizers when running via TestBench
-            self._setup_optimizer_logging()
+            # Note: We don't initialize logging here - it will be set up in run_test_from_file()
+            # after the test log file is created, so all logs go to the same file
+            self.logger = logging.getLogger("adaptive_benchmark")
+            self.logger.setLevel(logging.DEBUG)
+            # Don't add handlers here - they'll be added in run_test_from_file() with the correct log file
             for optimizer in self.optimizers.values():
                 optimizer.set_logger(self.logger)
             
@@ -461,30 +468,46 @@ class TestBench:
             debug_info("Could not print mem0 memories")
             debug_print_exception(e, context="Printing mem0 memories", include_traceback=True)
     
-    def _setup_optimizer_logging(self):
-        """Initialize a file logger for optimization runs when using TestBench."""
+    def _setup_optimizer_logging(self, log_file_path: Optional[Path] = None):
+        """
+        Initialize a file logger for optimization runs when using TestBench.
+        
+        Args:
+            log_file_path: Path to log file. If None, uses StreamHandler to write to stdout 
+                          (which is redirected to test log file). If provided, logs will go 
+                          to the same file as the test logs (consolidated logging).
+                          NOTE: No separate log file is created - all logs go to the test log file.
+        """
         try:
-            log_dir = Path("logs")
-            log_dir.mkdir(exist_ok=True)
             self.logger = logging.getLogger("adaptive_benchmark")
             self.logger.setLevel(logging.DEBUG)
             # Clear existing handlers to avoid duplication
             for h in self.logger.handlers[:]:
                 self.logger.removeHandler(h)
-            from datetime import datetime
-            # Use current time for unique log file per run
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_file = log_dir / f"adaptive_benchmark_{timestamp}.log"
-            file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')  # 'w' mode to overwrite/create new file
-            file_handler.setLevel(logging.DEBUG)
-            console_handler = logging.StreamHandler()
-            console_handler.setLevel(logging.INFO)
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            file_handler.setFormatter(formatter)
-            console_handler.setFormatter(formatter)
-            self.logger.addHandler(file_handler)
-            self.logger.addHandler(console_handler)
-            self.logger.info("Logging initialized from TestBench. Detailed logs: %s", log_file)
+            
+            if log_file_path:
+                # Use the same log file as the test (consolidated logging)
+                log_file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')  # 'a' mode to append to existing file
+                file_handler.setLevel(logging.DEBUG)
+                formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                file_handler.setFormatter(formatter)
+                self.logger.addHandler(file_handler)
+                # Also add StreamHandler to write to stdout (which is redirected to log file)
+                console_handler = logging.StreamHandler(sys.stdout)
+                console_handler.setLevel(logging.DEBUG)
+                console_handler.setFormatter(formatter)
+                self.logger.addHandler(console_handler)
+                self.logger.info("Optimizer logging initialized - logs will be written to: %s", log_file_path)
+            else:
+                # No log file provided - don't create a separate one
+                # Just use StreamHandler to write to stdout (which will be redirected to test log file)
+                console_handler = logging.StreamHandler(sys.stdout)
+                console_handler.setLevel(logging.DEBUG)
+                formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                console_handler.setFormatter(formatter)
+                self.logger.addHandler(console_handler)
+                self.logger.info("Optimizer logging initialized - logs will be written to stdout (redirected to test log file)")
         except Exception as e:
             debug_info("Failed to initialize optimizer logging")
             debug_print_exception(e, context="Initializing optimizer logging", include_traceback=True)
@@ -693,12 +716,30 @@ class TestBench:
                 debug_print_exception(e, context=f"Cleaning up test environment {test_dir.name}", include_traceback=True)
                 logging.warning(f"Failed to clean up test environment {test_dir}: {e}")
         
+    def _get_results_base_dir_for_test(self, test_file: Path) -> Path:
+        """Get the appropriate results base directory based on test file location."""
+        test_file_str = str(test_file)
+        if "attack_bench" in test_file_str:
+            # For attack_bench tests, use attack_results instead of results
+            # Replace "results" with "attack_results" in the path
+            if "results" in str(self.default_results_base_dir):
+                attack_results_dir = Path(str(self.default_results_base_dir).replace("results", "attack_results"))
+            else:
+                # Fallback: construct attack_results path
+                attack_results_dir = self.default_results_base_dir.parent / "attack_results"
+            attack_results_dir.mkdir(parents=True, exist_ok=True)
+            return attack_results_dir
+        return self.default_results_base_dir
+    
     def run_test_from_file(self, test_file: Path) -> Dict[str, Any]:
         """Run a single test from a JSON file (adaptive or static based on config)."""
         # DEBUG: Print to original stdout before redirecting (helps diagnose if we get here)
         import sys
         original_stdout_before_redirect = sys.stdout
         debug_debug(f"run_test_from_file() called for test_file={test_file}", file=original_stdout_before_redirect)
+        
+        # Determine results base dir for this test (attack_bench uses attack_results)
+        results_base_dir_for_test = self._get_results_base_dir_for_test(test_file)
         
         # Load test definition to determine attack_type for log path
         with open(test_file, 'r', encoding='utf-8') as f:
@@ -733,6 +774,13 @@ class TestBench:
         debug_info(f"Log file opened: {log_path}")
         debug_info(f"Starting test: {test_file.name}")
         debug_info(f"Memory backend: {self.memory_backend_name}, Defense: {self.unified_defense}")
+        
+        # Update optimizer logging to use the same log file (consolidated logging)
+        if self.adaptive_enabled and hasattr(self, 'logger'):
+            self._setup_optimizer_logging(log_file_path=log_path)
+            # Update logger for all optimizers
+            for optimizer in self.optimizers.values():
+                optimizer.set_logger(self.logger)
         
         try:
             if self.adaptive_enabled:
@@ -798,6 +846,9 @@ class TestBench:
         # Use helper function to determine attack_type (handles memory_only tests)
         attack_type = determine_attack_type(test_file, test_def)
         
+        # Get results base dir for this test (attack_bench uses attack_results)
+        results_base_dir_for_test = self._get_results_base_dir_for_test(test_file)
+        
         # Check if result already exists (result caching)
         if should_skip_test(
             self.memory_backend_name,
@@ -806,7 +857,7 @@ class TestBench:
             attack_type,
             test_file,
             self.force,
-            self.results_base_dir
+            results_base_dir_for_test
         ):
             result_path = get_result_path(
                 self.memory_backend_name,
@@ -814,7 +865,7 @@ class TestBench:
                 self.model_name,
                 attack_type,
                 test_file,
-                self.results_base_dir
+                results_base_dir_for_test
             )
             print(f"Skipping {test_file.name} - result already exists at {result_path}")
             print(f"   Use --force to overwrite")
@@ -1411,9 +1462,16 @@ class TestBench:
                             step_result["success_check"] = step["success_check"]
                         if is_attack_bench:
                             if "user_goal" in step:
-                                step_result["user_goal"] = step["user_goal"]
+                                step_result["user_goal"] = {
+                                    "description": step["user_goal"].get("description", ""),
+                                    "passed": False
+                                }
                             if "attack_goal" in step:
-                                step_result["attack_goal"] = step["attack_goal"]
+                                step_result["attack_goal"] = {
+                                    "description": step["attack_goal"].get("description", ""),
+                                    "passed": False,
+                                    "partial_attack_score": 0.0
+                                }
                     step_results.append(step_result)
         
             # Add final session to session history (if there are any remaining steps after the last session change)
@@ -1468,13 +1526,16 @@ class TestBench:
                     test_result["defense_type"] = self.defense_type
             
             # Save result using unified structure
+            # Get results base dir for this test (attack_bench uses attack_results)
+            results_base_dir_for_test = self._get_results_base_dir_for_test(test_file)
+            
             result_path = get_result_path(
                 self.memory_backend_name,
                 self.unified_defense,
                 self.model_name,
                 attack_type,
                 test_file,
-                self.results_base_dir
+                results_base_dir_for_test
             )
             result_path.parent.mkdir(parents=True, exist_ok=True)
             
@@ -1578,13 +1639,15 @@ class TestBench:
         try:
             # Use helper function to determine attack_type (handles memory_only tests)
             attack_type = determine_attack_type(test_file, test_def)
+            # Get results base dir for this test (attack_bench uses attack_results)
+            results_base_dir_for_test = self._get_results_base_dir_for_test(test_file)
             result_path = get_result_path(
                 self.memory_backend_name if self.memory_backend_name != "none" else "none",
                 self.unified_defense,
                 self.model_name,
                 attack_type,
                 test_file,
-                self.results_base_dir
+                results_base_dir_for_test
             )
             result_path.parent.mkdir(parents=True, exist_ok=True)
             
@@ -1637,7 +1700,30 @@ class TestBench:
     
     def _get_cached_test(self, test_file: Path) -> Optional[Path]:
         """Check if there's a cached version of the test with successful attacks."""
-        cache_file = self.cache_dir / test_file.relative_to(self.test_bench_dir)
+        # Handle test files that may be outside test_bench_dir (e.g., attack_bench tests)
+        try:
+            # Try relative to test_bench_dir first (for tests in data/benchmark/tests/)
+            relative_path = test_file.relative_to(self.test_bench_dir)
+            cache_file = self.cache_dir / relative_path
+        except ValueError:
+            # Test file is not under test_bench_dir (e.g., attack_bench tests)
+            # Use path relative to data/benchmark/ instead
+            try:
+                # Make benchmark_base absolute to handle both absolute and relative test_file paths
+                benchmark_base = Path("data/benchmark").resolve()
+                test_file_resolved = test_file.resolve()
+                relative_path = test_file_resolved.relative_to(benchmark_base)
+                cache_file = self.cache_dir / relative_path
+            except ValueError:
+                # Fallback: use string manipulation to extract path after "data/benchmark/"
+                test_file_str = str(test_file)
+                if "data/benchmark/" in test_file_str:
+                    relative_path = Path(test_file_str.split("data/benchmark/")[-1])
+                else:
+                    # Use filename only as last resort
+                    relative_path = Path(test_file.name)
+                cache_file = self.cache_dir / relative_path
+        
         if cache_file.exists():
             return cache_file
         return None
@@ -1950,13 +2036,24 @@ class TestBench:
                         step, i, session_id, test_config
                     )
                     
+                    # Handle case where step_result is None (shouldn't happen, but be defensive)
+                    if step_result is None:
+                        print(f"ERROR: Step {i} returned None result, skipping optimization")
+                        step_results.append({
+                            "step": i,
+                            "error": "Step execution returned None",
+                            "passed": False
+                        })
+                        all_passed = False
+                        continue
+                    
                     # Update environment state with traces and session data after running the step
                     # This ensures the state has the latest traces when we save it before the next step
                     try:
                         current_state = self.state_manager.get_current_state()
                         if current_state:
                             # Update traces from the step result or by reading from trace file
-                            if "step_traces" in step_result:
+                            if step_result and "step_traces" in step_result:
                                 current_state.update_step_data(i, step_result["step_traces"])
                             else:
                                 # Fallback: read traces from file
@@ -1973,7 +2070,9 @@ class TestBench:
                         debug_print_exception(e, context=f"Updating environment state after step {i}", include_traceback=True)
                     
                     # Check if attack failed
-                    attack_goal_passed = step_result.get("attack_goal", {}).get("passed")
+                    # Ensure attack_goal dict exists in step_result
+                    attack_goal_dict = step_result.get("attack_goal", {})
+                    attack_goal_passed = attack_goal_dict.get("passed") if isinstance(attack_goal_dict, dict) else None
                     if attack_goal_passed is False:
                         print(f"WARNING: Attack failed at step {i}, attempting optimization")
                         
@@ -2229,18 +2328,14 @@ class TestBench:
         # Run the step (reuse existing logic from static test)
         start_time = time.time()
         try:
-            result = invoke_agent(
+            agent_result = invoke_agent(
                 text=step['user_message'],
                 session_id=session_id,
                 config=test_config
             )
             duration = time.time() - start_time
-        except Exception as e:
-            # API call failed after retries - this is an execution error
-            # Re-raise to be caught by caller and tracked
-            raise
             
-            response = result["response"]
+            response = agent_result["response"]
             print(f"Agent Response: {response}")
             print(f"Duration: {duration:.2f}s")
             
@@ -2327,14 +2422,32 @@ class TestBench:
             
             result = {
                 "step": step_num,
-                "user_message": step['user_message'],
-                "expected_behavior": step['expected_behavior'],
-                "error": str(e)
+                "user_message": step.get('user_message', ''),
+                "expected_behavior": step.get('expected_behavior', ''),
+                "error": str(e),
+                "step_traces": []  # Empty traces on error
             }
+            
+            # Include user_goal and attack_goal structures even on error
+            # This ensures the result structure is consistent
+            if "user_goal" in step and step.get("user_goal"):
+                result["user_goal"] = {
+                    "description": step["user_goal"].get("description", ""),
+                    "passed": False
+                }
+            
+            if "attack_goal" in step and step.get("attack_goal"):
+                result["attack_goal"] = {
+                    "description": step["attack_goal"].get("description", ""),
+                    "passed": False,
+                    "partial_attack_score": 0.0
+                }
+            
             # Only include "passed" if this step has a success_check
             has_success_check = ("user_goal" in step and step.get("user_goal")) or ("attack_goal" in step and step.get("attack_goal"))
             if has_success_check:
                 result["passed"] = False
+            
             return result
     
     def _run_regular_step(self, step: Dict[str, Any], step_num: int, 
@@ -2512,7 +2625,8 @@ class TestBench:
             print(f"Trying optimization strategy: {strategy_name}")
             
             result = optimizer.optimize_attack(
-                original_attack_email, failed_step, step_num, session_id, test_config, current_state
+                original_attack_email, failed_step, step_num, session_id, test_config, current_state,
+                test_def=test_def, attack_email_step_num=attack_email_step_num
             )
             
             if result.success:
@@ -2577,7 +2691,30 @@ class TestBench:
         print(f"💾 Caching successful attack for {test_file.name}")
         
         # Create cache directory structure
-        cache_file = self.cache_dir / test_file.relative_to(self.test_bench_dir)
+        # Handle test files that may be outside test_bench_dir (e.g., attack_bench tests)
+        try:
+            # Try relative to test_bench_dir first (for tests in data/benchmark/tests/)
+            relative_path = test_file.relative_to(self.test_bench_dir)
+            cache_file = self.cache_dir / relative_path
+        except ValueError:
+            # Test file is not under test_bench_dir (e.g., attack_bench tests)
+            # Use path relative to data/benchmark/ instead
+            try:
+                # Make benchmark_base absolute to handle both absolute and relative test_file paths
+                benchmark_base = Path("data/benchmark").resolve()
+                test_file_resolved = test_file.resolve()
+                relative_path = test_file_resolved.relative_to(benchmark_base)
+                cache_file = self.cache_dir / relative_path
+            except ValueError:
+                # Fallback: use string manipulation to extract path after "data/benchmark/"
+                test_file_str = str(test_file)
+                if "data/benchmark/" in test_file_str:
+                    relative_path = Path(test_file_str.split("data/benchmark/")[-1])
+                else:
+                    # Use filename only as last resort
+                    relative_path = Path(test_file.name)
+                cache_file = self.cache_dir / relative_path
+        
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         
         # Load original test and update with optimized attacks

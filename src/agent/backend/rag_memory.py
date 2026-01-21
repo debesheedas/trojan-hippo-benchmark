@@ -358,7 +358,9 @@ class RAGMemoryManager:
             
             try:
                 # Perform similarity search
+                debug_debug(f"RAG Memory: Performing similarity search with k={k}, query='{query[:100]}...'", truncate=False, max_length=500)
                 results = self.vectorstore.similarity_search(query, k=k)
+                debug_debug(f"RAG Memory: Similarity search returned {len(results)} results (requested k={k})", truncate=False)
                 
                 # P1: Check if any retrieved memory has U label (provable_policy defense)
                 if defense_type == "provable_policy" and session_id:
@@ -377,7 +379,13 @@ class RAGMemoryManager:
                                 f"All memories must have 'label' metadata set to 'T' or 'U'."
                             )
                 
-                return [doc.page_content for doc in results]
+                retrieved_chunks = [doc.page_content for doc in results]
+                # Log each retrieved chunk (without truncation for full visibility)
+                debug_debug(f"RAG Memory: Retrieved {len(retrieved_chunks)} chunks", truncate=False)
+                for i, chunk in enumerate(retrieved_chunks, 1):
+                    debug_debug(f"RAG Memory Chunk {i}/{len(retrieved_chunks)} ({len(chunk)} chars):\n{chunk}", truncate=False)
+                
+                return retrieved_chunks
             except Exception as e:
                 debug_info(f"Error during retrieval: {e}")
                 debug_print_exception(e, context="RAG memory retrieval", include_traceback=True)
@@ -398,14 +406,26 @@ class RAGMemoryManager:
         """
         retrieved = self.retrieve(query, top_k, session_id=session_id, defense_type=defense_type)
         
+        # Debug logging: Log retrieval details (without truncation to see full chunks)
+        k = top_k or self.top_k
+        debug_debug(f"RAG Memory get_context: Query='{query[:100]}...', top_k={k}, retrieved {len(retrieved)} chunks", truncate=False, max_length=500)
+        
         if not retrieved:
+            debug_debug("RAG Memory get_context: No chunks retrieved (vectorstore may be empty or query didn't match)", truncate=False)
             return ""
+        
+        # Log each retrieved chunk in full (without truncation)
+        for i, memory in enumerate(retrieved, 1):
+            debug_debug(f"RAG Memory Chunk {i}/{len(retrieved)} ({len(memory)} chars):\n{memory}", truncate=False)
         
         context_parts = []
         for i, memory in enumerate(retrieved, 1):
             context_parts.append(f"Memory {i}:\n{memory}")
         
-        return "\n\n".join(context_parts)
+        formatted_context = "\n\n".join(context_parts)
+        debug_debug(f"RAG Memory get_context: Formatted context ({len(formatted_context)} total chars):\n{formatted_context}", truncate=False)
+        
+        return formatted_context
     
     def clear_all_memory(self):
         """Clear all memory from the vector store."""
@@ -496,14 +516,21 @@ def get_rag_memory_context(text: str, session_id: str, memory_config: dict, memo
         return ""
     
     try:
+        debug_debug(f"get_rag_memory_context called: text='{text[:100]}...', session_id={session_id}, defense_type={rag_defense_type}", truncate=False, max_length=500)
         rag_memory_manager = get_rag_memory_manager(
             embedding_model=rag_memory_config.get("embedding_model", "text-embedding-3-small"),
-            top_k=rag_memory_config.get("top_k", 3),
+            top_k=rag_memory_config.get("top_k", 8),  # Default to 8 for RAG backend
             chunk_size=rag_memory_config.get("chunk_size", 512),
             vectorstore_path=rag_memory_config.get("vectorstore_path", "data/agent/rag_vectorstore"),
         )
+        debug_debug(f"RAG memory manager created with top_k={rag_memory_manager.top_k}", truncate=False)
         rag_context = rag_memory_manager.get_context(text, session_id=session_id, defense_type=rag_defense_type)
-        return "\n\n# Relevant Memory Context\n" + rag_context + "\n" if rag_context else ""
+        if rag_context:
+            debug_debug(f"RAG context retrieved ({len(rag_context)} chars), adding to prompt", truncate=False)
+            return "\n\n# Relevant Memory Context\n" + rag_context + "\n"
+        else:
+            debug_debug("No RAG context retrieved (empty result)", truncate=False)
+            return ""
     except (OSError, IOError, ValueError, RuntimeError) as e:
         debug_debug(f"Could not retrieve RAG memory context: {e}")
         return ""

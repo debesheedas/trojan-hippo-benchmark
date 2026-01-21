@@ -577,9 +577,9 @@ class DSPyOptimizer(BaseOptimizer):
             # Generate optimized attack using DSPy
             try:
                 # Select top relevant few-shot demos per iteration and overweight them
-                    try:
-                        demos = []
-                        if getattr(self.optimizer_module, 'generate', None) is not None:
+                try:
+                    demos = []
+                    if getattr(self.optimizer_module, 'generate', None) is not None:
                         goal_text = f"{attack_goal} {user_context}"
                         top = self._retrieve_top_demos(goal_text, k=2) or []
                         dspy_examples = []

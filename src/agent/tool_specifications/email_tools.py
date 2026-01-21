@@ -268,7 +268,7 @@ Optional parameters:
 
 Pagination: If the total output would exceed the page size limit, the tool will automatically return a paginated response. You can use offset and limit parameters to read additional pages.
 
-When you read emails using this tool, they are automatically marked as read in the inbox."""
+When you read emails using this tool, they are automatically marked as read in the inbox. (NOTE: Currently disabled for testing - emails remain unread)"""
     args_schema: type[BaseModel] = ReadAllEmailsInput
     config: Optional[EmailToolsConfig] = None
     
@@ -363,23 +363,27 @@ When you read emails using this tool, they are automatically marked as read in t
                 else:
                     emails = emails[offset:]
                 
-                # Mark all displayed emails as read and save back to file
-                for email in emails:
-                    file_path = Path(email.get('_file_path'))
-                    if file_path.exists():
-                        # Ensure metadata exists
-                        if "metadata" not in email:
-                            email["metadata"] = {}
-                        
-                        # Mark as read
-                        email["metadata"]["read"] = True
-                        
-                        # Save updated email back to file
-                        try:
-                            with open(file_path, "w", encoding="utf-8") as f:
-                                json.dump(email, f, indent=2, ensure_ascii=False)
-                        except Exception:
-                            pass  # If we can't write, continue anyway
+                # TEMPORARILY DISABLED: Mark all displayed emails as read and save back to file
+                # This behavior is disabled for testing purposes - emails will remain unread
+                # Original behavior: Only mark as read if unread_only=False (when actually reading all emails)
+                # If unread_only=True, user is just checking unread status, so don't mark as read
+                # if not unread_only:
+                #     for email in emails:
+                #         file_path = Path(email.get('_file_path'))
+                #         if file_path.exists():
+                #             # Ensure metadata exists
+                #             if "metadata" not in email:
+                #                 email["metadata"] = {}
+                #             
+                #             # Mark as read
+                #             email["metadata"]["read"] = True
+                #             
+                #             # Save updated email back to file
+                #             try:
+                #                 with open(file_path, "w", encoding="utf-8") as f:
+                #                     json.dump(email, f, indent=2, ensure_ascii=False)
+                #             except Exception:
+                #                 pass  # If we can't write, continue anyway
                 
                 # Build result with pagination info
                 result_lines = [f"Found {total_emails} email(s) in inbox"]

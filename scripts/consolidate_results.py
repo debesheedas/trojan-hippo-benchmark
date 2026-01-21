@@ -486,16 +486,23 @@ def generate_average_heatmap(
         rate_row = []
         error_row = []
         for backend in MEMORY_BACKENDS:
+            # Skip invalid combinations (set to NaN for visualization)
+            if not is_valid_combination(backend, defense_type):
+                rate_row.append(np.nan)
+                error_row.append(False)
+                continue
+            
             rates = []
             has_any_errors = False
             
             # Collect rates from all suites for this combination
             for attack_type in all_data.keys():
-                _, _, rate, has_errors = all_data[attack_type][defense_type][backend]
-                if has_errors:
-                    has_any_errors = True
-                else:
-                    rates.append(rate)
+                if defense_type in all_data[attack_type] and backend in all_data[attack_type][defense_type]:
+                    _, _, rate, has_errors = all_data[attack_type][defense_type][backend]
+                    if has_errors:
+                        has_any_errors = True
+                    else:
+                        rates.append(rate)
             
             if has_any_errors:
                 avg_rate = 0.0
@@ -522,6 +529,9 @@ def generate_average_heatmap(
     display_matrix = rates_matrix.copy().astype(float)
     display_matrix[has_errors_matrix] = np.nan
     
+    # Create mask for both errors and invalid combinations (NaN)
+    mask = has_errors_matrix | np.isnan(display_matrix)
+    
     # Create heatmap
     sns.heatmap(display_matrix, 
                 annot=True, 
@@ -535,7 +545,7 @@ def generate_average_heatmap(
                 linewidths=1,
                 linecolor='gray',
                 ax=ax,
-                mask=has_errors_matrix)
+                mask=mask)
     
     # Add error annotations
     for i in range(len(UNIFIED_DEFENSE_TYPES)):
@@ -687,13 +697,6 @@ def main():
                     )
                     plot_files.append(combined_heatmap_file)
                     print(f"  OK: Combined Heatmaps: {combined_heatmap_file.name}")
-                    
-                    # Average heatmap
-                    avg_heatmap_file = generate_average_heatmap(
-                        model_name, all_suites_data, output_dir
-                    )
-                    plot_files.append(avg_heatmap_file)
-                    print(f"  OK: Average Heatmap: {avg_heatmap_file.name}")
                 except Exception as e:
                     print(f"  WARNING: Error generating combined visualizations: {e}")
         
@@ -710,6 +713,20 @@ def main():
                 avg_csv_file = generate_average_summary_csv(model_name, all_suites_data, output_dir)
                 csv_files.append(avg_csv_file)
                 print(f"  OK: Average Summary CSV: {avg_csv_file.name}")
+                
+                # Average heatmap (should match the average summary CSV)
+                if not args.no_plots:
+                    if PLOTTING_AVAILABLE:
+                        try:
+                            avg_heatmap_file = generate_average_heatmap(
+                                model_name, all_suites_data, output_dir
+                            )
+                            plot_files.append(avg_heatmap_file)
+                            print(f"  OK: Average Heatmap: {avg_heatmap_file.name}")
+                        except Exception as e:
+                            print(f"  WARNING: Error generating average heatmap: {e}")
+                    else:
+                        print(f"  WARNING: Skipping average heatmap: matplotlib/seaborn not installed")
             except Exception as e:
                 print(f"  WARNING: Error generating combined CSV files: {e}")
     
