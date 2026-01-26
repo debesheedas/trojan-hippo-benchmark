@@ -17,7 +17,11 @@ import yaml
 from dotenv import load_dotenv
 import numpy as np
 from openai import OpenAI
-import google.generativeai as genai
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    raise ImportError("The 'google-genai' library is required. Please install it using 'pip install google-genai'.")
 
 # Load environment variables
 load_dotenv()
@@ -549,8 +553,7 @@ def get_gemini_client(api_key: Optional[str] = None):
     if not api_key:
         raise ValueError("GEMINI_API_KEY is not set")
     
-    genai.configure(api_key=api_key)
-    return genai
+    return genai.Client(api_key=api_key)
 
 
 def call_openai_chat_completion(
@@ -657,6 +660,7 @@ def call_gemini_chat_completion(
     temperature: Optional[float] = None,
     max_output_tokens: Optional[int] = None,
     top_p: Optional[float] = None,
+    client: Optional[Any] = None,
 ) -> Any:
     """
     Call Gemini chat completion API.
@@ -667,10 +671,15 @@ def call_gemini_chat_completion(
         temperature: Temperature parameter
         max_output_tokens: Maximum output tokens
         top_p: Top-p parameter
+        client: Optional pre-created client (auto-created if not provided)
     
     Returns:
         Response object from Gemini API (wrapped to be OpenAI-compatible)
     """
+    # Create client if not provided
+    if client is None:
+        client = get_gemini_client()
+    
     # Extract system instruction from messages
     system_instruction = None
     chat_messages = []
@@ -686,58 +695,45 @@ def call_gemini_chat_completion(
             else:
                 system_instruction += "\n\n" + content
         else:
-            # Add to chat history
-            chat_messages.append({
-                "role": "user" if role == "user" else "model",
-                "parts": [content]
-            })
+            # Convert to Content objects for the new API
+            role_mapping = {"user": "user", "assistant": "model"}
+            chat_messages.append(
+                types.Content(
+                    parts=[types.Part(text=content)],
+                    role=role_mapping.get(role, "user")
+                )
+            )
     
     # Build generation config
-    generation_config = {}
+    config_params = {}
     if temperature is not None:
-        generation_config["temperature"] = temperature
+        config_params["temperature"] = temperature
     if max_output_tokens is not None:
-        generation_config["max_output_tokens"] = max_output_tokens
+        config_params["max_output_tokens"] = max_output_tokens
     if top_p is not None:
-        generation_config["top_p"] = top_p
-    
-    gen_config = genai.types.GenerationConfig(**generation_config) if generation_config else None
-    
-    # Get the model instance - system_instruction is passed during model creation
+        config_params["top_p"] = top_p
     if system_instruction:
-        model_instance = genai.GenerativeModel(
-            model,
-            system_instruction=system_instruction
-        )
-    else:
-        model_instance = genai.GenerativeModel(model)
+        config_params["system_instruction"] = system_instruction
+    
+    gen_config = types.GenerateContentConfig(**config_params) if config_params else None
     
     # Build the prompt from messages
-    # For chat, we need to handle the conversation history
+    # Use generate_content with contents list (works for both single and multiple messages)
     if len(chat_messages) == 0:
         raise ValueError("No user messages found in messages list")
     
-    # If we have multiple messages, use chat history
-    if len(chat_messages) > 1:
-        # Separate history from the last message
-        history = chat_messages[:-1]
-        last_message = chat_messages[-1]["parts"][0]
-        
-        # Start chat with history
-        chat = model_instance.start_chat(history=history)
-        
-        # Send the last message
-        response = chat.send_message(last_message, generation_config=gen_config if gen_config else None)
+    # Use generate_content with the list of Content objects
+    if gen_config:
+        response = client.models.generate_content(
+            model=model,
+            contents=chat_messages,
+            config=gen_config
+        )
     else:
-        # Single message - use generate_content
-        prompt = chat_messages[0]["parts"][0]
-        if gen_config:
-            response = model_instance.generate_content(
-                prompt,
-                generation_config=gen_config
-            )
-        else:
-            response = model_instance.generate_content(prompt)
+        response = client.models.generate_content(
+            model=model,
+            contents=chat_messages
+        )
     
     # Convert Gemini response to OpenAI-like format for compatibility
     class GeminiResponse:
@@ -988,6 +984,7 @@ def call_llm_chat_completion(
             temperature=temperature,
             max_output_tokens=max_output_tokens,
             top_p=top_p,
+            client=client,
         )
     else:
         raise ValueError(f"Unsupported provider: {provider}")

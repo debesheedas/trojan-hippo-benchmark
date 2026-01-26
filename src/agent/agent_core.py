@@ -437,7 +437,7 @@ def _create_agent_executor(
     elif provider == "gemini":
         raise NotImplementedError(
             "Gemini models are not yet supported with LangChain integration due to version conflicts. "
-            "Direct API calls via google-generativeai work (used in adaptive attacks). "
+            "Direct API calls via google-genai work (used in adaptive attacks). "
             "For LangChain agent, please use OpenAI models or install langchain-google-genai manually "
             "with compatible versions."
         )

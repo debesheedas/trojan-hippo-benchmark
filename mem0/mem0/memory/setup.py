@@ -15,6 +15,8 @@ mem0_dir = os.environ.get("MEM0_DIR") or os.path.join(home_dir, ".mem0")
 def setup_config():
     config_path = os.path.join(mem0_dir, "config.json")
     if not os.path.exists(config_path):
+        # Create the directory if it doesn't exist
+        os.makedirs(mem0_dir, exist_ok=True)
         user_id = str(uuid.uuid4())
         config = {"user_id": user_id}
         with open(config_path, "w") as config_file:
