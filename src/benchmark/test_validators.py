@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from agent.utils import (
     debug_info, debug_debug, debug_print_exception, load_config,
-    call_llm_chat_completion, detect_provider, append_trace_event
+    call_llm_chat_completion, detect_provider
 )
 from agent.utils import print_validator_result
 
@@ -385,60 +385,57 @@ class FileSystemValidator(TestValidator):
         }
     
     def _resolve_path(self, file_pattern: str) -> str:
-        """Resolve file pattern to test environment path if test_config is available."""
-        if not self.test_config:
-            return file_pattern
+        """Resolve file pattern to test environment path if test_config is available.
         
-        # Map common data directory patterns to test environment paths
-        data_mappings = {
-            "data/outbox": self.test_config["data"]["outbox_dir"],
-            "data/drafts": self.test_config["data"]["drafts_dir"],
-            "data/mailbox": self.test_config["data"]["mailbox_dir"],
-            "data/sessions": self.test_config["data"].get("sessions_dir", "data/agent/sessions"),
-            "data/agent/outbox": self.test_config["data"]["outbox_dir"],
-            "data/agent/drafts": self.test_config["data"]["drafts_dir"],
-            "data/agent/mailbox": self.test_config["data"]["mailbox_dir"],
-            "data/agent/sessions": self.test_config["data"].get("sessions_dir", "data/agent/sessions"),
-        }
-        
-        # Replace data directory paths with test environment paths
-        resolved_pattern = file_pattern
-        for original_path, test_path in data_mappings.items():
-            if file_pattern.startswith(original_path):
-                resolved_pattern = file_pattern.replace(original_path, test_path)
-                break
-        
-        return resolved_pattern
+        NOTE: This benchmark now operates entirely in-memory. Path resolution is kept
+        for pattern matching purposes only (e.g., to determine folder type: outbox/drafts/inbox).
+        Actual file operations are done via InMemoryMailbox in _find_files_matching_patterns.
+        """
+        # Just return the original pattern - in-memory mode doesn't use resolved paths
+        # The pattern is used to determine folder type (outbox/drafts/inbox) in _find_files_matching_patterns
+        return file_pattern
     
     def _find_files_matching_patterns(self) -> Tuple[List[str], Dict[str, List[str]]]:
         """Find all files matching the patterns, returning (all_files, pattern_to_files mapping)."""
         found_files = []
         pattern_to_files = {}
         
+        # Check if using in-memory mailbox
+        mailbox = None
+        if self.test_config:
+            # Check if test_config has mailbox directly
+            mailbox = self.test_config.get("mailbox")
+            # Or check if it's in an InMemoryTestEnvironment
+            if not mailbox:
+                in_memory_env = self.test_config.get("in_memory_environment")
+                if in_memory_env:
+                    mailbox = in_memory_env.mailbox
+        
+        # Use in-memory mailbox (required)
+        if not mailbox:
+            raise ValueError("mailbox is required in test_config - file system storage is no longer supported")
+        
+        # Use in-memory mailbox
         for resolved_pattern in self._resolved_files:
             pattern_files = []
             
-            # Handle glob patterns
-            if '*' in resolved_pattern or '?' in resolved_pattern:
-                pattern_str = str(resolved_pattern)
-                last_sep_idx = max(pattern_str.rfind('/'), pattern_str.rfind('\\'))
-                
-                if last_sep_idx >= 0:
-                    dir_part, glob_part = pattern_str[:last_sep_idx], pattern_str[last_sep_idx + 1:]
-                    dir_path = Path(dir_part)
-                    if dir_path.exists() and dir_path.is_dir():
-                        pattern_files = [str(p) for p in dir_path.glob(glob_part) if p.is_file()]
-                    else:
-                        pattern_files = [str(p) for p in Path(".").glob(resolved_pattern) if p.is_file()]
-                else:
-                    pattern_files = [str(p) for p in Path(".").glob(resolved_pattern) if p.is_file()]
-            else:
-                # No glob - check as regular path
-                pattern_path = Path(resolved_pattern)
-                if pattern_path.is_file():
-                    pattern_files = [str(pattern_path)]
-                elif pattern_path.is_dir():
-                    pattern_files = [str(p) for p in pattern_path.glob("*") if p.is_file()]
+            # Determine folder from pattern
+            folder = None
+            if "outbox" in resolved_pattern.lower():
+                folder = "outbox"
+            elif "drafts" in resolved_pattern.lower():
+                folder = "drafts"
+            elif "mailbox" in resolved_pattern.lower() or "inbox" in resolved_pattern.lower():
+                folder = "inbox"
+            
+            if folder:
+                # Get emails from in-memory mailbox
+                emails = mailbox.get_emails(folder, unread_only=False)
+                # Create virtual file paths for compatibility
+                for email in emails:
+                    email_id = email.get("_email_id", "unknown")
+                    virtual_path = f"in_memory_{folder}_{email_id}.json"
+                    pattern_files.append(virtual_path)
             
             found_files.extend(pattern_files)
             if pattern_files:
@@ -478,7 +475,10 @@ class FileSystemValidator(TestValidator):
         for resolved_pattern, expected_fields in self._resolved_json_fields.items():
             pattern_files = pattern_to_files.get(resolved_pattern, [])
             if not pattern_files:
-                pattern_files = [f for f in found_files if self._matches_pattern(f, resolved_pattern)]
+                # Try to match files against pattern (for backward compatibility with file system)
+                # Skip this for virtual in-memory paths - they should already be in pattern_to_files
+                pattern_files = [f for f in found_files 
+                               if not f.startswith("in_memory_") and self._matches_pattern(f, resolved_pattern)]
             
             # Check all matching files - if any file matches the JSON fields, validation passes
             for file_path in pattern_files:
@@ -574,18 +574,38 @@ class FileSystemValidator(TestValidator):
     
     def _check_json_fields(self, file_path: str, expected_fields: Dict[str, Any]) -> bool:
         """Check if JSON file contains expected field values."""
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            return self._check_json_fields_data(data, expected_fields)
-        except json.JSONDecodeError as e:
-            debug_info(f"File {file_path} is not valid JSON")
-            debug_print_exception(e, context=f"Parsing JSON file {file_path}", include_traceback=True)
-            return False
-        except Exception as e:
-            debug_info(f"Could not validate JSON fields in {file_path}")
-            debug_print_exception(e, context=f"Validating JSON fields in {file_path}", include_traceback=True)
-            return False
+        # Check if using in-memory mailbox
+        mailbox = None
+        if self.test_config:
+            mailbox = self.test_config.get("mailbox")
+            if not mailbox:
+                in_memory_env = self.test_config.get("in_memory_environment")
+                if in_memory_env:
+                    mailbox = in_memory_env.mailbox
+        
+        # If file_path is a virtual in-memory path, extract email from mailbox
+        if mailbox and file_path.startswith("in_memory_"):
+            try:
+                # Parse virtual path: in_memory_{folder}_{email_id}.json
+                parts = file_path.replace("in_memory_", "").replace(".json", "").split("_", 1)
+                if len(parts) == 2:
+                    folder = parts[0]
+                    email_id = parts[1]
+                    
+                    # Get emails from folder
+                    emails = mailbox.get_emails(folder, unread_only=False)
+                    
+                    # Find email by ID
+                    for email in emails:
+                        if email.get("_email_id") == email_id:
+                            return self._check_json_fields_data(email, expected_fields)
+            except Exception as e:
+                debug_info(f"Could not extract email from in-memory mailbox for {file_path}")
+                debug_print_exception(e, context=f"Extracting email from in-memory mailbox", include_traceback=True)
+                return False
+        
+        # Should never reach here - all paths should be virtual in-memory paths
+        raise ValueError(f"File system storage is no longer supported - expected virtual in-memory path but got: {file_path}")
 
 
 class SemanticJudgeValidator(TestValidator):
@@ -677,11 +697,13 @@ class SemanticJudgeValidator(TestValidator):
             return ""
         
         try:
-            # Get outbox directory from test config
-            outbox_dir = Path(self.test_config.get("data", {}).get("outbox_dir", "data/agent/outbox"))
-            
-            if not outbox_dir.exists():
-                return ""
+            # Check if using in-memory mailbox
+            mailbox = None
+            mailbox = self.test_config.get("mailbox")
+            if not mailbox:
+                in_memory_env = self.test_config.get("in_memory_environment")
+                if in_memory_env:
+                    mailbox = in_memory_env.mailbox
             
             parts = check_target.split(".")
             # Format: outbox.email.to.{email_with_dots}.{field}
@@ -692,18 +714,17 @@ class SemanticJudgeValidator(TestValidator):
             target_email = ".".join(parts[3:-1])
             target_field = parts[-1]
             
-            # Get all emails and find one sent to target_email
-            email_files = list(outbox_dir.glob("*.json"))
             matching_emails = []
             
-            for email_file in email_files:
-                try:
-                    with open(email_file, 'r', encoding='utf-8') as f:
-                        email = json.load(f)
-                    if email.get('to', '').lower() == target_email.lower():
-                        matching_emails.append(email)
-                except Exception:
-                    continue
+            # Use in-memory mailbox (required)
+            if not mailbox:
+                raise ValueError("mailbox is required in test_config - file system storage is no longer supported")
+            
+            # Use in-memory mailbox
+            outbox_emails = mailbox.get_emails("outbox", unread_only=False)
+            for email in outbox_emails:
+                if email.get('to', '').lower() == target_email.lower():
+                    matching_emails.append(email)
             
             if not matching_emails:
                 return ""
@@ -1151,16 +1172,15 @@ class CompositeValidator(TestValidator):
     - operator: "AND" or "OR" (default: "AND")
     """
     
-    def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None, prefix: str = "", trace_file: Optional[str] = None) -> bool:
+    def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None, prefix: str = "") -> bool:
         """
-        Validate with optional printing and trace logging.
+        Validate with optional printing.
         
         Args:
             agent_response: Agent response text
             session_id: Session identifier
             traces: Trace events
             prefix: Prefix for nested validators (for indentation), empty string means no printing
-            trace_file: Optional trace file path for logging validator results
             
         Returns:
             Whether validation passed
@@ -1189,12 +1209,8 @@ class CompositeValidator(TestValidator):
                 composite_validator = validator  # Type narrowing for type checker
                 if print_results:
                     nested_prefix = prefix + "  "
-                    result = composite_validator.validate(agent_response, session_id, traces, prefix=nested_prefix, trace_file=trace_file)
+                    result = composite_validator.validate(agent_response, session_id, traces, prefix=nested_prefix)
                     results[-1] = result
-                elif trace_file:
-                    # Still need to validate nested for trace logging
-                    nested_result = composite_validator.validate(agent_response, session_id, traces, prefix="", trace_file=trace_file)
-                    results[-1] = nested_result
             
             # Print result if requested
             if print_results:
@@ -1202,37 +1218,37 @@ class CompositeValidator(TestValidator):
                 print_validator_result(validator_type, f"{prefix}{validator_name}", result)
             
             # Store result for trace logging
-            if trace_file:
-                validator_name = self._get_validator_display_name(validator_config, validator_type)
-                validator_results.append({
-                    "type": validator_type,
-                    "name": validator_name,
-                    "passed": result,
-                    "config": validator_config
-                })
+            validator_name = self._get_validator_display_name(validator_config, validator_type)
+            validator_results.append({
+                "type": validator_type,
+                "name": validator_name,
+                "passed": result,
+                "config": validator_config
+            })
         
-        # Log validator results to trace file if provided
-        if trace_file and validator_results:
+        # Log validator results to in-memory trace store
+        if validator_results and self.test_config:
             try:
-                append_trace_event(
-                    trace_file,
-                    "validator_results",
-                    session_id,
-                    {
-                        "operator": operator,
-                        "overall_passed": all(results) if operator == "AND" else any(results),
-                        "validators": validator_results
-                    }
-                )
+                in_memory_env = self.test_config.get("in_memory_environment")
+                if in_memory_env:
+                    in_memory_env.log_event(
+                        session_id,
+                        "validator_results",
+                        {
+                            "operator": operator,
+                            "overall_passed": all(results) if operator == "AND" else any(results),
+                            "validators": validator_results
+                        }
+                    )
             except Exception as e:
                 debug_info("Could not log validator results to trace")
                 debug_print_exception(e, context="Logging validator results to trace", include_traceback=True)
         
         return any(results) if operator == "OR" else all(results)
     
-    def validate_with_print(self, agent_response: str, session_id: str, traces: List[Dict] = None, prefix: str = "", trace_file: Optional[str] = None) -> bool:
+    def validate_with_print(self, agent_response: str, session_id: str, traces: List[Dict] = None, prefix: str = "") -> bool:
         """Validate and print individual validator results (convenience method)."""
-        return self.validate(agent_response, session_id, traces, prefix, trace_file)
+        return self.validate(agent_response, session_id, traces, prefix)
     
     def _get_validator_display_name(self, config: Dict[str, Any], validator_type: str) -> str:
         """Generate a display name for a validator."""

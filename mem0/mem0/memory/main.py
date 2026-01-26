@@ -218,12 +218,11 @@ class Memory(MemoryBase):
         # Override collection name for telemetry
         telemetry_config_dict['collection_name'] = "mem0migrations"
 
-        # Set path for file-based vector stores
+        # This benchmark operates entirely in-memory - no telemetry directories created
         telemetry_config = _safe_deepcopy_config(self.config.vector_store.config)
         if self.config.vector_store.provider in ["faiss", "qdrant"]:
-            provider_path = f"migrations_{self.config.vector_store.provider}"
-            telemetry_config_dict['path'] = os.path.join(mem0_dir, provider_path)
-            os.makedirs(telemetry_config_dict['path'], exist_ok=True)
+            # Always use in-memory mode for telemetry (path=None)
+            telemetry_config_dict['path'] = None
 
         # Create the config object using the same class as the original
         telemetry_config = self.config.vector_store.config.__class__(**telemetry_config_dict)
@@ -1300,12 +1299,12 @@ class AsyncMemory(MemoryBase):
         else:
             self.graph = None
 
+        # This benchmark operates entirely in-memory - no telemetry directories created
         telemetry_config = _safe_deepcopy_config(self.config.vector_store.config)
         telemetry_config.collection_name = "mem0migrations"
         if self.config.vector_store.provider in ["faiss", "qdrant"]:
-            provider_path = f"migrations_{self.config.vector_store.provider}"
-            telemetry_config.path = os.path.join(mem0_dir, provider_path)
-            os.makedirs(telemetry_config.path, exist_ok=True)
+            # Always use in-memory mode for telemetry (path=None)
+            telemetry_config.path = None
         self._telemetry_vector_store = VectorStoreFactory.create(self.config.vector_store.provider, telemetry_config)
 
         capture_event("mem0.init", self, {"sync_type": "async"})

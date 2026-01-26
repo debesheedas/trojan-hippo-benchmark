@@ -2,11 +2,14 @@ import json
 import os
 import uuid
 
-# Set up the directory path
+# Set up the directory path (used for reference only, no directories are created)
+# This benchmark runs entirely in-memory - no file system operations
 VECTOR_ID = str(uuid.uuid4())
 home_dir = os.path.expanduser("~")
 mem0_dir = os.environ.get("MEM0_DIR") or os.path.join(home_dir, ".mem0")
-os.makedirs(mem0_dir, exist_ok=True)
+
+# NOTE: Directory creation removed - this benchmark operates entirely in-memory
+# No ~/.mem0 directory is created
 
 
 def setup_config():

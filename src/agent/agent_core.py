@@ -13,7 +13,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import trim_messages, HumanMessage, AIMessage, SystemMessage
 from agent.tools_registry import create_all_tools, create_email_tools
 from agent.tool_specifications.email_tools import EmailToolsConfig
-from agent.utils import append_trace_event, get_timestamp, ensure_data_directories, set_global_seeds, debug_info, debug_debug, debug_print_exception, get_model_context_window
+from agent.utils import get_timestamp, ensure_data_directories, set_global_seeds, debug_info, debug_debug, debug_print_exception, get_model_context_window
 from agent.backend.explicit_memory import get_memory_manager, _memory_manager_cache
 from agent.backend.rag_memory import get_rag_memory_context, index_rag_memory
 from agent.backend.mem0_memory import get_mem0_memory_context, index_mem0_memory
@@ -253,44 +253,120 @@ def _build_agent_prompt(memory_instructions: str, memory_context: str, include_m
         memory_context=memory_context or "",
     )
 
+def _safe_deepcopy_config(config: dict) -> dict:
+    """
+    Safely deep copy config, excluding unpicklable objects like vectorstore, mailbox, and manager.
+    
+    These objects contain threading locks and cannot be pickled, but they don't need
+    to be copied since they're shared references that shouldn't be modified.
+    """
+    # Store references to unpicklable objects before removing them
+    unpicklable_refs = {}
+    
+    # Extract in_memory objects (using new key names)
+    if "in_memory_environment" in config:
+        unpicklable_refs["in_memory_environment"] = config["in_memory_environment"]
+    if "mailbox" in config:
+        unpicklable_refs["mailbox"] = config["mailbox"]
+    
+    # Extract vectorstore and manager from memory configs
+    memory_config = config.get("memory", {})
+    for backend_key in ["rag_memory", "mem0_memory", "context_memory", "explicit_memory"]:
+        if backend_key in memory_config:
+            backend_config = memory_config[backend_key]
+            if isinstance(backend_config, dict):
+                if "vectorstore" in backend_config:
+                    unpicklable_refs[f"memory.{backend_key}.vectorstore"] = backend_config["vectorstore"]
+                if "manager" in backend_config:
+                    unpicklable_refs[f"memory.{backend_key}.manager"] = backend_config["manager"]
+    
+    # Create a temporary config with unpicklable objects set to None
+    temp_config = {}
+    for key, value in config.items():
+        if key in ["in_memory_environment", "mailbox"]:
+            temp_config[key] = None
+        elif key == "memory" and isinstance(value, dict):
+            temp_memory = {}
+            for mem_key, mem_value in value.items():
+                if mem_key in ["rag_memory", "mem0_memory", "context_memory", "explicit_memory"] and isinstance(mem_value, dict):
+                    # Exclude both vectorstore and manager
+                    temp_backend = {k: (None if k in ["vectorstore", "manager"] else v) 
+                                   for k, v in mem_value.items()}
+                    temp_memory[mem_key] = temp_backend
+                else:
+                    temp_memory[mem_key] = mem_value
+            temp_config[key] = temp_memory
+        else:
+            temp_config[key] = value
+    
+    # Now deep copy the temp config (unpicklable objects are None, so this should work)
+    try:
+        copied_config = copy.deepcopy(temp_config)
+    except (TypeError, AttributeError) as e:
+        # Fallback: if deepcopy still fails, use shallow copy and manually copy nested dicts
+        copied_config = copy.copy(temp_config)
+        for key, value in temp_config.items():
+            if isinstance(value, dict) and key not in ["in_memory_environment", "mailbox"]:
+                copied_config[key] = copy.deepcopy(value)
+    
+    # Restore unpicklable references in copied config
+    if "in_memory_environment" in unpicklable_refs:
+        copied_config["in_memory_environment"] = unpicklable_refs["in_memory_environment"]
+    if "mailbox" in unpicklable_refs:
+        copied_config["mailbox"] = unpicklable_refs["mailbox"]
+    
+    # Restore vectorstore and manager references
+    for backend_key in ["rag_memory", "mem0_memory", "context_memory", "explicit_memory"]:
+        for ref_type in ["vectorstore", "manager"]:
+            key = f"memory.{backend_key}.{ref_type}"
+            if key in unpicklable_refs:
+                if "memory" in copied_config and backend_key in copied_config["memory"]:
+                    if isinstance(copied_config["memory"][backend_key], dict):
+                        copied_config["memory"][backend_key][ref_type] = unpicklable_refs[key]
+    
+    return copied_config
+
 def _create_agent_executor(
     config: dict,
     session_id: Optional[str] = None,
 ) -> Any:
     # Benchmarks always provide config - require it to fail fast if missing
-    config = copy.deepcopy(config)
+    # Use safe deep copy to avoid pickle errors with threading locks in vectorstores
+    config = _safe_deepcopy_config(config)
     
     if "seed" in config:
         set_global_seeds(config["seed"])
     
+    # ensure_data_directories is now a no-op (this benchmark operates entirely in-memory)
     ensure_data_directories(config)
 
     memory_backend_for_defense = config.get("memory", {}).get("backend", "explicit")
     unified_defense = get_unified_defense_from_config(config, memory_backend_for_defense)
     
-    data_config = config.get("data", {})
-    if not data_config:
-        raise ValueError(
-            "Config must include a 'data' section with required fields: "
-            "mailbox_dir, drafts_dir, outbox_dir, trace_file, memory_file"
-        )
+    # Get in_memory_environment (required for mailbox and trace_store)
+    in_memory_env = config.get("in_memory_environment")
     
-    # Require all essential fields - fail fast if missing
-    required_fields = ["mailbox_dir", "drafts_dir", "trace_file"]
-    missing_fields = [field for field in required_fields if field not in data_config]
-    if missing_fields:
-        raise ValueError(
-            f"Config 'data' section missing required fields: {', '.join(missing_fields)}"
-        )
+    # Get mailbox (required)
+    mailbox = config.get("mailbox")
+    if not mailbox and in_memory_env:
+        mailbox = in_memory_env.mailbox
+    
+    if not mailbox:
+        raise ValueError("mailbox is required in config")
+    
+    # Get trace_store (required for tools to log events)
+    trace_store = None
+    if in_memory_env:
+        trace_store = in_memory_env.trace_store
+    
+    if not trace_store:
+        raise ValueError("trace_store is required - in_memory_environment must be provided in config")
     
     tools_config = EmailToolsConfig(
-        mailbox_dir=data_config["mailbox_dir"],
-        drafts_dir=data_config["drafts_dir"],
-        outbox_dir=data_config.get("outbox_dir", "data/agent/outbox"),  # Optional, has default
-        trace_file=data_config["trace_file"],
+        mailbox=mailbox,
+        trace_store=trace_store,
         defense_type=unified_defense,
     )
-    memory_file = data_config.get("memory_file", "data/agent/agent_memory.json")  # Optional, has default
     
     if session_id:
         tools_config.session_id = session_id
@@ -313,9 +389,7 @@ def _create_agent_executor(
     if explicit_memory_enabled and explicit_defense_type != "disable_memory":
         all_tools = create_all_tools(
             email_config=tools_config,
-            memory_file=memory_file,
             session_id=session_id,
-            trace_file=data_config["trace_file"],
             explicit_defense_type=explicit_defense_type,
             limit_memory_size=limit_memory_size,
         )
@@ -382,10 +456,8 @@ def _create_agent_executor(
         memory_instructions = memory_prompt_file.read_text(encoding="utf-8") if memory_prompt_file.exists() else ""
         
         try:
-            # Use validated data_config directly (simpler than nested .get())
-            memory_file = explicit_memory_config.get("memory_file", 
-                data_config.get("memory_file", "data/agent/agent_memory.json"))
-            memory_manager = get_memory_manager(memory_file=memory_file)
+            # Get in-memory memory manager
+            memory_manager = get_memory_manager()
             explicit_memory_context = memory_manager.get_long_term_as_text(
                 session_id=session_id,
                 defense_type=explicit_defense_type
@@ -394,7 +466,7 @@ def _create_agent_executor(
                 memory_lines = explicit_memory_context.split('\n')
                 print(f"Loaded {len(memory_manager.long_term)} explicit memories into system prompt ({len(explicit_memory_context)} chars, {len(memory_lines)} lines)")
             else:
-                print(f"No explicit memories loaded (memory file: {memory_file})")
+                print(f"No explicit memories loaded (in-memory)")
         except (OSError, IOError, ValueError, KeyError) as e:
             debug_info("Could not load explicit memory (will continue without explicit memory context)")
             debug_print_exception(e, context="Loading explicit memory", include_traceback=True)
@@ -415,10 +487,28 @@ def invoke_agent(text: str, session_id: str, config: dict) -> Dict[str, Any]:
     # Benchmarks always provide both session_id and config - require them to fail fast
     # Validation of data config happens in _create_agent_executor_for_python
     
+    # Get trace_store from in_memory_environment
+    in_memory_env = config.get("in_memory_environment")
+    trace_store = in_memory_env.trace_store if in_memory_env else None
+    
+    def log_trace_event(event_type: str, payload: dict):
+        """Helper to log trace events using the environment's trace_store."""
+        if trace_store is not None:
+            import uuid
+            from datetime import datetime, timezone
+            event = {
+                "event_id": str(uuid.uuid4()),
+                "event_type": event_type,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "session_id": session_id,
+                **payload
+            }
+            trace_store.append_event(session_id, event)
+    
     agent = _get_or_create_agent_executor(session_id, config)
 
     # Log user input
-    append_trace_event(config["data"]["trace_file"], "user_input", session_id, {"text": text})
+    log_trace_event("user_input", {"text": text})
 
     # Extract configs once
     memory_config = config.get("memory", {})
@@ -519,7 +609,7 @@ def invoke_agent(text: str, session_id: str, config: dict) -> Dict[str, Any]:
     if len(session_messages) > 50:
         session_messages = session_messages[-50:]
 
-    append_trace_event(config["data"]["trace_file"], "agent_response", session_id, {"text": response_text})
+    log_trace_event("agent_response", {"text": response_text})
 
     return {
         "response": response_text,

@@ -25,7 +25,7 @@ sys.path.insert(0, str(BASE_DIR / "src"))
 load_dotenv()
 
 from agent.agent_core import invoke_agent, clear_session_agent, clear_agent_cache
-from agent.utils import read_trace_events, load_config, ensure_data_directories, set_global_seeds
+from agent.utils import load_config, ensure_data_directories, set_global_seeds
 from agent.utils import debug_info, debug_debug, debug_print_exception, debug_print_long_content, set_debug_level, DebugLevel, get_debug_level
 from benchmark.test_validators import create_validator, CompositeValidator
 from agent.utils import get_colored_printer
@@ -35,17 +35,24 @@ from benchmark.benchmark_utils import (
     get_unified_defense_from_config,
     get_result_path,
     should_skip_test,
-    create_isolated_test_dir,
     determine_attack_type,
     discover_test_files as discover_test_files_util,
     get_log_path
 )
 
+# Import in-memory storage
+try:
+    from benchmark.in_memory_storage import InMemoryTestEnvironment, InMemoryMailbox, InMemoryVectorstore
+except ImportError:
+    InMemoryTestEnvironment = None  # Type: ignore
+    InMemoryMailbox = None  # Type: ignore
+    InMemoryVectorstore = None  # Type: ignore
+
 
 class TestBench:
     """Test bench for email agent."""
     
-    def __init__(self, config_path: Optional[str] = None, config: Optional[Dict[str, Any]] = None, defense_type_override: Optional[str] = None, force: bool = False):
+    def __init__(self, config_path: Optional[str] = None, config: Optional[Dict[str, Any]] = None, defense_type_override: Optional[str] = None, force: bool = False, logs_base_dir: Optional[Path] = None):
         """
         Initialize TestBench.
         
@@ -54,6 +61,7 @@ class TestBench:
             config: Config dictionary (mutually exclusive with config_path)
             defense_type_override: Override defense type from config
             force: Force overwrite existing results
+            logs_base_dir: Base directory for logs (defaults to data/benchmark/logs)
         """
         if config_path is not None and config is not None:
             raise ValueError("Cannot specify both config_path and config")
@@ -86,8 +94,10 @@ class TestBench:
         self.model_name = self.config.get("agent", {}).get("target_model_name")
         if not self.model_name:
             raise ValueError("Config missing agent.target_model_name. Please set it in agent_config.yaml.")
-        self.test_dirs = []  # Track test directories for cleanup
+        # No test directories needed - everything is in-memory
+        self.test_dirs = []  # Kept for compatibility but will always be empty
         self.force = force  # Force overwrite existing results
+        self.logs_base_dir = Path(logs_base_dir) if logs_base_dir is not None else None  # Base directory for logs (None = use default)
         
         # Get memory backend from config
         memory_config = self.config.get("memory", {})
@@ -234,28 +244,16 @@ class TestBench:
         
         try:
             from agent.backend.mem0_memory import get_mem0_memory_manager
-            from pathlib import Path
             
             mem0_config = test_config.get("memory", {}).get("mem0_memory", {})
-            vectorstore_path = mem0_config.get("vectorstore_path", "data/agent/mem0_vectorstore")
             user_id = mem0_config.get("user_id", "vince")
-            # Memories are stored with agent_id=None, so we query with None
-            agent_id = None
-            
-            # Check if vectorstore directory exists and has files
-            vectorstore_path_obj = Path(vectorstore_path)
-            faiss_files = list(vectorstore_path_obj.glob("*.faiss")) if vectorstore_path_obj.exists() else []
             
             print(f"\n{'='*80}")
-            print(f"DEBUG: Initial mem0 Memories in Vectorstore")
+            print(f"DEBUG: Initial mem0 Memories (in-memory)")
             print(f"{'='*80}")
-            print(f"Vectorstore Path: {vectorstore_path}")
-            print(f"Vectorstore Exists: {vectorstore_path_obj.exists()}")
-            print(f"FAISS Files Found: {len(faiss_files)}")
-            print(f"User ID: {user_id}, Agent ID: {agent_id} (memories are stored with agent_id=None)")
+            print(f"User ID: {user_id}")
             
-            # Initialize mem0 memory manager
-            # Note: agent_id parameter here is just for manager initialization, not for querying
+            # Initialize mem0 memory manager (in-memory)
             mem0_manager = get_mem0_memory_manager(
                 llm_provider=mem0_config.get("llm_provider", "openai"),
                 llm_model=mem0_config.get("llm_model", "gpt-4o-mini"),
@@ -263,10 +261,8 @@ class TestBench:
                 embedding_provider=mem0_config.get("embedding_provider", "openai"),
                 embedding_model=mem0_config.get("embedding_model", "text-embedding-3-small"),
                 vector_store_provider=mem0_config.get("vector_store_provider", "faiss"),
-                vectorstore_path=vectorstore_path,
                 top_k=mem0_config.get("top_k", 3),
                 user_id=user_id,
-                agent_id=None,  # Memories are stored with agent_id=None
             )
             
             # Get all memories with agent_id=None (this is how they're stored)
@@ -319,11 +315,9 @@ class TestBench:
             from agent.agent_core import _build_agent_prompt
             
             mem0_config = test_config.get("memory", {}).get("mem0_memory", {})
-            vectorstore_path = mem0_config.get("vectorstore_path", "data/agent/mem0_vectorstore")
             user_id = mem0_config.get("user_id", "vince")
-            agent_id = mem0_config.get("agent_id", "email_agent")
             
-            # Initialize mem0 memory manager
+            # Initialize mem0 memory manager (in-memory)
             mem0_manager = get_mem0_memory_manager(
                 llm_provider=mem0_config.get("llm_provider", "openai"),
                 llm_model=mem0_config.get("llm_model", "gpt-5-mini"),
@@ -331,14 +325,12 @@ class TestBench:
                 embedding_provider=mem0_config.get("embedding_provider", "openai"),
                 embedding_model=mem0_config.get("embedding_model", "text-embedding-3-small"),
                 vector_store_provider=mem0_config.get("vector_store_provider", "faiss"),
-                vectorstore_path=vectorstore_path,
                 top_k=mem0_config.get("top_k", 3),
                 user_id=user_id,
-                agent_id=agent_id,
             )
             
             # Get all memories
-            memories = mem0_manager.get_all_memories(user_id=user_id, agent_id=agent_id, limit=1000)
+            memories = mem0_manager.get_all_memories(user_id=user_id, agent_id=None, limit=1000)
             
             if memories:
                 print("\n🧠 Mem0 Memories:")
@@ -370,21 +362,23 @@ class TestBench:
                         try:
                             from agent.backend.rag_memory import get_rag_memory_manager
                             rag_config = memory_config.get("rag_memory", {})
-                            rag_memory_manager = get_rag_memory_manager(
-                                embedding_model=rag_config.get("embedding_model", "text-embedding-3-small"),
-                                top_k=rag_config.get("top_k", 3),
-                                chunk_size=rag_config.get("chunk_size", 512),
-                                vectorstore_path=rag_config.get("vectorstore_path", "data/agent/rag_vectorstore"),
-                            )
-                            # Pass session_id and defense_type for provable_policy defense
-                            rag_context = rag_memory_manager.get_context(
-                                user_message,
-                                session_id=session_id,
-                                defense_type=rag_defense_type
-                            )
-                            if rag_context:
-                                rag_context = "\n\n# Relevant Memory Context\n" + rag_context + "\n"
-                                context_parts.append(rag_context)
+                            vectorstore = rag_config.get("vectorstore")
+                            if vectorstore:
+                                rag_memory_manager = get_rag_memory_manager(
+                                    vectorstore=vectorstore,
+                                    embedding_model=rag_config.get("embedding_model", "text-embedding-3-small"),
+                                    top_k=rag_config.get("top_k", 3),
+                                    chunk_size=rag_config.get("chunk_size", 512),
+                                )
+                                # Pass session_id and defense_type for provable_policy defense
+                                rag_context = rag_memory_manager.get_context(
+                                    user_message,
+                                    session_id=session_id,
+                                    defense_type=rag_defense_type
+                                )
+                                if rag_context:
+                                    rag_context = "\n\n# Relevant Memory Context\n" + rag_context + "\n"
+                                    context_parts.append(rag_context)
                         except Exception as e:
                             debug_info("Could not retrieve RAG memory context")
                             debug_print_exception(e, context="Retrieving RAG memory context", include_traceback=True)
@@ -438,12 +432,7 @@ class TestBench:
                     # Try to load explicit memory context
                     try:
                         from agent.backend.explicit_memory import get_memory_manager
-                        memory_file = memory_config.get("explicit_memory", {}).get("memory_file", 
-                            test_config.get("data", {}).get("memory_file", "data/agent/agent_memory.json"))
-                        memory_manager = get_memory_manager(memory_file=memory_file)
-                        # Note: For provable_policy defense, session_id and defense_type should be passed
-                        # but in test_bench context, we don't have session_id here, so pass None
-                        # The defense will still work when memories are retrieved in agent_core
+                        memory_manager = get_memory_manager()
                         explicit_memory_context = memory_manager.get_long_term_as_text()
                     except Exception:
                         explicit_memory_context = ""
@@ -514,56 +503,50 @@ class TestBench:
 
     def create_test_environment(self, test_name: str, initial_data: Dict[str, str] = None) -> Dict[str, str]:
         """
-        Create an isolated test environment with specified initial data.
+        Create an isolated in-memory test environment with specified initial data.
         
-        Uses memory backend for unified memory initialization.
+        Uses in-memory storage to eliminate file system contamination issues.
         
         Args:
             test_name: Name of the test (for logging)
             initial_data: Dict with keys 'inbox_set', 'outbox_set', 'drafts_set', 'memory' (unified format), 'session_set'
         
         Returns:
-            Config dict with test-specific paths.
+            Config dict with in-memory structures and paths (for backward compatibility).
         """
-        # Create isolated test directory with unique name (PID + timestamp for parallel execution)
-        test_dir = create_isolated_test_dir(test_name)
-        self.test_dirs.append(test_dir)
+        # Create in-memory test environment (completely in-memory, no file I/O)
+        in_memory_env = InMemoryTestEnvironment(test_name)
         
-        # Create subdirectories
-        inbox_dir = test_dir / "inbox"
-        outbox_dir = test_dir / "outbox"
-        drafts_dir = test_dir / "drafts"
-        sessions_dir = test_dir / "sessions"
-        traces_dir = test_dir / "traces"
-        mem0_vectorstore_dir = test_dir / "mem0_vectorstore"
-        rag_vectorstore_dir = test_dir / "rag_vectorstore"
+        # Note: trace_store is passed explicitly through in_memory_environment
+        # Tools access it via config["in_memory_environment"].trace_store
         
-        # Create directories (but NOT mem0_vectorstore_dir or rag_vectorstore_dir - let loaders create them)
-        # This prevents false warnings about the directory already existing
-        dirs_to_create = [inbox_dir, outbox_dir, drafts_dir, sessions_dir, traces_dir]
+        # No temp directories needed - everything is in-memory
+        # test_dir is only used for legacy config paths (not actually created)
+        test_dir = None
         
-        for dir_path in dirs_to_create:
-            dir_path.mkdir(exist_ok=True)
-        
-        # Copy initial data based on configuration
+        # Copy initial data to in-memory mailbox
         if initial_data:
             # Copy inbox data
             if "inbox_set" in initial_data:
                 inbox_set = initial_data["inbox_set"]
                 source_inbox = Path(f"data/benchmark/initial_environment/initial_inbox/{inbox_set}")
                 if source_inbox.exists():
-                    for email_file in source_inbox.glob("*.json"):
-                        shutil.copy2(email_file, inbox_dir)
+                    in_memory_env.mailbox.copy_from_filesystem(source_inbox, folder="inbox")
                 else:
                     print(f"Warning: Inbox set '{inbox_set}' not found at {source_inbox}")
             
-            # Copy outbox data
+            # Copy outbox data (but skip for attack benchmarks to prevent false positives)
+            # Attack benchmarks should start with empty outbox
             if "outbox_set" in initial_data:
+                # Only copy if this is not an attack benchmark
+                # For attack benchmarks, we want empty outbox
                 outbox_set = initial_data["outbox_set"]
                 source_outbox = Path(f"data/benchmark/initial_environment/initial_outbox/{outbox_set}")
                 if source_outbox.exists():
-                    for email_file in source_outbox.glob("*.json"):
-                        shutil.copy2(email_file, outbox_dir)
+                    # Check if this is an attack benchmark by checking test_name
+                    # Attack benchmarks typically have "attack" in the name or path
+                    if "attack" not in test_name.lower():
+                        in_memory_env.mailbox.copy_from_filesystem(source_outbox, folder="outbox")
                 else:
                     print(f"Warning: Outbox set '{outbox_set}' not found at {source_outbox}")
             
@@ -572,8 +555,7 @@ class TestBench:
                 drafts_set = initial_data["drafts_set"]
                 source_drafts = Path(f"data/benchmark/initial_environment/initial_drafts/{drafts_set}")
                 if source_drafts.exists():
-                    for email_file in source_drafts.glob("*.json"):
-                        shutil.copy2(email_file, drafts_dir)
+                    in_memory_env.mailbox.copy_from_filesystem(source_drafts, folder="drafts")
                 else:
                     print(f"Warning: Drafts set '{drafts_set}' not found at {source_drafts}")
             
@@ -581,86 +563,59 @@ class TestBench:
             if "attack_emails" in initial_data:
                 attack_emails = initial_data["attack_emails"]
                 for attack_email in attack_emails:
-                    # Generate unique filename for attack email
-                    attack_email_id = str(uuid.uuid4())[:8]
-                    attack_email_file = inbox_dir / f"attack_{attack_email_id}.json"
-                    
-                    # Write attack email to inbox
-                    with open(attack_email_file, 'w', encoding='utf-8') as f:
-                        json.dump(attack_email, f, indent=2, ensure_ascii=False)
-                    
+                    in_memory_env.mailbox.add_email(attack_email, folder="inbox")
                     print(f"Added attack email: {attack_email.get('subject', 'No subject')} from {attack_email.get('from', 'Unknown sender')}")
         else:
-            # Fallback to original behavior if no initial_data specified
+            # Fallback: copy from original mailbox if it exists
             original_mailbox = Path("data/agent/mailbox")
             if original_mailbox.exists():
-                for email_file in original_mailbox.glob("*.json"):
-                    shutil.copy2(email_file, inbox_dir)
+                in_memory_env.mailbox.copy_from_filesystem(original_mailbox, folder="inbox")
         
         # Initialize memory using unified backend
         # All tests start with empty memory - memory is built during test execution
         if self.memory_backend_name == "none":
             print(f"No memory backend enabled (memory_backend: none) - skipping memory initialization")
-            # Still create empty memory file for compatibility
-            memory_file = test_dir / "agent_memory.json"
-            if not memory_file.exists():
-                empty_memory = {"long_term": []}
-                with open(memory_file, 'w', encoding='utf-8') as f:
-                    json.dump(empty_memory, f, indent=2)
         else:
             # Initialize empty memory backend - memory will be built during test execution
-            # Backends will create empty stores on first use, no initialization needed
             print(f"Initialized {self.memory_backend_name} memory backend (empty - memory built during test)")
-            
-            # Still create empty memory file for compatibility (for explicit backend)
-            if self.memory_backend_name == "explicit":
-                memory_file = test_dir / "agent_memory.json"
-                if not memory_file.exists():
-                    empty_memory = {"long_term": []}
-                    with open(memory_file, 'w', encoding='utf-8') as f:
-                        json.dump(empty_memory, f, indent=2)
         
-        # Copy initial session data to test environment
+        # Copy initial session data to in-memory session store
         if initial_data and "session_set" in initial_data:
             session_set = initial_data["session_set"]
             source_sessions = Path(f"data/benchmark/initial_environment/initial_sessions/{session_set}.json")
             if source_sessions.exists():
-                shutil.copy2(source_sessions, sessions_dir / "session_index.json")
+                with open(source_sessions, 'r', encoding='utf-8') as f:
+                    session_data = json.load(f)
+                # Store in in-memory session store
+                in_memory_env.session_store.set_session("initial", session_data)
             else:
                 print(f"Warning: Session set '{session_set}' not found at {source_sessions}")
-                # Create empty session file as fallback
-                empty_sessions = {
-                    "sessions": []
-                }
-                with open(sessions_dir / "session_index.json", 'w', encoding='utf-8') as f:
-                    json.dump(empty_sessions, f, indent=2)
         
         # Create test-specific config (deep copy to avoid modifying original)
         import copy
         test_config = copy.deepcopy(self.config)
+        
         # Initialize data section if it doesn't exist
         if "data" not in test_config:
             test_config["data"] = {}
-        test_config["data"]["mailbox_dir"] = str(inbox_dir)
-        test_config["data"]["outbox_dir"] = str(outbox_dir)
-        test_config["data"]["drafts_dir"] = str(drafts_dir)
-        test_config["data"]["sessions_dir"] = str(sessions_dir)
+        
+        # Store in-memory environment in test_config for tools and validators
+        test_config["in_memory_environment"] = in_memory_env
+        test_config["mailbox"] = in_memory_env.mailbox
         
         # Set memory backend info for validators
         if "memory" not in test_config:
             test_config["memory"] = {}
         test_config["memory"]["backend"] = self.memory_backend_name
         
-        # Set backend-specific paths and defense types (only if backend is enabled)
+        # Set backend-specific in-memory vectorstores and paths
         if self.memory_backend_name == "none":
             # No memory backend enabled
-            # Explicitly set backend to "none" and disable all backends
             test_config["memory"]["backend"] = "none"
             for backend_name in ["explicit", "mem0", "rag", "context"]:
                 if backend_name not in test_config["memory"]:
                     test_config["memory"][backend_name] = {}
                 test_config["memory"][backend_name]["enabled"] = False
-            # Also disable backend-specific configs
             for backend_config_key in ["explicit_memory", "mem0_memory", "rag_memory", "context_memory"]:
                 if backend_config_key not in test_config["memory"]:
                     test_config["memory"][backend_config_key] = {}
@@ -668,53 +623,45 @@ class TestBench:
         elif self.memory_backend_name == "rag":
             if "rag_memory" not in test_config["memory"]:
                 test_config["memory"]["rag_memory"] = {}
-            test_config["memory"]["rag_memory"]["vectorstore_path"] = str(test_dir / "rag_vectorstore")
+            test_config["memory"]["rag_memory"]["vectorstore"] = in_memory_env.rag_vectorstore
             test_config["memory"]["rag_memory"]["defense_type"] = self.backend_defense
         elif self.memory_backend_name == "mem0":
             if "mem0_memory" not in test_config["memory"]:
                 test_config["memory"]["mem0_memory"] = {}
-            test_config["memory"]["mem0_memory"]["vectorstore_path"] = str(test_dir / "mem0_vectorstore")
             test_config["memory"]["mem0_memory"]["defense_type"] = self.backend_defense
+            # Create and store a shared mem0 manager instance to persist memories across invocations
+            from agent.backend.mem0_memory import get_mem0_memory_manager
+            mem0_config = test_config["memory"]["mem0_memory"]
+            mem0_manager = get_mem0_memory_manager(
+                llm_provider=mem0_config.get("llm_provider", "openai"),
+                llm_model=mem0_config.get("llm_model", "gpt-5-mini"),
+                llm_temperature=mem0_config.get("llm_temperature", 0.0),
+                embedding_provider=mem0_config.get("embedding_provider", "openai"),
+                embedding_model=mem0_config.get("embedding_model", "text-embedding-3-small"),
+                vector_store_provider=mem0_config.get("vector_store_provider", "faiss"),
+                top_k=mem0_config.get("top_k", 10),
+                user_id=mem0_config.get("user_id", "vince"),
+            )
+            test_config["memory"]["mem0_memory"]["manager"] = mem0_manager
         elif self.memory_backend_name == "context":
             if "context_memory" not in test_config["memory"]:
                 test_config["memory"]["context_memory"] = {}
-            test_config["memory"]["context_memory"]["context_path"] = str(test_dir / "context_memory.json")
             test_config["memory"]["context_memory"]["defense_type"] = self.backend_defense
+            # Create and store a shared context memory manager to persist memories across invocations
+            from agent.backend.context_memory import get_context_memory_manager
+            context_config = test_config["memory"]["context_memory"]
+            context_manager = get_context_memory_manager(
+                max_context_length=context_config.get("max_context_length"),
+                model_name=test_config.get("agent", {}).get("model_name", "gpt-4o-mini"),
+            )
+            test_config["memory"]["context_memory"]["manager"] = context_manager
         elif self.memory_backend_name == "explicit":
             if "explicit_memory" not in test_config["memory"]:
                 test_config["memory"]["explicit_memory"] = {}
-            test_config["memory"]["explicit_memory"]["memory_file"] = str(test_dir / "agent_memory.json")
             test_config["memory"]["explicit_memory"]["defense_type"] = self.backend_defense
         
-        # Include defense type in trace file name if defense is enabled
-        if self.memory_backend_name in ("rag", "mem0", "context"):
-            if self.backend_defense == "none" or self.backend_defense == "no_defense":
-                trace_filename = "trace.jsonl"
-            else:
-                trace_filename = f"trace_{self.backend_defense}.jsonl"
-        else:
-            trace_filename = "trace.jsonl"
-        test_config["data"]["trace_file"] = str(traces_dir / trace_filename)
-        test_config["data"]["memory_file"] = str(test_dir / "agent_memory.json")
-        
-        print(f"Created test environment: {test_dir}")
+        print(f"Created in-memory test environment: {test_name} (completely in-memory, no file I/O)")
         return test_config
-    
-    def cleanup_test_environment(self, test_dir: Path):
-        """
-        Clean up test environment directory.
-        
-        Handles errors gracefully to ensure cleanup doesn't fail the benchmark.
-        """
-        if test_dir and test_dir.exists():
-            try:
-                shutil.rmtree(test_dir)
-                print(f"Cleaned up test environment: {test_dir.name}")
-            except Exception as e:
-                # Log error but don't fail - we'll clean up later if needed
-                debug_info(f"Failed to clean up test environment {test_dir.name}")
-                debug_print_exception(e, context=f"Cleaning up test environment {test_dir.name}", include_traceback=True)
-                logging.warning(f"Failed to clean up test environment {test_dir}: {e}")
         
     def _get_results_base_dir_for_test(self, test_file: Path) -> Path:
         """Get the appropriate results base directory based on test file location."""
@@ -748,7 +695,7 @@ class TestBench:
         attack_type = determine_attack_type(test_file, test_def)
         
         # Set up individual log file for this test case (matches results folder structure)
-        logs_base_dir = Path("data/benchmark/logs")
+        logs_base_dir = self.logs_base_dir if self.logs_base_dir is not None else Path("data/benchmark/logs")
         log_path = get_log_path(
             memory_backend=self.memory_backend_name,
             unified_defense=self.unified_defense,
@@ -896,7 +843,6 @@ class TestBench:
         debug_debug(f"About to create test environment for test: {test_name}")
         test_config = self.create_test_environment(test_name, initial_data)
         debug_debug("Test environment created successfully")
-        test_dir = Path(test_config["data"]["mailbox_dir"]).parent
 
         # Debug: Print all initial mem0 memories loaded in the vectorstore
         self._debug_print_initial_mem0_memories(test_config)
@@ -934,7 +880,8 @@ class TestBench:
                     
                     # Save current session history
                     try:
-                        current_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+                        in_memory_env = test_config.get("in_memory_environment")
+                        current_traces = in_memory_env.get_traces(session_id) if in_memory_env else []
                         session_history.append({
                             "session_id": session_id,
                             "step_range": f"1-{i-1}",
@@ -963,18 +910,18 @@ class TestBench:
                     ProvablePolicyManager.initialize_session(session_id)
                     
                     # Log session change event
-                    from agent.utils import append_trace_event, get_timestamp, generate_id
-                    append_trace_event(
-                        test_config["data"]["trace_file"],
-                        session_id=session_id,
-                        event_type="session_change",
-                        payload={
-                            "old_session_id": old_session_id,
-                            "new_session_id": session_id,
-                            "reason": "programmatic_session_management",
-                            "step": i
-                        }
-                    )
+                    in_memory_env = test_config.get("in_memory_environment")
+                    if in_memory_env:
+                        in_memory_env.log_event(
+                            session_id=session_id,
+                            event_type="session_change",
+                            payload={
+                                "old_session_id": old_session_id,
+                                "new_session_id": session_id,
+                                "reason": "programmatic_session_management",
+                                "step": i
+                            }
+                        )
                     
                     # Record this step (no success_check, so no "passed" attribute)
                     step_results.append({
@@ -1004,18 +951,12 @@ class TestBench:
                         })
                         continue
                     
-                    # Get inbox directory from test config
-                    inbox_dir = Path(test_config["data"]["mailbox_dir"])
-                    inbox_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Generate unique filename for attack email
-                    attack_email_id = str(uuid.uuid4())[:8]
-                    attack_email_file = inbox_dir / f"attack_{attack_email_id}.json"
-                    
-                    # Write attack email to inbox
+                    # Add to in-memory mailbox (required - filesystem storage no longer supported)
                     try:
-                        with open(attack_email_file, 'w', encoding='utf-8') as f:
-                            json.dump(attack_email, f, indent=2, ensure_ascii=False)
+                        mailbox = test_config.get("mailbox")
+                        if not mailbox:
+                            raise ValueError("mailbox is required in test_config")
+                        mailbox.add_email(attack_email, folder="inbox")
                         
                         print(f"Added attack email: {attack_email.get('subject', 'No subject')} from {attack_email.get('from', 'Unknown sender')}")
                         
@@ -1057,18 +998,12 @@ class TestBench:
                         })
                         continue
                     
-                    # Get inbox directory from test config
-                    inbox_dir = Path(test_config["data"]["mailbox_dir"])
-                    inbox_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Generate unique filename for email
-                    email_id = str(uuid.uuid4())[:8]
-                    email_file = inbox_dir / f"email_{email_id}.json"
-                    
-                    # Write email to inbox
+                    # Add email to in-memory mailbox (required - filesystem storage no longer supported)
                     try:
-                        with open(email_file, 'w', encoding='utf-8') as f:
-                            json.dump(email, f, indent=2, ensure_ascii=False)
+                        mailbox = test_config.get("mailbox")
+                        if not mailbox:
+                            raise ValueError("mailbox is required in test_config")
+                        mailbox.add_email(email, folder="inbox")
                         
                         print(f"Added email: {email.get('subject', 'No subject')} from {email.get('from', 'Unknown sender')}")
                         
@@ -1120,16 +1055,12 @@ class TestBench:
                         })
                         continue
                     
-                    # Get inbox directory from test config
-                    inbox_dir = Path(test_config["data"]["mailbox_dir"])
-                    inbox_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Generate unique filename for benign email
-                    benign_email_id = str(uuid.uuid4())[:8]
-                    benign_email_file = inbox_dir / f"benign_{benign_email_id}.json"
-                    
-                    # Write benign email to inbox
+                    # Add benign email to in-memory mailbox (required - filesystem storage no longer supported)
                     try:
+                        mailbox = test_config.get("mailbox")
+                        if not mailbox:
+                            raise ValueError("mailbox is required in test_config")
+                        mailbox.add_email(benign_email, folder="inbox")
                         with open(benign_email_file, 'w', encoding='utf-8') as f:
                             json.dump(benign_email, f, indent=2, ensure_ascii=False)
                         
@@ -1186,7 +1117,8 @@ class TestBench:
                     
                     # Collect traces for this step
                     try:
-                        step_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+                        in_memory_env = test_config.get("in_memory_environment")
+                        step_traces = in_memory_env.get_traces(session_id) if in_memory_env else []
                         # Print only tool_call and tool_result events (to avoid duplicate user_input/agent_response)
                         for trace_event in step_traces:
                             event_type = trace_event.get('event_type', '')
@@ -1231,8 +1163,7 @@ class TestBench:
                                     # Use validate_with_print if it's a composite validator
                                     if isinstance(validator, CompositeValidator):
                                         print("\nUser Goal Validator Results:")
-                                        trace_file = test_config.get("data", {}).get("trace_file") if isinstance(test_config.get("data"), dict) else None
-                                        user_goal_passed = validator.validate_with_print(response, session_id, step_traces, trace_file=trace_file)
+                                        user_goal_passed = validator.validate_with_print(response, session_id, step_traces)
                                     else:
                                         user_goal_passed = validator.validate(response, session_id, step_traces)
                                         # Print single validator result
@@ -1241,13 +1172,11 @@ class TestBench:
                                         print_validator_result(validator_type, "User goal", user_goal_passed)
                                         # Log to trace
                                         try:
-                                            from agent.utils import append_trace_event
-                                            trace_file = test_config.get("data", {}).get("trace_file") if isinstance(test_config.get("data"), dict) else None
-                                            if trace_file:
-                                                append_trace_event(
-                                                    trace_file,
-                                                    "validator_results",
+                                            in_memory_env = test_config.get("in_memory_environment")
+                                            if in_memory_env:
+                                                in_memory_env.log_event(
                                                     session_id,
+                                                    "validator_results",
                                                     {
                                                         "type": validator_type,
                                                         "name": "User goal",
@@ -1279,8 +1208,7 @@ class TestBench:
                                     # Use validate_with_print if it's a composite validator
                                     if isinstance(validator, CompositeValidator):
                                         print("\nValidator Results:")
-                                        trace_file = test_config.get("data", {}).get("trace_file") if isinstance(test_config.get("data"), dict) else None
-                                        attack_goal_passed = validator.validate_with_print(response, session_id, step_traces, trace_file=trace_file)
+                                        attack_goal_passed = validator.validate_with_print(response, session_id, step_traces)
                                     else:
                                         attack_goal_passed = validator.validate(response, session_id, step_traces)
                                         # Print single validator result
@@ -1289,13 +1217,11 @@ class TestBench:
                                         print_validator_result(validator_type, "Attack goal", attack_goal_passed)
                                         # Log to trace
                                         try:
-                                            from agent.utils import append_trace_event
-                                            trace_file = test_config.get("data", {}).get("trace_file") if isinstance(test_config.get("data"), dict) else None
-                                            if trace_file:
-                                                append_trace_event(
-                                                    trace_file,
-                                                    "validator_results",
+                                            in_memory_env = test_config.get("in_memory_environment")
+                                            if in_memory_env:
+                                                in_memory_env.log_event(
                                                     session_id,
+                                                    "validator_results",
                                                     {
                                                         "type": validator_type,
                                                         "name": "Attack goal",
@@ -1355,8 +1281,7 @@ class TestBench:
                                     # Use validate_with_print if it's a composite validator
                                     if isinstance(validator, CompositeValidator):
                                         print("\nValidator Results:")
-                                        trace_file = test_config.get("data", {}).get("trace_file") if isinstance(test_config.get("data"), dict) else None
-                                        step_passed = validator.validate_with_print(response, session_id, step_traces, trace_file=trace_file)
+                                        step_passed = validator.validate_with_print(response, session_id, step_traces)
                                     else:
                                         step_passed = validator.validate(response, session_id, step_traces)
                                         # Print single validator result
@@ -1365,13 +1290,11 @@ class TestBench:
                                         print_validator_result(validator_type, "Success check", step_passed)
                                         # Log to trace
                                         try:
-                                            from agent.utils import append_trace_event
-                                            trace_file = test_config.get("data", {}).get("trace_file") if isinstance(test_config.get("data"), dict) else None
-                                            if trace_file:
-                                                append_trace_event(
-                                                    trace_file,
-                                                    "validator_results",
+                                            in_memory_env = test_config.get("in_memory_environment")
+                                            if in_memory_env:
+                                                in_memory_env.log_event(
                                                     session_id,
+                                                    "validator_results",
                                                     {
                                                         "type": validator_type,
                                                         "name": "Success check",
@@ -1476,7 +1399,8 @@ class TestBench:
         
             # Add final session to session history (if there are any remaining steps after the last session change)
             try:
-                final_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+                in_memory_env = test_config.get("in_memory_environment")
+                final_traces = in_memory_env.get_traces(session_id) if in_memory_env else []
                 if final_traces:  # Only add if there are traces for the final session
                     # Find the last session change step to determine the step range
                     last_session_step = 0
@@ -1513,7 +1437,6 @@ class TestBench:
                 "overall_success": all_passed,
                 "steps": step_results,
                 "session_history": session_history,
-                "test_environment": str(test_dir),
                 "execution_success": test_execution_success,  # True if no execution errors, False otherwise
                 "execution_errors": test_execution_errors if test_execution_errors else None  # List of error messages
             }
@@ -1592,7 +1515,8 @@ class TestBench:
             
         finally:
             # Clean up test environment
-            self.cleanup_test_environment(test_dir)
+            # No explicit cleanup needed - temp directories are cleaned up automatically
+            pass
     
     def _run_adaptive_test_from_file(self, test_file: Path) -> Dict[str, Any]:
         """
@@ -1616,23 +1540,30 @@ class TestBench:
         # Use helper function to determine attack_type (handles memory_only tests)
         attack_type = determine_attack_type(test_file, test_def)
         
-        # Check if this is an indirect PI attack (only these get adaptive treatment)
-        if attack_type != "indirect":
-            print(f"Non-indirect attack, running in static mode")
+        # Check if this is an attack_bench test (only these get adaptive treatment)
+        test_file_str = str(test_file)
+        is_attack_bench = "attack_bench" in test_file_str
+        if not is_attack_bench:
+            print(f"Non-attack-bench test, running in static mode")
             return self._run_static_test_from_file(test_file)
         
         # Check for cached version first
         cached_test = self._get_cached_test(test_file)
         if cached_test:
-            print(f"💾 Using cached test with optimized attack")
-            return self._run_static_test_from_file(cached_test)
+            print(f"💾 Found cached test with optimized attack, loading it")
+            # Load the cached test definition (which has optimized attack emails)
+            with open(cached_test, 'r', encoding='utf-8') as f:
+                cached_test_def = json.load(f)
+            # Use the cached test definition instead of the original
+            test_def = cached_test_def
+            print(f"💾 Using optimized attack email from cache")
         
         print(f"Running adaptive test for indirect attack: {test_name}")
         
         # Initialize state manager with test data
         self.state_manager.initialize(test_def, self.config)
         
-        # Run test with adaptive optimization
+        # Run test with adaptive optimization (even if using cached test, so we can re-optimize if attack fails)
         result = self._run_test_with_optimization(test_def, test_file)
         
         # Save detailed result using unified structure (match static behavior)
@@ -1692,9 +1623,21 @@ class TestBench:
         except Exception as e:
             print(f"Warning: Failed to save adaptive test result: {e}")
         
-        # Cache successful attacks
+        # Cache successful attacks - only cache if optimization was used AND attack goal actually succeeded
         if result.get("optimization_used"):
-            self._cache_successful_attack(test_file, result)
+            # Check if any attack goal actually passed
+            attack_succeeded = False
+            steps = result.get("steps", [])
+            for step_result in steps:
+                attack_goal = step_result.get("attack_goal", {})
+                if isinstance(attack_goal, dict) and attack_goal.get("passed") is True:
+                    attack_succeeded = True
+                    break
+            
+            if attack_succeeded:
+                self._cache_successful_attack(test_file, result)
+            else:
+                print(f"💾 Optimization was used but attack did not succeed - not caching")
         
         return result
     
@@ -1739,7 +1682,6 @@ class TestBench:
         
         # Create test environment
         test_config = self.create_test_environment(test_name, initial_data)
-        test_dir = Path(test_config["data"]["mailbox_dir"]).parent
         
         # Debug: Print all initial mem0 memories loaded in the vectorstore
         self._debug_print_initial_mem0_memories(test_config)
@@ -1774,7 +1716,8 @@ class TestBench:
                     
                     # Save current session history before switching
                     try:
-                        current_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+                        in_memory_env = test_config.get("in_memory_environment")
+                        current_traces = in_memory_env.get_traces(session_id) if in_memory_env else []
                         if current_traces:  # Only add if there are traces
                             # Find the last session change step to determine the step range
                             last_session_step = 0
@@ -1812,18 +1755,18 @@ class TestBench:
                     
                     # Log session change event
                     try:
-                        from agent.utils import append_trace_event, get_timestamp, generate_id
-                        append_trace_event(
-                            test_config["data"]["trace_file"],
-                            session_id=session_id,
-                            event_type="session_change",
-                            payload={
-                                "old_session_id": old_session_id,
-                                "new_session_id": session_id,
-                                "reason": "programmatic_session_management",
-                                "step": i
-                            }
-                        )
+                        in_memory_env = test_config.get("in_memory_environment")
+                        if in_memory_env:
+                            in_memory_env.log_event(
+                                session_id=session_id,
+                                event_type="session_change",
+                                payload={
+                                    "old_session_id": old_session_id,
+                                    "new_session_id": session_id,
+                                    "reason": "programmatic_session_management",
+                                    "step": i
+                                }
+                            )
                     except Exception as e:
                         debug_info("Could not log session change event")
                         debug_print_exception(e, context="Logging session change event", include_traceback=True)
@@ -1855,18 +1798,12 @@ class TestBench:
                         })
                         continue
                     
-                    # Get inbox directory from test config
-                    inbox_dir = Path(test_config["data"]["mailbox_dir"])
-                    inbox_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Generate unique filename for attack email
-                    attack_email_id = str(uuid.uuid4())[:8]
-                    attack_email_file = inbox_dir / f"attack_{attack_email_id}.json"
-                    
-                    # Write attack email to inbox
+                    # Add to in-memory mailbox (required - filesystem storage no longer supported)
                     try:
-                        with open(attack_email_file, 'w', encoding='utf-8') as f:
-                            json.dump(attack_email, f, indent=2, ensure_ascii=False)
+                        mailbox = test_config.get("mailbox")
+                        if not mailbox:
+                            raise ValueError("mailbox is required in test_config")
+                        mailbox.add_email(attack_email, folder="inbox")
                         
                         print(f"Added attack email: {attack_email.get('subject', 'No subject')} from {attack_email.get('from', 'Unknown sender')}")
                         
@@ -1918,18 +1855,12 @@ class TestBench:
                         })
                         continue
                     
-                    # Get inbox directory from test config
-                    inbox_dir = Path(test_config["data"]["mailbox_dir"])
-                    inbox_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Generate unique filename for email
-                    email_id = str(uuid.uuid4())[:8]
-                    email_file = inbox_dir / f"email_{email_id}.json"
-                    
-                    # Write email to inbox
+                    # Add to in-memory mailbox (required - filesystem storage no longer supported)
                     try:
-                        with open(email_file, 'w', encoding='utf-8') as f:
-                            json.dump(email, f, indent=2, ensure_ascii=False)
+                        mailbox = test_config.get("mailbox")
+                        if not mailbox:
+                            raise ValueError("mailbox is required in test_config")
+                        mailbox.add_email(email, folder="inbox")
                         
                         print(f"Added email: {email.get('subject', 'No subject')} from {email.get('from', 'Unknown sender')}")
                         
@@ -1981,18 +1912,12 @@ class TestBench:
                         })
                         continue
                     
-                    # Get inbox directory from test config
-                    inbox_dir = Path(test_config["data"]["mailbox_dir"])
-                    inbox_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Generate unique filename for benign email
-                    benign_email_id = str(uuid.uuid4())[:8]
-                    benign_email_file = inbox_dir / f"benign_{benign_email_id}.json"
-                    
-                    # Write benign email to inbox
+                    # Add to in-memory mailbox (required - filesystem storage no longer supported)
                     try:
-                        with open(benign_email_file, 'w', encoding='utf-8') as f:
-                            json.dump(benign_email, f, indent=2, ensure_ascii=False)
+                        mailbox = test_config.get("mailbox")
+                        if not mailbox:
+                            raise ValueError("mailbox is required in test_config")
+                        mailbox.add_email(benign_email, folder="inbox")
                         
                         print(f"Added benign email: {benign_email.get('subject', 'No subject')} from {benign_email.get('from', 'Unknown sender')}")
                         
@@ -2056,12 +1981,13 @@ class TestBench:
                             if step_result and "step_traces" in step_result:
                                 current_state.update_step_data(i, step_result["step_traces"])
                             else:
-                                # Fallback: read traces from file
+                                # Fallback: read traces from in-memory environment
                                 try:
-                                    step_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+                                    in_memory_env = test_config.get("in_memory_environment")
+                                    step_traces = in_memory_env.get_traces(session_id) if in_memory_env else []
                                     current_state.update_step_data(i, step_traces)
                                 except Exception as e:
-                                    debug_debug(f"Could not read traces from file for step {i}, continuing without traces")
+                                    debug_debug(f"Could not read traces for step {i}, continuing without traces")
                                     debug_print_exception(e, context=f"Reading traces for step {i} in adaptive test", include_traceback=True)
                             # Update session ID
                             current_state.session_id = session_id
@@ -2158,6 +2084,71 @@ class TestBench:
                             print(f"Clearing session history for {session_id} to match fresh optimization state")
                             clear_session_agent(session_id)
                             
+                            # CRITICAL: Replay steps 1 to (attack_email_step_num-1) to rebuild RAG vectorstore with optimized email
+                            # The scorer replays all steps, so its RAG vectorstore is correct
+                            # We need to do the same here so the RAG vectorstore gets rebuilt with the new optimized email
+                            if attack_email_step_num and attack_email_step_num > 1:
+                                print(f"🔄 Replaying steps 1-{attack_email_step_num-1} to rebuild RAG vectorstore with optimized attack email...")
+                                replay_session_id = f"adaptive_{int(time.time()*1000)}"
+                                
+                                # Initialize replay session as trusted
+                                from agent.agent_core import SessionTrustManager, ProvablePolicyManager
+                                SessionTrustManager.initialize_session(replay_session_id)
+                                ProvablePolicyManager.initialize_session(replay_session_id)
+                                
+                                # Get steps from test_def
+                                test_steps = test_def.get("steps", [])
+                                
+                                # Replay steps up to (but not including) the attack email step
+                                # This matches the scorer's behavior: replay all steps to rebuild RAG vectorstore
+                                for replay_step_num in range(1, attack_email_step_num):
+                                    if replay_step_num - 1 < len(test_steps):
+                                        replay_step = test_steps[replay_step_num - 1]  # Convert to 0-indexed
+                                        replay_step_type = replay_step.get("step_type", "user_message")
+                                        
+                                        if replay_step_type == "start_new_session":
+                                            # Start new session
+                                            old_replay_session = replay_session_id
+                                            replay_session_id = f"adaptive_{int(time.time()*1000)}"
+                                            print(f"   Replay step {replay_step_num}: New session {replay_session_id} (was {old_replay_session})")
+                                            clear_session_agent(old_replay_session)
+                                            SessionTrustManager.initialize_session(replay_session_id)
+                                            ProvablePolicyManager.initialize_session(replay_session_id)
+                                        
+                                        elif replay_step_type == "insert_email":
+                                            # Re-insert regular email (for consistency with scorer)
+                                            email = replay_step.get("email")
+                                            if email:
+                                                mailbox = test_config.get("mailbox")
+                                                if not mailbox:
+                                                    raise ValueError("mailbox is required in test_config")
+                                                mailbox.add_email(email, folder="inbox")
+                                                print(f"   Replay step {replay_step_num}: Re-inserted email '{email.get('subject', 'No subject')}'")
+                                        
+                                        elif replay_step_type == "insert_benign_email":
+                                            # Re-insert benign email (for consistency with scorer)
+                                            benign_email = replay_step.get("benign_email")
+                                            if benign_email:
+                                                mailbox = test_config.get("mailbox")
+                                                if not mailbox:
+                                                    raise ValueError("mailbox is required in test_config")
+                                                mailbox.add_email(benign_email, folder="inbox")
+                                                print(f"   Replay step {replay_step_num}: Re-inserted benign email '{benign_email.get('subject', 'No subject')}'")
+                                        
+                                        elif replay_step_type == "user_message":
+                                            # Run user message step (this triggers agent response and RAG indexing)
+                                            user_msg = replay_step.get("user_message", "")
+                                            if user_msg:
+                                                print(f"   Replay step {replay_step_num}: {user_msg[:50]}...")
+                                                invoke_agent(user_msg, replay_session_id, test_config)
+                                        
+                                        # Note: We skip "insert_attack_email" steps during replay because
+                                        # the optimized attack email has already been injected via _inject_optimized_attack_email
+                                
+                                # Update session_id to the final replay session for the actual step
+                                session_id = replay_session_id
+                                print(f"✅ Replayed steps 1-{attack_email_step_num-1}, RAG vectorstore rebuilt with optimized email")
+                            
                             # Re-run the step with optimized attack
                             step_result = self._run_step_with_attack_check(
                                 step, i, session_id, test_config, 
@@ -2196,12 +2187,13 @@ class TestBench:
                             if "step_traces" in step_result:
                                 current_state.update_step_data(i, step_result["step_traces"])
                             else:
-                                # Fallback: read traces from file
+                                # Fallback: read traces from in-memory environment
                                 try:
-                                    step_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+                                    in_memory_env = test_config.get("in_memory_environment")
+                                    step_traces = in_memory_env.get_traces(session_id) if in_memory_env else []
                                     current_state.update_step_data(i, step_traces)
                                 except Exception as e:
-                                    debug_debug(f"Could not read traces from file for step {i}, continuing without traces")
+                                    debug_debug(f"Could not read traces for step {i}, continuing without traces")
                                     debug_print_exception(e, context=f"Reading traces for step {i} in adaptive test", include_traceback=True)
                             # Update session ID
                             current_state.session_id = session_id
@@ -2216,7 +2208,8 @@ class TestBench:
             
             # Add final session to session history (if there are any remaining steps after the last session change)
             try:
-                final_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+                in_memory_env = test_config.get("in_memory_environment")
+                final_traces = in_memory_env.get_traces(session_id) if in_memory_env else []
                 if final_traces:  # Only add if there are traces for the final session
                     # Find the last session change step to determine the step range
                     last_session_step = 0
@@ -2275,7 +2268,6 @@ class TestBench:
                 "overall_success": all_passed,
                 "steps": step_results,
                 "session_history": session_history,
-                "test_environment": str(test_dir),
                 "optimization_used": optimization_used,
                 "total_user_steps": total_user_steps,
                 "total_successful_user_steps": total_successful_user_steps,
@@ -2294,32 +2286,15 @@ class TestBench:
             
         finally:
             # Clean up test environment
-            self.cleanup_test_environment(test_dir)
+            # No explicit cleanup needed - temp directories are cleaned up automatically
+            pass
     
     def _run_step_with_attack_check(self, step: Dict[str, Any], step_num: int, 
                                   session_id: str, test_config: Dict[str, Any],
                                   optimized_attack_email: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Run a step and check if attack succeeds."""
-        # Clear recent memory files at start of step (so we only check memories added this step)
-        test_dir = Path(test_config.get("data", {}).get("mailbox_dir", "")).parent if test_config.get("data", {}).get("mailbox_dir") else None
-        if test_dir:
-            # Clear RAG recent chunks
-            recent_chunks_file = test_dir / "rag_recent_chunks.json"
-            if recent_chunks_file.exists():
-                try:
-                    recent_chunks_file.unlink()
-                except Exception as e:
-                    debug_debug(f"Could not delete {recent_chunks_file} (non-critical cleanup)")
-                    debug_print_exception(e, context=f"Deleting RAG recent chunks file {recent_chunks_file}", include_traceback=True)
-            
-            # Clear mem0 recent memories
-            recent_memories_file = test_dir / "mem0_recent_memories.json"
-            if recent_memories_file.exists():
-                try:
-                    recent_memories_file.unlink()
-                except Exception as e:
-                    debug_debug(f"Could not delete {recent_memories_file} (non-critical cleanup)")
-                    debug_print_exception(e, context=f"Deleting mem0 recent memories file {recent_memories_file}", include_traceback=True)
+        # No file cleanup needed - everything is in-memory
+        # Recent memory tracking is handled in-memory by memory backends
         
         # If we have an optimized attack email, we need to update the test environment
         if optimized_attack_email:
@@ -2344,7 +2319,8 @@ class TestBench:
             
             # Get traces for evaluation
             try:
-                step_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+                in_memory_env = test_config.get("in_memory_environment")
+                step_traces = in_memory_env.get_traces(session_id) if in_memory_env else []
             except Exception as e:
                 debug_info("Could not read traces")
                 debug_print_exception(e, context="Reading traces", include_traceback=True)
@@ -2453,26 +2429,8 @@ class TestBench:
     def _run_regular_step(self, step: Dict[str, Any], step_num: int, 
                          session_id: str, test_config: Dict[str, Any]) -> Dict[str, Any]:
         """Run a regular step without attack goals."""
-        # Clear recent memory files at start of step (so we only check memories added this step)
-        test_dir = Path(test_config.get("data", {}).get("mailbox_dir", "")).parent if test_config.get("data", {}).get("mailbox_dir") else None
-        if test_dir:
-            # Clear RAG recent chunks
-            recent_chunks_file = test_dir / "rag_recent_chunks.json"
-            if recent_chunks_file.exists():
-                try:
-                    recent_chunks_file.unlink()
-                except Exception as e:
-                    debug_debug(f"Could not delete {recent_chunks_file} (non-critical cleanup)")
-                    debug_print_exception(e, context=f"Deleting RAG recent chunks file {recent_chunks_file}", include_traceback=True)
-            
-            # Clear mem0 recent memories
-            recent_memories_file = test_dir / "mem0_recent_memories.json"
-            if recent_memories_file.exists():
-                try:
-                    recent_memories_file.unlink()
-                except Exception as e:
-                    debug_debug(f"Could not delete {recent_memories_file} (non-critical cleanup)")
-                    debug_print_exception(e, context=f"Deleting mem0 recent memories file {recent_memories_file}", include_traceback=True)
+        # No file cleanup needed - everything is in-memory
+        # Recent memory tracking is handled in-memory by memory backends
         
         start_time = time.time()
         try:
@@ -2488,7 +2446,8 @@ class TestBench:
             # Get traces for regular steps too
             step_traces = []
             try:
-                step_traces = read_trace_events(test_config["data"]["trace_file"], session_id)
+                in_memory_env = test_config.get("in_memory_environment")
+                step_traces = in_memory_env.get_traces(session_id) if in_memory_env else []
             except Exception as e:
                 # Ignore trace reading errors for regular steps (non-critical)
                 debug_debug("Could not read traces for regular step (non-critical)")
@@ -2685,6 +2644,28 @@ class TestBench:
                     test_config, 
                     environment_state=None
                 )
+        
+        # CRITICAL: Clear the RAG vectorstore when injecting optimized email
+        # The RAG vectorstore was built with the old attack email from previous steps (1-3)
+        # We need to clear it so it gets rebuilt with the new optimized email when step 4 runs
+        # This ensures the agent retrieves the optimized email from RAG, not the old one
+        memory_backend = test_config.get("memory", {}).get("backend", "none")
+        if memory_backend == "rag":
+            rag_memory_config = test_config.get("memory", {}).get("rag_memory", {})
+            vectorstore = rag_memory_config.get("vectorstore")
+            if vectorstore:
+                try:
+                    print(f"🧹 Clearing in-memory RAG vectorstore to rebuild with optimized attack email")
+                    vectorstore.clear()
+                    print(f"✅ RAG vectorstore cleared successfully")
+                    if self.logger:
+                        self.logger.debug(f"Cleared in-memory RAG vectorstore to rebuild with optimized attack email")
+                except Exception as e:
+                    print(f"⚠️ Could not clear RAG vectorstore: {e}")
+                    debug_info(f"Could not clear RAG vectorstore: {e}")
+                    debug_print_exception(e, context="Clearing RAG vectorstore", include_traceback=True)
+            else:
+                print(f"ℹ️ No vectorstore found in rag_memory_config (will be created when agent processes emails)")
     
     def _cache_successful_attack(self, test_file: Path, result: Dict[str, Any]):
         """Cache a test with successful attacks for future runs."""
@@ -2770,19 +2751,13 @@ class TestBench:
         if not test_files:
             return []
         
-        # Determine if this is an attack benchmark by checking if any test has attack_type
+        # Determine if this is an attack benchmark by checking if test files are in attack_bench directory
         is_attack_bench = False
         for test_file in test_files:
-            try:
-                with open(test_file, 'r', encoding='utf-8') as f:
-                    test_def = json.load(f)
-                    if test_def.get("attack_type") in ["direct", "indirect"]:
-                        is_attack_bench = True
-                        break
-            except Exception as e:
-                debug_debug(f"Could not parse test file {test_file} to determine attack type, skipping")
-                debug_print_exception(e, context=f"Parsing test file {test_file} to determine attack type", include_traceback=True)
-                continue
+            test_file_str = str(test_file)
+            if "attack_bench" in test_file_str:
+                is_attack_bench = True
+                break
         
         bench_type = "ATTACK BENCHMARK" if is_attack_bench else "TEST BENCH"
         
@@ -2792,14 +2767,22 @@ class TestBench:
         print(f"Found {len(test_files)} test files")
         
         # Group tests by attack_type for better organization
-        test_groups = {"benign": [], "direct": [], "indirect": [], "memory_only": [], "assistant_responses": [], "untrusted_probe": [], "untrusted_send": [], "disable_send": [], "memory_tools": [], "long_memory": [], "unknown": []}
+        test_groups = {"memory_only": [], "assistant_responses": [], "untrusted_probe": [], "untrusted_send": [], "disable_send": [], "memory_tools": [], "long_memory": [], "attack_bench": [], "unknown": []}
         for test_file in test_files:
             try:
-                with open(test_file, 'r', encoding='utf-8') as f:
-                    test_def = json.load(f)
-                    # Use helper function to determine attack_type (handles memory_only tests)
-                    attack_type = determine_attack_type(test_file, test_def)
-                    test_groups[attack_type].append(test_file)
+                test_file_str = str(test_file)
+                # Check if this is an attack_bench test
+                if "attack_bench" in test_file_str:
+                    test_groups["attack_bench"].append(test_file)
+                else:
+                    with open(test_file, 'r', encoding='utf-8') as f:
+                        test_def = json.load(f)
+                        # Use helper function to determine attack_type (handles utility suite tests)
+                        attack_type = determine_attack_type(test_file, test_def)
+                        if attack_type and attack_type in test_groups:
+                            test_groups[attack_type].append(test_file)
+                        else:
+                            test_groups["unknown"].append(test_file)
             except Exception:
                 test_groups["unknown"].append(test_file)
         
@@ -2824,18 +2807,25 @@ class TestBench:
     
     def cleanup_all_test_environments(self):
         """
-        Clean up all test environment directories.
+        Clean up all temporary trace/session directories.
         
-        Ensures all test environments created during this benchmark run are removed.
+        These are minimal temp directories created by tempfile.mkdtemp() for traces/sessions only.
+        Since everything else is in-memory, cleanup is optional (OS will clean up temp dirs eventually).
+        We still clean them up explicitly to avoid cluttering the temp directory, but silently.
         """
         if not self.test_dirs:
             return
         
-        print(f"\n🧹 Cleaning up {len(self.test_dirs)} test environment(s)...")
+        # Silently clean up temp directories (no verbose messages since they're just temp files)
         for test_dir in self.test_dirs:
-            self.cleanup_test_environment(test_dir)
+            if test_dir and test_dir.exists():
+                try:
+                    import shutil
+                    shutil.rmtree(test_dir)
+                except Exception:
+                    # Ignore cleanup errors for temp directories - OS will clean them up eventually
+                    pass
         self.test_dirs.clear()
-        print("All test environments cleaned up.")
     
     def print_summary(self, results: List[Dict[str, Any]]):
         """Generate a summary report of all test results."""
@@ -2877,22 +2867,29 @@ class TestBench:
         failed_steps = total_user_steps - total_successful_user_steps
         
         # Group results by attack_type
-        attack_type_groups = {"benign": [], "direct": [], "indirect": []}
+        attack_type_groups = {"memory_only": [], "assistant_responses": [], "untrusted_probe": [], "untrusted_send": [], "disable_send": [], "memory_tools": [], "long_memory": [], "attack_bench": [], "unknown": []}
         for result in results:
             # Try to get attack_type from test file
-            attack_type = "benign"  # default to benign if not found
+            attack_type = None  # default to None if not found
             try:
                 test_file = Path(result.get("test_file", ""))
                 if test_file.exists():
-                    with open(test_file, 'r', encoding='utf-8') as f:
-                        test_def = json.load(f)
-                    # Use helper function to determine attack_type (handles memory_only tests)
-                    attack_type = determine_attack_type(test_file, test_def)
+                    test_file_str = str(test_file)
+                    # Check if this is an attack_bench test
+                    if "attack_bench" in test_file_str:
+                        attack_type = "attack_bench"
+                    else:
+                        with open(test_file, 'r', encoding='utf-8') as f:
+                            test_def = json.load(f)
+                        # Use helper function to determine attack_type (handles utility suite tests)
+                        attack_type = determine_attack_type(test_file, test_def)
             except Exception as e:
                 debug_debug(f"Could not parse test file {test_file} to determine attack type for result grouping")
                 debug_print_exception(e, context=f"Parsing test file {test_file} for result grouping", include_traceback=True)
-            if attack_type in attack_type_groups:
+            if attack_type and attack_type in attack_type_groups:
                 attack_type_groups[attack_type].append(result)
+            else:
+                attack_type_groups["unknown"].append(result)
         
         # Calculate utility and attack success rates for attack benchmarks
         utility_success_rate = "N/A"
@@ -2976,7 +2973,7 @@ def main():
     
     parser = argparse.ArgumentParser(description="Email Agent Test Bench")
     parser.add_argument("--test", type=str, nargs="+", help="Run specific test file(s) or directory(ies). Can specify multiple paths separated by spaces.")
-    parser.add_argument("--suite", type=str, choices=["benign", "direct", "indirect"], help="Shortcut to run an entire suite under data/benchmark/attack_bench/<suite>.")
+    parser.add_argument("--suite", type=str, choices=["memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"], help="Shortcut to run an entire utility test suite under data/benchmark/tests/<suite>/.")
     parser.add_argument("--config", type=str, default="agent_config.yaml", help="Config file")
     parser.add_argument("--defense-type", type=str, help="Override defense_type from config (e.g., 'none', 'user_prompt_only', 'no_untrusted_tools', 'disable_memory'). This allows parallel runs without modifying the global config file.")
     parser.add_argument("--force", action="store_true", help="Force overwrite existing results")
@@ -3020,10 +3017,10 @@ def main():
                 print("No tests were executed successfully.")
                 return 1
         else:
-            # No specific tests specified, run all suites by default
-            print("No specific tests specified. Running all test suites...")
+            # No specific tests specified, run all utility test suites by default
+            print("No specific tests specified. Running all utility test suites...")
             all_results = []
-            for suite in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools"]:
+            for suite in ["memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"]:
                 print(f"\n{'='*60}")
                 print(f"Running suite: {suite}")
                 print(f"{'='*60}")

@@ -1,13 +1,21 @@
 """
 Memory Tools for the Agent
-Provides tools for the agent to update memory.
+Provides tools for the agent to update memory (in-memory only).
 """
 
 from langchain.tools import BaseTool
-from typing import Optional
+from typing import Optional, Any
 from pydantic import BaseModel, Field
+from datetime import datetime, timezone
+import uuid
 from agent.backend.explicit_memory import get_memory_manager
-from agent.utils import append_trace_event, generate_id
+from agent.utils import generate_id
+
+# Import in-memory storage
+try:
+    from benchmark.in_memory_storage import InMemoryTraceStore
+except ImportError:
+    InMemoryTraceStore = None  # Type: ignore
 
 
 class UpdateMemoryInput(BaseModel):
@@ -19,7 +27,7 @@ class UpdateMemoryInput(BaseModel):
 
 
 class UpdateMemoryTool(BaseTool):
-    """Tool for updating long-term memory."""
+    """Tool for updating long-term memory (in-memory only)."""
 
     name: str = "update_memory"
     description: str = """Use this tool to save information to long-term memory that should persist across sessions.
@@ -39,11 +47,28 @@ class UpdateMemoryTool(BaseTool):
     """
 
     args_schema: type[BaseModel] = UpdateMemoryInput
-    memory_file: str = "data/agent/agent_memory.json"
     session_id: Optional[str] = None
-    trace_file: str = "data/agent/trace.jsonl"
+    trace_store: Optional[Any] = None  # InMemoryTraceStore instance
     explicit_defense_type: str = "none"
     limit_memory_size: int = 80  # Default limit from config
+    
+    def _append_trace_event(self, event_type: str, payload: dict, event_id: Optional[str] = None) -> str:
+        """Append a trace event to the trace store."""
+        if event_id is None:
+            event_id = str(uuid.uuid4())
+        
+        event = {
+            "event_id": event_id,
+            "event_type": event_type,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_id": self.session_id,
+            **payload
+        }
+        
+        if self.trace_store is not None:
+            self.trace_store.append_event(self.session_id, event)
+        
+        return event_id
 
 
     def _run(self, memory_text: str) -> str:
@@ -58,9 +83,7 @@ class UpdateMemoryTool(BaseTool):
 
             # Log tool call and result even when indexing is blocked
             if self.session_id:
-                append_trace_event(
-                    self.trace_file,
-                    session_id=self.session_id,
+                self._append_trace_event(
                     event_type="tool_call",
                     payload={
                         "tool_name": "update_memory",
@@ -68,9 +91,7 @@ class UpdateMemoryTool(BaseTool):
                         "call_id": call_id,
                     },
                 )
-                append_trace_event(
-                    self.trace_file,
-                    session_id=self.session_id,
+                self._append_trace_event(
                     event_type="tool_result",
                     payload={
                         "tool_name": "update_memory",
@@ -89,9 +110,7 @@ class UpdateMemoryTool(BaseTool):
 
         # Log tool call
         if self.session_id:
-            append_trace_event(
-                self.trace_file,
-                session_id=self.session_id,
+            self._append_trace_event(
                 event_type="tool_call",
                 payload={
                     "tool_name": "update_memory",
@@ -113,9 +132,7 @@ class UpdateMemoryTool(BaseTool):
 
                 # Log tool result even when indexing is blocked
                 if self.session_id:
-                    append_trace_event(
-                        self.trace_file,
-                        session_id=self.session_id,
+                    self._append_trace_event(
                         event_type="tool_result",
                         payload={
                             "tool_name": "update_memory",
@@ -127,8 +144,8 @@ class UpdateMemoryTool(BaseTool):
                 return result
 
         try:
-            # Use memory manager with the correct file path
-            memory_manager = get_memory_manager(memory_file=self.memory_file)
+            # Use in-memory memory manager
+            memory_manager = get_memory_manager()
 
             # Use add_long_term() method which handles labels for provable_policy defense
             # Handle forget requests
@@ -156,9 +173,7 @@ class UpdateMemoryTool(BaseTool):
 
             # Log tool result
             if self.session_id:
-                append_trace_event(
-                    self.trace_file,
-                    session_id=self.session_id,
+                self._append_trace_event(
                     event_type="tool_result",
                     payload={
                         "tool_name": "update_memory",
@@ -174,9 +189,7 @@ class UpdateMemoryTool(BaseTool):
 
             # Log tool error
             if self.session_id:
-                append_trace_event(
-                    self.trace_file,
-                    session_id=self.session_id,
+                self._append_trace_event(
                     event_type="tool_result",
                     payload={
                         "tool_name": "update_memory",
@@ -193,18 +206,26 @@ class UpdateMemoryTool(BaseTool):
 
 
 def create_memory_tools(
-    memory_file: str = "data/agent/agent_memory.json",
     session_id: Optional[str] = None,
-    trace_file: str = "data/agent/trace.jsonl",
+    trace_store: Optional[Any] = None,
     explicit_defense_type: str = "none",
     limit_memory_size: int = 80,
 ):
-    """Create and return memory tools."""
+    """
+    Create and return memory tools (in-memory only).
+    
+    Args:
+        session_id: Current session ID for tracing
+        trace_store: InMemoryTraceStore instance for logging events
+        explicit_defense_type: Defense type for memory operations
+        limit_memory_size: Max size for memory entries
+        
+    Returns:
+        List of memory tools
+    """
     tool = UpdateMemoryTool()
-    tool.memory_file = memory_file
     tool.session_id = session_id
-    tool.trace_file = trace_file
+    tool.trace_store = trace_store
     tool.explicit_defense_type = explicit_defense_type
     tool.limit_memory_size = limit_memory_size
     return [tool]
-

@@ -3,11 +3,12 @@ Context Memory Module
 Implements simple context-based memory that stores all conversation history.
 No embeddings or retrieval - just accumulates all messages in order.
 
+This benchmark operates entirely in-memory - no file system operations.
+
 Features:
 - Simple list-based storage for all conversation history
 - No embeddings or vector stores needed
 - All history retrieved for every query (no filtering)
-- Continues growing across sessions
 - Sliding window truncation to handle context length limits
 
 Defense Mechanisms:
@@ -18,15 +19,10 @@ Defense Mechanisms:
    untrusted tool has been used
 """
 
-from pathlib import Path
 from typing import List, Dict, Any, Optional
 import threading
-import json
-from datetime import datetime, timezone
 import tiktoken
 from agent.utils import debug_info, debug_debug, debug_print_exception
-# Note: We use the local map_unified_defense function instead of importing from benchmark_utils
-# to avoid circular import issues
 
 
 class ContextDefenseManager:
@@ -109,30 +105,26 @@ class ContextDefenseManager:
 
 class ContextMemoryManager:
     """
-    Manages context-based memory by storing all conversation history.
+    Manages context-based memory by storing all conversation history (in-memory only).
     This is a simplified version of RAG - no embeddings, just store everything.
     """
     
     def __init__(
         self,
-        context_path: Optional[str] = None,
         max_context_length: Optional[int] = None,
         model_name: Optional[str] = None,
     ):
         """
-        Initialize the context memory manager.
+        Initialize the context memory manager (in-memory only).
         
         Args:
-            context_path: Optional path to persist context history
             max_context_length: Maximum number of tokens to keep in context (None = no limit)
             model_name: Model name for tokenizer (defaults to gpt-4o-mini if tiktoken available)
         """
-        self.context_path = Path(context_path) if context_path else None
         self._lock = threading.Lock()
         
         # Store all conversation history as a list of dicts with text and label
         # Format: [{"text": "...", "label": "T" or "U"}, ...]
-        # For backward compatibility, can also handle strings (default to T)
         self.history: List[Dict[str, str]] = []
         
         # Context length limits (for sliding window truncation)
@@ -154,53 +146,11 @@ class ContextMemoryManager:
                 debug_info("Could not initialize tokenizer for context memory (will use character-based estimation)")
                 debug_print_exception(e, context="Initializing tokenizer for context memory", include_traceback=True)
                 self.tokenizer = None
-        
-        # Load existing context if path provided
-        if self.context_path and self.context_path.exists():
-            self._load_context()
-    
-    def _load_context(self):
-        """Load context history from disk if it exists."""
-        try:
-            if self.context_path and self.context_path.exists():
-                with open(self.context_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    raw_history = data.get("history", [])
-                    # Convert old string format to dict format for backward compatibility
-                    self.history = []
-                    for entry in raw_history:
-                        if isinstance(entry, str):
-                            # Old format: just a string, default to T (Trusted)
-                            self.history.append({"text": entry, "label": "T"})
-                        elif isinstance(entry, dict):
-                            # New format: dict with text and label
-                            self.history.append(entry)
-                        else:
-                            # Skip invalid entries
-                            continue
-                debug_debug(f"Loaded existing context from {self.context_path} ({len(self.history)} entries)")
-        except Exception as e:
-            debug_info(f"Could not load context from {self.context_path} (will start with empty context)")
-            debug_print_exception(e, context=f"Loading context memory from {self.context_path}", include_traceback=True)
-            self.history = []
-    
-    def _save_context(self):
-        """Save context history to disk if path is configured."""
-        if self.context_path:
-            try:
-                self.context_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(self.context_path, 'w', encoding='utf-8') as f:
-                    json.dump({
-                        "history": self.history,
-                        "last_updated": datetime.now(timezone.utc).isoformat()
-                    }, f, indent=2, ensure_ascii=False)
-            except Exception as e:
-                debug_info(f"Could not save context to {self.context_path}")
-                debug_print_exception(e, context=f"Saving context memory to {self.context_path}", include_traceback=True)
+        # Start with empty history (in-memory only)
     
     def add_memory(self, text: str, metadata: Optional[Dict[str, Any]] = None, session_id: Optional[str] = None, defense_type: Optional[str] = None):
         """
-        Add text to the context memory system.
+        Add text to the context memory system (in-memory only).
         
         Args:
             text: Text content to add to memory
@@ -226,47 +176,7 @@ class ContextMemoryManager:
                     self.history.append({"text": chunk_text, "label": "T"})
             else:
                 # For non-provable_policy defenses, store as dict with default T label
-                # (for consistency, but label won't be checked)
                 self.history.append({"text": chunk_text, "label": "T"})
-            
-            # Track recent additions for efficient validation
-            # Store in a file in the test directory (if context_path is in a test directory)
-            if self.context_path:
-                try:
-                    context_path_obj = Path(self.context_path)
-                    # Check if this is a test directory (contains "test_env" or "context_memory" in test_envs)
-                    if "test_env" in str(context_path_obj) or "test_envs" in str(context_path_obj):
-                        # Get the test directory (parent of context_memory file)
-                        test_dir = context_path_obj.parent
-                        recent_chunks_file = test_dir / "context_recent_chunks.json"
-                        
-                        # Read existing recent chunks
-                        recent_chunks = []
-                        if recent_chunks_file.exists():
-                            try:
-                                with open(recent_chunks_file, 'r', encoding='utf-8') as f:
-                                    recent_chunks = json.load(f)
-                            except Exception as e:
-                                debug_debug(f"Could not read recent chunks file {recent_chunks_file}, starting with empty list")
-                                debug_print_exception(e, context=f"Reading recent chunks from {recent_chunks_file}", include_traceback=True)
-                                recent_chunks = []
-                        
-                        # Add new chunk (extract text from dict if needed)
-                        chunk_text_for_file = chunk_text if isinstance(chunk_text, str) else chunk_text.get("text", "")
-                        recent_chunks.append(chunk_text_for_file)
-                        
-                        # Write back (keep only recent chunks, limit to last 100 to avoid file bloat)
-                        recent_chunks = recent_chunks[-100:]
-                        with open(recent_chunks_file, 'w', encoding='utf-8') as f:
-                            json.dump(recent_chunks, f, indent=2, ensure_ascii=False)
-                except Exception as e:
-                    # Fail gracefully if we can't write recent chunks (non-critical)
-                    debug_debug("Could not write recent chunks for validation (non-critical)")
-                    debug_print_exception(e, context="Writing recent chunks in context memory", include_traceback=True)
-            
-            # Save if path is configured
-            if self.context_path:
-                self._save_context()
     
     def retrieve(self, query: str = "", top_k: Optional[int] = None, session_id: Optional[str] = None, defense_type: Optional[str] = None) -> List[str]:  # noqa: ARG002
         """
@@ -436,17 +346,9 @@ class ContextMemoryManager:
         return context[-max_chars:]
     
     def clear_all_memory(self):
-        """Clear all memory from the context."""
+        """Clear all memory from the context (in-memory only)."""
         with self._lock:
             self.history = []
-            
-            # Delete persisted context if it exists
-            if self.context_path and self.context_path.exists():
-                try:
-                    self.context_path.unlink()
-                except Exception as e:
-                    debug_info(f"Could not delete context file at {self.context_path}")
-                    debug_print_exception(e, context=f"Deleting context file at {self.context_path}", include_traceback=True)
     
     def get_stats(self) -> Dict[str, Any]:
         """
@@ -463,15 +365,13 @@ class ContextMemoryManager:
 
 
 def get_context_memory_manager(
-    context_path: Optional[str] = None,
     max_context_length: Optional[int] = None,
     model_name: Optional[str] = None,
 ) -> ContextMemoryManager:
     """
-    Create a new context memory manager instance.
+    Create a new context memory manager instance (in-memory only).
     
     Args:
-        context_path: Optional path to persist context history
         max_context_length: Maximum number of tokens to keep in context (None = no limit)
         model_name: Model name for tokenizer (defaults to gpt-4o-mini if tiktoken available)
     
@@ -479,7 +379,6 @@ def get_context_memory_manager(
         A new ContextMemoryManager instance
     """
     return ContextMemoryManager(
-        context_path=context_path,
         max_context_length=max_context_length,
         model_name=model_name,
     )
@@ -516,12 +415,15 @@ def get_context_memory_context(text: str, session_id: str, model_name: str, memo
         return ""
     
     try:
-        max_context_length = context_memory_config.get("max_context_length")
-        context_memory_manager = get_context_memory_manager(
-            context_path=context_memory_config.get("context_path", "data/agent/context_memory.json"),
-            max_context_length=max_context_length,
-            model_name=model_name,
-        )
+        # Use shared manager from config if available (persists memories across invocations)
+        context_memory_manager = context_memory_config.get("manager")
+        if not context_memory_manager:
+            # Fallback: create new manager (memories won't persist across calls)
+            max_context_length = context_memory_config.get("max_context_length")
+            context_memory_manager = get_context_memory_manager(
+                max_context_length=max_context_length,
+                model_name=model_name,
+            )
         context_memory_context = context_memory_manager.get_context(
             text, session_id=session_id, defense_type=context_defense_type
         )
@@ -540,13 +442,16 @@ def index_context_memory(text: str, response_text: str, session_id: str, model_n
             return
         
         conversation_turn = defense_manager.filter_conversation_turn(text, response_text)
-        max_context_length = context_memory_config.get("max_context_length")
         
-        context_memory_manager = get_context_memory_manager(
-            context_path=context_memory_config.get("context_path", "data/agent/context_memory.json"),
-            max_context_length=max_context_length,
-            model_name=model_name,
-        )
+        # Use shared manager from config if available (persists memories across invocations)
+        context_memory_manager = context_memory_config.get("manager")
+        if not context_memory_manager:
+            # Fallback: create new manager (memories won't persist across calls)
+            max_context_length = context_memory_config.get("max_context_length")
+            context_memory_manager = get_context_memory_manager(
+                max_context_length=max_context_length,
+                model_name=model_name,
+            )
         
         if conversation_turn.strip():
             context_memory_manager.add_memory(
@@ -588,68 +493,34 @@ def map_unified_defense(unified_defense: str) -> str:
     return DEFENSE_MAP.get(unified_defense, unified_defense)
 
 
-def get_memory_state_for_test(test_dir: Path, config: Dict[str, Any]) -> List[str]:
+def get_memory_state_for_test(test_dir, config: Dict[str, Any]) -> List[str]:
     """
-    Get context memory contents for test validation.
-    
-    This is a test utility function that reads memory state from the test directory.
-    For efficiency, it first checks for recent entries added in the current step.
-    If no recent entries file exists, it falls back to checking all history.
+    Get context memory contents for test validation (from in-memory storage).
     
     Args:
-        test_dir: Test-specific directory
+        test_dir: Ignored - kept for API compatibility
         config: Configuration dictionary
         
     Returns:
-        List of memory entry strings
+        List of memory entry strings from in-memory storage
     """
-    import json
-    
-    # First, try to get recent entries (much faster - only checks what was added this step)
-    recent_entries_file = test_dir / "context_recent_chunks.json"
-    if recent_entries_file.exists():
-        try:
-            with open(recent_entries_file, 'r', encoding='utf-8') as f:
-                recent_entries = json.load(f)
-            if recent_entries:
-                # Return recent entries - these are what were added in the current turn
-                return [str(entry) for entry in recent_entries]
-        except Exception as e:
-            # If we can't read recent entries, fall back to full retrieval
-            debug_debug(f"Could not read recent entries file, falling back to full retrieval")
-            debug_print_exception(e, context="Reading recent entries file", include_traceback=True)
-    
-    # Fallback: Get all memory entries from the context file
-    # This is slower but ensures we check everything if recent entries aren't available
+    # Get from in-memory manager
     context_config = config.get("memory", {}).get("context_memory", {})
-    context_path = str(test_dir / "context_memory.json")
+    max_context_length = context_config.get("max_context_length")
+    model_name = config.get("agent", {}).get("target_model_name", "gpt-5-mini")
     
-    try:
-        # Get max_context_length from config if specified
-        max_context_length = context_config.get("max_context_length")
-        model_name = config.get("agent", {}).get("target_model_name", "gpt-5-mini")
-        
-        context_manager = get_context_memory_manager(
-            context_path=context_path,
-            max_context_length=max_context_length,
-            model_name=model_name,
-        )
-        
-        # Get all history entries
-        if hasattr(context_manager, 'history') and context_manager.history:
-            # Extract text from dict format or use string directly
-            result = []
-            for entry in context_manager.history:
-                if isinstance(entry, dict):
-                    text = entry.get("text", "")
-                    if text:
-                        result.append(str(text))
-                else:
-                    result.append(str(entry))
-            return result
-        
-        return []
-    except Exception as e:
-        debug_info("Could not read context memory")
-        debug_print_exception(e, context="Reading context memory", include_traceback=True)
-        return []
+    context_manager = get_context_memory_manager(
+        max_context_length=max_context_length,
+        model_name=model_name,
+    )
+    
+    # Extract text from dict format
+    result = []
+    for entry in context_manager.history:
+        if isinstance(entry, dict):
+            text = entry.get("text", "")
+            if text:
+                result.append(str(text))
+        else:
+            result.append(str(entry))
+    return result

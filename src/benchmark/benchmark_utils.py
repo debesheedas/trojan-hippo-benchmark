@@ -103,7 +103,7 @@ def _get_result_path_components(
         memory_backend: Memory backend name ("explicit", "mem0", "rag", or "none")
         unified_defense: Unified defense name (e.g., "none", "disable_memory")
         model_name: Model name (e.g., "gpt-5-mini")
-        attack_type: Attack type ("benign", "direct", "indirect")
+        attack_type: Attack type (utility suite name or attack_type from test_def for attack_bench)
         
     Returns:
         Tuple of (backend_for_path, defense_folder)
@@ -150,7 +150,7 @@ def get_result_path(
         memory_backend: Memory backend name ("explicit", "mem0", "rag", or "none" for disable_memory)
         unified_defense: Unified defense name (e.g., "none", "disable_memory")
         model_name: Model name (e.g., "gpt-5-mini")
-        attack_type: Attack type ("benign", "direct", "indirect")
+        attack_type: Attack type (utility suite name or attack_type from test_def for attack_bench)
         test_file: Path to test file
         results_base_dir: Base directory for results
         
@@ -192,7 +192,7 @@ def get_log_path(
     memory_backend: str,
     unified_defense: str,
     model_name: str,
-    attack_type: str,
+    attack_type: Optional[str],
     test_file: Path,
     logs_base_dir: Path = Path("data/benchmark/logs")
 ) -> Path:
@@ -206,13 +206,17 @@ def get_log_path(
         memory_backend: Memory backend name ("explicit", "mem0", "rag", or "none" for disable_memory)
         unified_defense: Unified defense name (e.g., "none", "disable_memory")
         model_name: Model name (e.g., "gpt-5-mini")
-        attack_type: Attack type ("benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools")
+        attack_type: Attack type ("benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", or None/unknown)
         test_file: Path to test file
         logs_base_dir: Base directory for logs
         
     Returns:
         Path to log file
     """
+    # Handle None attack_type by determining it from test_file
+    if attack_type is None:
+        attack_type = determine_attack_type(test_file)
+    
     backend_for_path, defense_folder = _get_result_path_components(
         memory_backend, unified_defense, model_name, attack_type
     )
@@ -232,12 +236,14 @@ def get_log_path(
         )
     else:
         # Construct path: logs/{model_name}/{memory_backend}/{defense_folder}/{attack_type}/{test_file_name}.log
+        # Use "unknown" if attack_type is still None or empty
+        attack_type_folder = attack_type if attack_type else "unknown"
         log_path = (
             logs_base_dir /
             model_name /
             backend_for_path /
             defense_folder /
-            attack_type /
+            attack_type_folder /
             test_file.with_suffix('.log').name
         )
     
@@ -260,7 +266,7 @@ def get_combination_log_path(
         memory_backend: Memory backend name
         unified_defense: Unified defense name
         model_name: Model name
-        attack_type: Attack type ("benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools")
+        attack_type: Attack type (utility suite name or attack_type from test_def for attack_bench)
         logs_base_dir: Base directory for logs
         
     Returns:
@@ -301,7 +307,7 @@ def get_results_dir(
         memory_backend: Memory backend name ("explicit", "mem0", "rag", or "none")
         unified_defense: Unified defense name (e.g., "none", "disable_memory")
         model_name: Model name (e.g., "gpt-5-mini")
-        attack_type: Attack type ("benign", "direct", "indirect")
+        attack_type: Attack type (utility suite name or attack_type from test_def for attack_bench)
         results_base_dir: Base directory for results
         
     Returns:
@@ -570,11 +576,12 @@ def discover_test_files(
     Intelligently discover test files from a path.
     
     Handles:
-    - Suite keywords (benign, direct, indirect, memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory) -> maps to test_dir/{suite}/
+    - Suite keywords (memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory) -> maps to test_dir/{suite}/
     - File paths -> returns single file if JSON
     - Directory paths -> finds all JSON files recursively
     
     Uses unified test directory structure: data/benchmark/tests/{suite}/
+    For attack bench tests, use data/benchmark/attack_bench/ directly (no suites).
     
     Args:
         test_path: Path string (file, directory, or suite name)
@@ -586,7 +593,7 @@ def discover_test_files(
     """
     
     # Handle suite keywords
-    suite_keywords = {"benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"}
+    suite_keywords = {"memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"}
     if test_path in suite_keywords:
         test_path_obj = test_dir / test_path
     else:
@@ -620,10 +627,9 @@ def discover_test_files(
 
 def determine_attack_type(test_file: Path, test_def: Optional[Dict[str, Any]] = None) -> str:
     """
-    Determine the attack_type for a test file, handling memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, and long_memory tests specially.
-
-    Memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, and long_memory tests should be saved to their respective folders even if they have
-    attack_type="benign" in their JSON. This function detects these tests by:
+    Determine the attack_type for a test file.
+    
+    For utility tests (in data/benchmark/tests/), detects suite by path/filename:
     1. Checking if "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", or "long_memory" is in the test file path
     2. Checking if the filename starts with "memory_only_", "assistant_responses_", "untrusted_probe_", "untrusted_send_", "disable_send_", "memory_tools_", or "long_memory_"
     
@@ -632,7 +638,7 @@ def determine_attack_type(test_file: Path, test_def: Optional[Dict[str, Any]] = 
         test_def: Optional test definition dict (if already loaded)
         
     Returns:
-        Attack type string ("benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", or "long_memory")
+        Attack type string ("memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory", or from test_def if available)
     """
     # Check if this is a memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, or long_memory test by path or filename
     test_file_str = str(test_file)
@@ -651,18 +657,44 @@ def determine_attack_type(test_file: Path, test_def: Optional[Dict[str, Any]] = 
     if "long_memory" in test_file_str or test_file.name.startswith("long_memory_"):
         return "long_memory"
     
+    # Valid utility suite types (not obsolete "benign", "direct", "indirect")
+    valid_utility_suites = {"memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"}
+    
+    # Check if this is an attack_bench test (no suite structure)
+    if "attack_bench" in test_file_str:
+        # Attack bench tests don't have suites - return attack_type from test_def or "indirect" as default
+        if test_def:
+            return test_def.get("attack_type", "indirect")
+        # Fallback: try to read from file
+        try:
+            import json
+            with open(test_file, 'r', encoding='utf-8') as f:
+                test_data = json.load(f)
+            return test_data.get("attack_type", "indirect")
+        except Exception:
+            return "indirect"
+    
     # Otherwise, use attack_type from test definition if available
     if test_def:
-        return test_def.get("attack_type", "benign")
+        attack_type = test_def.get("attack_type")
+        # Only return valid utility suite types, not obsolete "benign", "direct", "indirect"
+        if attack_type in valid_utility_suites:
+            return attack_type
+        # If attack_type is obsolete or not found, return "unknown" as default
+        # This ensures we always return a valid string for path construction
+        return "unknown"
     
     # Fallback: try to read from file
     try:
         import json
         with open(test_file, 'r', encoding='utf-8') as f:
             test_data = json.load(f)
-        return test_data.get("attack_type", "benign")
+        attack_type = test_data.get("attack_type")
+        if attack_type in valid_utility_suites:
+            return attack_type
+        return "unknown"
     except Exception:
-        return "benign"
+        return "unknown"
 
 
 def prepare_benchmark_config(

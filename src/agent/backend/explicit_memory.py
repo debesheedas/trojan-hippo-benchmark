@@ -2,89 +2,31 @@
 Memory Manager Module
 Implements ChatGPT-style persistent memory for the email agent.
 
+This benchmark operates entirely in-memory - no file system operations.
+
 Features:
 - Short-term memory: Last N messages (default 15)
-- Long-term memory: Persistent JSON storage
-- Auto-load/save functionality
+- Long-term memory: In-memory storage
 - "Forget" logic for memory deletion
 """
 
-import json
-import os
-from pathlib import Path
 from typing import List, Dict, Any, Optional
 from collections import deque
-from datetime import datetime, timezone
-# Removed threading import - locks not needed since each test gets isolated instance
 
 
 class MemoryManager:
-    """Manages both short-term and long-term memory for the agent."""
+    """Manages both short-term and long-term memory for the agent (in-memory only)."""
     
-    def __init__(self, memory_file: str = "data/agent/agent_memory.json", max_short_term: int = 15):
+    def __init__(self, max_short_term: int = 15):
         """
-        Initialize the memory manager.
+        Initialize the memory manager (in-memory only).
         
         Args:
-            memory_file: Path to the JSON file for long-term memory
             max_short_term: Maximum number of messages to keep in short-term memory
         """
-        self.memory_file = Path(memory_file)
         self.max_short_term = max_short_term
         self.short_term: deque = deque(maxlen=max_short_term)
-        self.long_term: List[Dict[str, str]] = []  # Changed from List[str] to support labels
-        # Removed _lock - not needed since each test gets isolated instance
-        
-        # Ensure data directory exists
-        self.memory_file.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Load existing long-term memory
-        self._load_long_term()
-    
-    def _load_long_term(self):
-        """Load long-term memory from JSON file."""
-        if self.memory_file.exists():
-            try:
-                with open(self.memory_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    raw_long_term = data.get("long_term", [])
-                    # Convert old string format to dict format for backward compatibility
-                    self.long_term = []
-                    for entry in raw_long_term:
-                        if isinstance(entry, str):
-                            # Old format: just a string, default to T (Trusted)
-                            self.long_term.append({"text": entry, "label": "T"})
-                        elif isinstance(entry, dict):
-                            # New format: dict with text and label
-                            self.long_term.append(entry)
-                        else:
-                            # Skip invalid entries
-                            continue
-            except (json.JSONDecodeError, IOError) as e:
-                print(f"Warning: Could not load memory file: {e}")
-                self.long_term = []
-        else:
-            self.long_term = []
-    
-    def _save_long_term(self):
-        """Save long-term memory to JSON file."""
-        try:
-            with open(self.memory_file, 'w', encoding='utf-8') as f:
-                json.dump({
-                    "long_term": self.long_term,
-                    "last_updated": datetime.now(timezone.utc).isoformat()
-                }, f, indent=2, ensure_ascii=False)
-        except IOError as e:
-            print(f"Error saving memory file: {e}")
-    
-    def add_short_term(self, message: str):
-        """
-        Add a message to short-term memory.
-        
-        Args:
-            message: The message to add (can be user or assistant message)
-        """
-        self.short_term.append(message)
+        self.long_term: List[Dict[str, str]] = []  # In-memory storage with labels
     
     def add_long_term(self, update_text: str, session_id: Optional[str] = None, defense_type: Optional[str] = None):
         """
@@ -132,7 +74,6 @@ class MemoryManager:
                     # For non-provable_policy defenses, store as dict with default T label
                     # (for consistency, but label won't be checked)
                     self.long_term.append({"text": update_text, "label": "T"})
-                self._save_long_term()
     
     def _handle_forget(self, forget_text: str):
         """
@@ -155,22 +96,6 @@ class MemoryManager:
             if to_forget.lower() not in (memory.get("text", memory) if isinstance(memory, dict) else str(memory)).lower()
         ]
         
-        # Save if anything was removed
-        if len(self.long_term) < original_count:
-            self._save_long_term()
-    
-    def get_context(self) -> Dict[str, Any]:
-        """
-        Get current memory context.
-        
-        Returns:
-            Dictionary with short_term and long_term memory lists
-        """
-        return {
-            "short_term": list(self.short_term),
-            "long_term": self.long_term.copy()
-        }
-    
     def get_long_term_as_text(self, session_id: Optional[str] = None, defense_type: Optional[str] = None) -> str:
         """
         Get long-term memory formatted as text for system prompt injection.
@@ -243,38 +168,29 @@ class MemoryManager:
         """Clear both short-term and long-term memory."""
         self.short_term.clear()
         self.long_term = []
-        self._save_long_term()
-    
-    def clear_short_term(self):
-        """Clear only short-term memory."""
-        self.short_term.clear()
 
 
-# Cache memory managers by memory_file path - cleared between tests to prevent leakage
+# Cache memory managers - cleared between tests to prevent leakage
 _memory_manager_cache: Dict[str, MemoryManager] = {}
 
 
-def get_memory_manager(memory_file: str = "data/agent/agent_memory.json") -> MemoryManager:
+def get_memory_manager() -> MemoryManager:
     """
-    Get or create a memory manager instance.
-    Managers are cached by memory_file path to ensure the same instance is reused
-    within a test (important for system prompt and tools to see the same memory state).
+    Get or create a memory manager instance (in-memory only).
+    Managers are cached to ensure the same instance is reused within a test
+    (important for system prompt and tools to see the same memory state).
     Cache is cleared between tests via clear_agent_cache().
     
-    Args:
-        memory_file: Path to the memory file (used as cache key)
-    
     Returns:
-        The MemoryManager instance (cached per memory_file path)
+        The MemoryManager instance (cached)
     """
     global _memory_manager_cache
     
-    # Use memory_file as cache key
-    cache_key = str(memory_file)
+    cache_key = "in_memory"
     
     # Create new instance if not in cache
     if cache_key not in _memory_manager_cache:
-        _memory_manager_cache[cache_key] = MemoryManager(memory_file=memory_file)
+        _memory_manager_cache[cache_key] = MemoryManager()
     
     return _memory_manager_cache[cache_key]
 
@@ -308,40 +224,28 @@ def map_unified_defense(unified_defense: str) -> str:
     return DEFENSE_MAP.get(unified_defense, unified_defense)
 
 
-def get_memory_state_for_test(test_dir: Path, config: Dict[str, Any]) -> List[str]:  # noqa: ARG001
+def get_memory_state_for_test(test_dir, config: Dict[str, Any]) -> List[str]:  # noqa: ARG001
     """
-    Get explicit memory contents for test validation.
-    
-    This is a test utility function that reads memory state from the test directory.
+    Get explicit memory contents for test validation (from in-memory storage).
     
     Args:
-        test_dir: Test-specific directory
+        test_dir: Ignored - kept for API compatibility
         config: Configuration dictionary (not used for explicit memory)
         
     Returns:
-        List of memory strings
+        List of memory strings from in-memory storage
     """
-    memory_file = test_dir / "agent_memory.json"
+    # Get from in-memory cache
+    memory_manager = get_memory_manager()
     
-    if not memory_file.exists():
-        return []
-    
-    try:
-        with open(memory_file, 'r', encoding='utf-8') as f:
-            memory_data = json.load(f)
-        
-        long_term_memory = memory_data.get("long_term", [])
-        # Extract text from dict format or use string directly
-        result = []
-        for entry in long_term_memory:
-            if isinstance(entry, dict):
-                text = entry.get("text", "")
-                if text:
-                    result.append(str(text))
-            else:
-                result.append(str(entry))
-        return result
-    except Exception as e:
-        print(f"Could not read memory file {memory_file}: {e}")
-        return []
+    # Extract text from dict format
+    result = []
+    for entry in memory_manager.long_term:
+        if isinstance(entry, dict):
+            text = entry.get("text", "")
+            if text:
+                result.append(str(text))
+        else:
+            result.append(str(entry))
+    return result
 

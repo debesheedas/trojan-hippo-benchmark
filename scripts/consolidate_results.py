@@ -9,12 +9,12 @@ Generates comprehensive CSV tables and visualizations for each test suite:
 - Average heatmap across all test suites
 - Combined CSV listing all test suites one below the other
 - Average summary CSV with all 23 valid combinations (5 memory backends × 5 defense types, minus 2 invalid combinations)
-- Separate files for each suite: benign, direct, indirect, memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory
+- Separate files for each suite: memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory
 
 Usage:
     python scripts/consolidate_results.py
     python scripts/consolidate_results.py --results-dir data/benchmark/results
-    python scripts/consolidate_results.py --suite benign
+    python scripts/consolidate_results.py --suite memory_only
     python scripts/consolidate_results.py --model gpt-5-mini
 """
 
@@ -54,7 +54,7 @@ from benchmark.benchmark_utils import (
 MEMORY_BACKENDS = ["none", "explicit", "mem0", "rag", "context"]
 BACKEND_LABELS = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
 VALID_ATTACK_TYPES = [
-    "benign", "direct", "indirect", "memory_only", "assistant_responses",
+    "memory_only", "assistant_responses",
     "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"
 ]
 
@@ -643,9 +643,6 @@ def main():
     plot_files = []
     error_summaries = []
     
-    # Store all data for combined visualizations (only when processing all suites)
-    all_models_data = {}
-    
     for model_name in models_to_process:
         all_suites_data = {}
         
@@ -682,9 +679,6 @@ def main():
                         print(f"  OK: Heatmap: {heatmap_file.name}")
                     except Exception as e:
                         print(f"  WARNING: Error generating heatmap: {e}")
-        
-        # Store data for this model
-        all_models_data[model_name] = all_suites_data
         
         # Generate combined visualizations if processing all suites (or multiple suites)
         if len(attack_types_to_process) > 1 and not args.no_plots:

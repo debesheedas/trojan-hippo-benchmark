@@ -47,18 +47,21 @@ class FAISS(VectorStoreBase):
         embedding_model_dims: int = 1536,
     ):
         """
-        Initialize the FAISS vector store.
+        Initialize the FAISS vector store (in-memory only).
+
+        This benchmark operates entirely in-memory - no file system operations.
 
         Args:
             collection_name (str): Name of the collection.
-            path (str, optional): Path for local FAISS database. Defaults to None.
+            path (str, optional): Ignored - kept for API compatibility only.
             distance_strategy (str, optional): Distance strategy to use. Options: 'euclidean', 'inner_product', 'cosine'.
                 Defaults to "euclidean".
             normalize_L2 (bool, optional): Whether to normalize L2 vectors. Only applicable for euclidean distance.
                 Defaults to False.
         """
         self.collection_name = collection_name
-        self.path = path or f"/tmp/faiss/{collection_name}"
+        # Always use in-memory mode (path is ignored)
+        self.path = None
         self.distance_strategy = distance_strategy
         self.normalize_L2 = normalize_L2
         self.embedding_model_dims = embedding_model_dims
@@ -68,52 +71,28 @@ class FAISS(VectorStoreBase):
         self.docstore = {}
         self.index_to_id = {}
 
-        # Create directory if it doesn't exist
-        if self.path:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-
-            # Try to load existing index if available
-            index_path = f"{self.path}/{collection_name}.faiss"
-            docstore_path = f"{self.path}/{collection_name}.pkl"
-            if os.path.exists(index_path) and os.path.exists(docstore_path):
-                self._load(index_path, docstore_path)
-            else:
-                self.create_col(collection_name)
+        # Always initialize empty collection in-memory (no file I/O)
+        self.create_col(collection_name)
 
     def _load(self, index_path: str, docstore_path: str):
         """
         Load FAISS index and docstore from disk.
-
-        Args:
-            index_path (str): Path to FAISS index file.
-            docstore_path (str): Path to docstore pickle file.
+        
+        NOTE: This method is a no-op - this benchmark operates entirely in-memory.
+        Kept for API compatibility only.
         """
-        try:
-            self.index = faiss.read_index(index_path)
-            with open(docstore_path, "rb") as f:
-                self.docstore, self.index_to_id = pickle.load(f)
-            logger.info(f"Loaded FAISS index from {index_path} with {self.index.ntotal} vectors")
-        except Exception as e:
-            logger.warning(f"Failed to load FAISS index: {e}")
-
-            self.docstore = {}
-            self.index_to_id = {}
+        # No-op: in-memory only mode
+        pass
 
     def _save(self):
-        """Save FAISS index and docstore to disk."""
-        if not self.path or not self.index:
-            return
-
-        try:
-            os.makedirs(self.path, exist_ok=True)
-            index_path = f"{self.path}/{self.collection_name}.faiss"
-            docstore_path = f"{self.path}/{self.collection_name}.pkl"
-
-            faiss.write_index(self.index, index_path)
-            with open(docstore_path, "wb") as f:
-                pickle.dump((self.docstore, self.index_to_id), f)
-        except Exception as e:
-            logger.warning(f"Failed to save FAISS index: {e}")
+        """
+        Save FAISS index and docstore to disk.
+        
+        NOTE: This method is a no-op - this benchmark operates entirely in-memory.
+        Kept for API compatibility only.
+        """
+        # No-op: in-memory only mode
+        pass
 
     def _parse_output(self, scores, ids, limit=None) -> List[OutputData]:
         """
@@ -378,45 +357,23 @@ class FAISS(VectorStoreBase):
 
     def list_cols(self) -> List[str]:
         """
-        List all collections.
+        List all collections (in-memory only).
 
         Returns:
             List[str]: List of collection names.
         """
-        if not self.path:
-            return [self.collection_name] if self.index else []
-
-        try:
-            collections = []
-            path = Path(self.path).parent
-            for file in path.glob("*.faiss"):
-                collections.append(file.stem)
-            return collections
-        except Exception as e:
-            logger.warning(f"Failed to list collections: {e}")
-            return [self.collection_name] if self.index else []
+        # In-memory mode: only return current collection if it exists
+        return [self.collection_name] if self.index else []
 
     def delete_col(self):
         """
-        Delete a collection.
+        Delete a collection (in-memory only - clears data structures).
         """
-        if self.path:
-            try:
-                index_path = f"{self.path}/{self.collection_name}.faiss"
-                docstore_path = f"{self.path}/{self.collection_name}.pkl"
-
-                if os.path.exists(index_path):
-                    os.remove(index_path)
-                if os.path.exists(docstore_path):
-                    os.remove(docstore_path)
-
-                logger.info(f"Deleted collection {self.collection_name}")
-            except Exception as e:
-                logger.warning(f"Failed to delete collection: {e}")
-
+        # Clear in-memory data structures
         self.index = None
         self.docstore = {}
         self.index_to_id = {}
+        logger.info(f"Deleted collection {self.collection_name} (in-memory)")
 
     def col_info(self) -> Dict:
         """

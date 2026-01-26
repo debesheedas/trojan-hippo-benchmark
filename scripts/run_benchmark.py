@@ -83,6 +83,7 @@ def run_benchmark(
     config_path: str = "benchmark_config.yaml",
     force: bool = False,
     results_base_dir: Optional[Path] = None,
+    logs_base_dir: Optional[Path] = None,
     target_model_name: Optional[str] = None
 ) -> Dict[str, Any]:
     """
@@ -169,7 +170,7 @@ def run_benchmark(
         print(f"SKIPPED: {len(missing)} test(s) already have results, {len(test_files) - len(missing)} will run")
     
     # Initialize TestBench with config dict directly (no temp file needed)
-    bench = TestBench(config=config, defense_type_override=unified_defense, force=force)
+    bench = TestBench(config=config, defense_type_override=unified_defense, force=force, logs_base_dir=logs_base_dir)
     
     try:
         # Run tests - TestBench.run_all_tests expects a path string
@@ -196,91 +197,6 @@ def run_benchmark(
         # Do NOT clean up old test environments here - that should be done
         # manually or at the end of all parallel runs to avoid interference
         bench.cleanup_all_test_environments()
-
-
-def run_all_defenses(
-    memory_backend: str,
-    test_path: str,
-    config_path: str = "benchmark_config.yaml",
-    force: bool = False,
-    defense_types: Optional[List[str]] = None,
-    target_model_name: Optional[str] = None
-) -> Dict[str, Any]:
-    """
-    Run benchmark for all defense types for a memory backend.
-    
-    Args:
-        memory_backend: Memory backend name
-        test_path: Path to test file, directory, or suite name
-        config_path: Path to config file
-        force: Force overwrite existing results
-        defense_types: List of defense types to run (defaults to all)
-        
-    Returns:
-        Dictionary with results summary for all defenses
-    """
-    if defense_types is None:
-        defense_types = UNIFIED_DEFENSE_TYPES
-    
-    print(f"\n{'#'*80}")
-    print(f"Running all defenses for {memory_backend.upper()}")
-    print(f"{'#'*80}\n")
-    
-    all_results = {}
-    summary = {
-        "memory_backend": memory_backend,
-        "defenses": {},
-        "total_tests": 0,
-        "total_passed": 0,
-        "total_failed": 0
-    }
-    
-    for defense_type in defense_types:
-        result = run_benchmark(
-            memory_backend=memory_backend,
-            unified_defense=defense_type,
-            test_path=test_path,
-            config_path=config_path,
-            force=force,
-            target_model_name=target_model_name
-        )
-        
-        all_results[defense_type] = result
-        
-        if result.get("success"):
-            if not result.get("skipped"):
-                summary["defenses"][defense_type] = {
-                    "tests_run": result.get("tests_run", 0),
-                    "tests_passed": result.get("tests_passed", 0),
-                    "tests_failed": result.get("tests_failed", 0)
-                }
-                summary["total_tests"] += result.get("tests_run", 0)
-                summary["total_passed"] += result.get("tests_passed", 0)
-                summary["total_failed"] += result.get("tests_failed", 0)
-            else:
-                summary["defenses"][defense_type] = {"skipped": True}
-    
-    # Print summary
-    print(f"\n{'='*80}")
-    print(f"SUMMARY: {memory_backend.upper()}")
-    print(f"{'='*80}")
-    for defense_type, stats in summary["defenses"].items():
-        if stats.get("skipped"):
-            status = "SKIPPED"
-        elif stats.get("tests_passed", 0) == stats.get("tests_run", 0):
-            status = "PASSED"
-        else:
-            status = "FAILED"
-        print(f"{defense_type:20s}: {status}", end="")
-        if not stats.get("skipped"):
-            print(f" ({stats.get('tests_passed', 0)}/{stats.get('tests_run', 0)} tests)")
-        else:
-            print()
-    
-    if summary["total_tests"] > 0:
-        print(f"\nTotal: {summary['total_passed']}/{summary['total_tests']} tests passed")
-    
-    return summary
 
 
 def _check_result_for_errors(
@@ -352,7 +268,7 @@ def _check_result_for_errors(
 
 
 def _run_single_combination(
-    args_tuple: Tuple[str, str, str, str, bool, Optional[Path], Optional[str]]
+    args_tuple: Tuple[str, str, str, str, bool, Optional[Path], Optional[Path], Optional[str]]
 ) -> Tuple[str, str, Dict[str, Any]]:
     """
     Wrapper function to run a single backend+defense combination.
@@ -366,7 +282,7 @@ def _run_single_combination(
     All output is redirected to a log file specific to this combination.
     
     Args:
-        args_tuple: (memory_backend, unified_defense, test_path, config_path, force, results_base_dir, target_model_name)
+        args_tuple: (memory_backend, unified_defense, test_path, config_path, force, results_base_dir, logs_base_dir, target_model_name)
     
     Returns:
         (memory_backend, unified_defense, result_dict)
@@ -375,12 +291,12 @@ def _run_single_combination(
     
     # Set process name for debugging
     process_id = os.getpid()
-    memory_backend, unified_defense, test_path, config_path, force, results_base_dir, target_model_name = args_tuple
+    memory_backend, unified_defense, test_path, config_path, force, results_base_dir, logs_base_dir, target_model_name = args_tuple
     
     # Determine attack type from test_path (needed for result paths)
     test_dir = Path("data/benchmark/tests")
     if isinstance(test_path, str):
-        if test_path in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"]:
+        if test_path in ["memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"]:
             attack_type = test_path
         else:
             # Try to determine from path
@@ -409,6 +325,7 @@ def _run_single_combination(
             config_path=config_path,
             force=force,
             results_base_dir=results_base_dir,
+            logs_base_dir=logs_base_dir,
             target_model_name=target_model_name
         )
         
@@ -502,6 +419,7 @@ def run_all_combinations(
     force: bool = False,
     num_workers: int = 1,
     results_base_dir: Optional[Path] = None,
+    logs_base_dir: Optional[Path] = None,
     target_model_name: Optional[str] = None
 ) -> Dict[str, Any]:
     """
@@ -547,7 +465,6 @@ def run_all_combinations(
     rate_limit_count = 0
     api_error_count = 0
     
-    all_results = {}
     summary = {
         "total_combinations": total_combinations,
         "combinations": {},
@@ -563,7 +480,7 @@ def run_all_combinations(
     
     # Prepare arguments for each combination
     args_list = [
-        (backend, defense, test_path, config_path, force, results_base_dir, target_model_name)
+        (backend, defense, test_path, config_path, force, results_base_dir, logs_base_dir, target_model_name)
         for backend, defense in combinations
     ]
     
@@ -594,8 +511,6 @@ def run_all_combinations(
                     has_error, has_connection_error, has_rate_limit_error = _check_result_for_errors(
                         result, backend_key, defense_key, summary
                     )
-                    
-                    all_results[f"{backend_key}_{defense_key}"] = result
                     
                     if result.get("success"):
                         if not result.get("skipped"):
@@ -697,8 +612,6 @@ def run_all_combinations(
                         error_indicator = " [ERROR]"
                     
                     print(f"[{completed}/{total_combinations}] {status} {backend_key.upper()} + {defense_key}{error_indicator}", flush=True)
-                    
-                    all_results[f"{backend_key}_{defense_key}"] = result
                     
                     if result.get("success"):
                         if not result.get("skipped"):
@@ -811,7 +724,7 @@ def run_all_combinations(
         model_arg = f"--model {target_model_name}" if target_model_name else ""
         
         print(f"\nTo rerun only the failed combinations, use:")
-        if "suite" in test_path or test_path in ["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"]:
+        if "suite" in test_path or test_path in ["memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"]:
             print(f"  python scripts/run_benchmark.py --suite {test_path} {model_arg} \\")
         else:
             print(f"  python scripts/run_benchmark.py --test {test_path} {model_arg} \\")
@@ -890,13 +803,13 @@ Examples:
   python scripts/run_benchmark.py --memory-backend explicit mem0 --defense-type none user_prompt_only --suite memory_only --num-workers 4
   
   # Single combination (one backend, one defense)
-  python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite benign
+  python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite memory_only
   
   # Run mem0 with all defenses (serial)
-  python scripts/run_benchmark.py --memory-backend mem0 --suite benign --num-workers 1
+  python scripts/run_benchmark.py --memory-backend mem0 --suite memory_only --num-workers 1
   
   # Run specific test file
-  python scripts/run_benchmark.py --memory-backend rag --defense-type user_prompt_only --test data/benchmark/tests/benign/00_email_tools.json --model gpt-5-mini
+  python scripts/run_benchmark.py --memory-backend rag --defense-type user_prompt_only --test data/benchmark/tests/memory_only/memory_only_001.json --model gpt-5-mini
   
   # Force overwrite existing results
   python scripts/run_benchmark.py --suite memory_only --model gpt-5-mini --force --num-workers 16
@@ -947,8 +860,8 @@ Examples:
     parser.add_argument(
         "--suite",
         type=str,
-        choices=["benign", "direct", "indirect", "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"],
-        help="Test suite to run (benign, direct, indirect, memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, or long_memory)"
+        choices=["memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"],
+        help="Utility test suite to run from data/benchmark/tests/<suite>/ (memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, or long_memory). For attack bench tests, use --test with path to data/benchmark/attack_bench/"
     )
     
     parser.add_argument(
@@ -968,6 +881,12 @@ Examples:
         "--results-dir",
         type=str,
         help="Base directory for results (defaults to data/benchmark/results)"
+    )
+    
+    parser.add_argument(
+        "--logs-dir",
+        type=str,
+        help="Base directory for logs (defaults to data/benchmark/logs)"
     )
     
     parser.add_argument(
@@ -1015,6 +934,9 @@ Examples:
     
     # Determine results directory
     results_base_dir = Path(args.results_dir) if args.results_dir else None
+    
+    # Determine logs directory
+    logs_base_dir = Path(args.logs_dir) if args.logs_dir else None
     
     # Determine if memory backends and defense types were specified
     memory_backends_specified = args.memory_backend is not None
@@ -1074,6 +996,7 @@ Examples:
             force=args.force,
             num_workers=args.num_workers,
             results_base_dir=results_base_dir,
+            logs_base_dir=logs_base_dir,
             target_model_name=args.target_model_name
         )
     else:
@@ -1095,6 +1018,7 @@ Examples:
             config_path=args.config,
             force=args.force,
             results_base_dir=results_base_dir,
+            logs_base_dir=logs_base_dir,
             target_model_name=args.target_model_name
         )
     

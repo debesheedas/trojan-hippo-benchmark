@@ -12,9 +12,16 @@ from langchain.tools import BaseTool
 from pydantic import BaseModel, Field
 import numpy as np
 
-from agent.utils import generate_id, get_timestamp, append_trace_event, USER_EMAIL
+from agent.utils import generate_id, get_timestamp, USER_EMAIL
 from agent.utils import debug_info, debug_debug, debug_print_exception
 from openai import OpenAI
+
+# Import in-memory storage
+try:
+    from benchmark.in_memory_storage import InMemoryMailbox, InMemoryTraceStore
+except ImportError:
+    InMemoryMailbox = None  # Type: ignore
+    InMemoryTraceStore = None  # Type: ignore
 
 
 def _keyword_relevance_score(query_lower: str, query_words: List[str], 
@@ -105,16 +112,6 @@ def _find_best_email_match(search_query: str, config, folder: str = "inbox", lim
     Returns:
         List of matching emails sorted by relevance and recency
     """
-    # Determine which folder to search
-    if folder.lower() == "inbox":
-        search_dir = config.mailbox_dir
-    elif folder.lower() == "outbox":
-        search_dir = config.outbox_dir
-    elif folder.lower() == "drafts":
-        search_dir = config.drafts_dir
-    else:
-        return []
-    
     matches = []
     query_lower = search_query.lower().strip()
     query_words = query_lower.split()
@@ -123,42 +120,42 @@ def _find_best_email_match(search_query: str, config, folder: str = "inbox", lim
     api_key = os.getenv("OPENAI_API_KEY")
     query_embedding = _get_embedding(search_query, api_key) if search_query else None
     
-    # Search across all emails in the folder - sort files for deterministic order
-    email_files = sorted(search_dir.glob("*.json"), key=lambda p: p.name)
+    # Get emails from mailbox
+    emails_to_search = config.mailbox.get_emails(folder, unread_only=False)
     
-    for file_path in email_files:
-        with open(file_path, "r", encoding="utf-8") as f:
-            email = json.load(f)
-            
-            # Extract email fields for searchable content
-            email_from = email.get('from', '')
-            email_subject = email.get('subject', '')
-            email_body = email.get('body_plain', email.get('body', ''))
-            
-            # Create searchable text (subject and body, with subject weighted more)
-            searchable_text = f"{email_subject}\n\n{email_body}"
-            
-            if not search_query.strip():
-                # Empty query - include all emails with base relevance
-                relevance = 0.5  # Base score for empty query
-            elif query_embedding is not None:
-                # Use semantic similarity (embeddings)
-                email_embedding = _get_embedding(searchable_text, api_key)
-                if email_embedding is not None:
-                    # Cosine similarity gives us a score between -1 and 1, normalize to 0-1
-                    similarity = _cosine_similarity(query_embedding, email_embedding)
-                    relevance = max(0.0, similarity)  # Ensure non-negative
-                else:
-                    # Fallback to keyword matching if embedding fails for this email
-                    relevance = _keyword_relevance_score(query_lower, query_words, email_from, email_subject, email_body)
+    # Process emails
+    for email in emails_to_search:
+        # Extract email fields for searchable content
+        email_from = email.get('from', '')
+        email_subject = email.get('subject', '')
+        email_body = email.get('body_plain', email.get('body', ''))
+        
+        # Create searchable text (subject and body, with subject weighted more)
+        searchable_text = f"{email_subject}\n\n{email_body}"
+        
+        if not search_query.strip():
+            # Empty query - include all emails with base relevance
+            relevance = 0.5  # Base score for empty query
+        elif query_embedding is not None:
+            # Use semantic similarity (embeddings)
+            email_embedding = _get_embedding(searchable_text, api_key)
+            if email_embedding is not None:
+                # Cosine similarity gives us a score between -1 and 1, normalize to 0-1
+                similarity = _cosine_similarity(query_embedding, email_embedding)
+                relevance = max(0.0, similarity)  # Ensure non-negative
             else:
-                # Fallback to keyword-based relevance if embeddings unavailable
+                # Fallback to keyword matching if embedding fails for this email
                 relevance = _keyword_relevance_score(query_lower, query_words, email_from, email_subject, email_body)
-            
-            if relevance > 0:
-                email['_relevance'] = relevance
-                email['_file_path'] = str(file_path)
-                matches.append(email)
+        else:
+            # Fallback to keyword-based relevance if embeddings unavailable
+            relevance = _keyword_relevance_score(query_lower, query_words, email_from, email_subject, email_body)
+        
+        if relevance > 0:
+            email['_relevance'] = relevance
+            # Add file path for compatibility (use email ID for in-memory)
+            if '_file_path' not in email:
+                email['_file_path'] = f"in_memory_{email.get('_email_id', 'unknown')}"
+            matches.append(email)
     
     # Sort by relevance (most relevant first), then by date (newest first) as tie-breaker
     def parse_timestamp(ts: str) -> float:
@@ -185,14 +182,54 @@ def _find_best_email_match(search_query: str, config, folder: str = "inbox", lim
 
 
 class EmailToolsConfig:
-    """Configuration for email tools."""
-    def __init__(self, mailbox_dir: str, drafts_dir: str, outbox_dir: str, trace_file: str, defense_type: Optional[str] = None):
-        self.mailbox_dir = Path(mailbox_dir)
-        self.drafts_dir = Path(drafts_dir)
-        self.outbox_dir = Path(outbox_dir)
-        self.trace_file = trace_file
+    """Configuration for email tools (in-memory only)."""
+    def __init__(
+        self, 
+        mailbox: 'InMemoryMailbox',
+        trace_store: 'InMemoryTraceStore',
+        defense_type: Optional[str] = None,
+    ):
+        """
+        Initialize email tools configuration.
+        
+        Args:
+            mailbox: In-memory mailbox storage (required)
+            trace_store: In-memory trace store for logging events (required)
+            defense_type: Defense type (e.g., "provable_policy", "none")
+        """
+        self.mailbox: 'InMemoryMailbox' = mailbox
+        self.trace_store: 'InMemoryTraceStore' = trace_store
         self.session_id: Optional[str] = None
-        self.defense_type: Optional[str] = defense_type  # Defense type (e.g., "provable_policy", "none")
+        self.defense_type: Optional[str] = defense_type
+    
+    def append_trace_event(self, event_type: str, payload: dict, event_id: Optional[str] = None) -> str:
+        """
+        Append a trace event using this config's trace_store.
+        
+        Args:
+            event_type: Type of event (e.g., "tool_call", "tool_result")
+            payload: Event payload dictionary
+            event_id: Optional event ID (generated if not provided)
+            
+        Returns:
+            The event ID
+        """
+        import uuid
+        from datetime import datetime, timezone
+        
+        if event_id is None:
+            event_id = str(uuid.uuid4())
+        
+        event = {
+            "event_id": event_id,
+            "event_type": event_type,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_id": self.session_id,
+            **payload
+        }
+        
+        self.trace_store.append_event(self.session_id, event)
+        return event_id
 
 
 class ReadAllEmailsInput(BaseModel):
@@ -291,10 +328,8 @@ When you read emails using this tool, they are automatically marked as read in t
         
         # Log tool call
         if self.config and self.config.session_id:
-            append_trace_event(
-                self.config.trace_file,
+            self.config.append_trace_event(
                 "tool_call",
-                self.config.session_id,
                 {
                     "tool_name": self.name,
                     "inputs": {"unread_only": unread_only, "offset": offset, "limit": limit},
@@ -313,11 +348,6 @@ When you read emails using this tool, they are automatically marked as read in t
             debug_print_exception(e, context="Loading config for email reading page_size", include_traceback=True)
         
         try:
-            # Get all emails from inbox directory
-            inbox_dir = self.config.mailbox_dir
-            email_files = sorted(inbox_dir.glob("*.json"), key=lambda p: p.name)
-            
-            emails = []
             def parse_timestamp(ts: str) -> float:
                 """Convert ISO timestamp to float for sorting. Returns 0 if invalid."""
                 try:
@@ -326,24 +356,13 @@ When you read emails using this tool, they are automatically marked as read in t
                 except:
                     return 0.0
             
-            # Read all emails and prepare for sorting
-            for file_path in email_files:
-                try:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        email = json.load(f)
-                        
-                        # Filter by unread status if requested
-                        if unread_only:
-                            is_read = email.get("metadata", {}).get("read", False)
-                            if is_read:
-                                continue
-                        
-                        email['_file_path'] = str(file_path)
-                        emails.append(email)
-                except Exception as e:
-                    debug_debug(f"Could not process email file, skipping")
-                    debug_print_exception(e, context="Processing email file in email tools", include_traceback=True)
-                    continue
+            # Get emails from in-memory mailbox
+            inbox_emails = self.config.mailbox.get_emails("inbox", unread_only=unread_only)
+            emails = []
+            for email in inbox_emails:
+                # Add file path for compatibility (use email ID)
+                email['_file_path'] = f"in_memory_{email.get('_email_id', 'unknown')}"
+                emails.append(email)
             
             if not emails:
                 result = "No emails found in inbox." if not unread_only else "No unread emails found in inbox."
@@ -362,28 +381,6 @@ When you read emails using this tool, they are automatically marked as read in t
                     emails = emails[offset:offset+limit]
                 else:
                     emails = emails[offset:]
-                
-                # TEMPORARILY DISABLED: Mark all displayed emails as read and save back to file
-                # This behavior is disabled for testing purposes - emails will remain unread
-                # Original behavior: Only mark as read if unread_only=False (when actually reading all emails)
-                # If unread_only=True, user is just checking unread status, so don't mark as read
-                # if not unread_only:
-                #     for email in emails:
-                #         file_path = Path(email.get('_file_path'))
-                #         if file_path.exists():
-                #             # Ensure metadata exists
-                #             if "metadata" not in email:
-                #                 email["metadata"] = {}
-                #             
-                #             # Mark as read
-                #             email["metadata"]["read"] = True
-                #             
-                #             # Save updated email back to file
-                #             try:
-                #                 with open(file_path, "w", encoding="utf-8") as f:
-                #                     json.dump(email, f, indent=2, ensure_ascii=False)
-                #             except Exception:
-                #                 pass  # If we can't write, continue anyway
                 
                 # Build result with pagination info
                 result_lines = [f"Found {total_emails} email(s) in inbox"]
@@ -464,10 +461,8 @@ When you read emails using this tool, they are automatically marked as read in t
             
             # Log tool result
             if self.config and self.config.session_id:
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_result",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "outputs": {"result": result, "count": len(emails)},
@@ -482,10 +477,8 @@ When you read emails using this tool, they are automatically marked as read in t
             
             # Log error
             if self.config and self.config.session_id:
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_result",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "outputs": {"error": error_msg},
@@ -525,10 +518,8 @@ Searches across sender, recipient, subject, and body. Returns most relevant matc
         
         # Log tool call
         if self.config and self.config.session_id:
-            append_trace_event(
-                self.config.trace_file,
+            self.config.append_trace_event(
                 "tool_call",
-                self.config.session_id,
                 {
                     "tool_name": self.name,
                     "inputs": {"query": query, "folder": folder},
@@ -571,10 +562,8 @@ Searches across sender, recipient, subject, and body. Returns most relevant matc
             
             # Log tool result
             if self.config and self.config.session_id:
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_result",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "outputs": {"result": result, "count": len(matches), "folder": folder},
@@ -589,10 +578,8 @@ Searches across sender, recipient, subject, and body. Returns most relevant matc
             
             # Log error
             if self.config and self.config.session_id:
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_result",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "outputs": {"error": error_msg},
@@ -647,10 +634,8 @@ This is a one-step operation - no need to manually construct the reply email. If
                 )
                 
                 # Log blocked tool call
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_call",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "inputs": {"search_query": search_query, "reply_body": reply_body},
@@ -660,10 +645,8 @@ This is a one-step operation - no need to manually construct the reply email. If
                     }
                 )
                 
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_result",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "outputs": {"error": error_msg, "blocked": True},
@@ -702,10 +685,8 @@ This is a one-step operation - no need to manually construct the reply email. If
                     )
                     
                     # Log blocked tool call
-                    append_trace_event(
-                        self.config.trace_file,
+                    self.config.append_trace_event(
                         "tool_call",
-                        self.config.session_id,
                         {
                             "tool_name": self.name,
                             "inputs": {"search_query": search_query, "reply_body": reply_body},
@@ -715,10 +696,8 @@ This is a one-step operation - no need to manually construct the reply email. If
                         }
                     )
                     
-                    append_trace_event(
-                        self.config.trace_file,
+                    self.config.append_trace_event(
                         "tool_result",
-                        self.config.session_id,
                         {
                             "tool_name": self.name,
                             "outputs": {"error": error_msg, "blocked": True},
@@ -738,10 +717,8 @@ This is a one-step operation - no need to manually construct the reply email. If
                     )
                     
                     # Log blocked tool call
-                    append_trace_event(
-                        self.config.trace_file,
+                    self.config.append_trace_event(
                         "tool_call",
-                        self.config.session_id,
                         {
                             "tool_name": self.name,
                             "inputs": {"search_query": search_query, "reply_body": reply_body},
@@ -751,10 +728,8 @@ This is a one-step operation - no need to manually construct the reply email. If
                         }
                     )
                     
-                    append_trace_event(
-                        self.config.trace_file,
+                    self.config.append_trace_event(
                         "tool_result",
-                        self.config.session_id,
                         {
                             "tool_name": self.name,
                             "outputs": {"error": error_msg, "blocked": True},
@@ -772,10 +747,8 @@ This is a one-step operation - no need to manually construct the reply email. If
         
         # Log tool call
         if self.config and self.config.session_id:
-            append_trace_event(
-                self.config.trace_file,
+            self.config.append_trace_event(
                 "tool_call",
-                self.config.session_id,
                 {
                     "tool_name": self.name,
                     "inputs": {"search_query": search_query, "reply_body": reply_body},
@@ -813,7 +786,6 @@ This is a one-step operation - no need to manually construct the reply email. If
                 
                 # Create and send reply email
                 email_id = generate_id("sent")
-                email_file = self.config.outbox_dir / f"{email_id}.json"
                 
                 reply_email = {
                     "from": USER_EMAIL,
@@ -826,8 +798,8 @@ This is a one-step operation - no need to manually construct the reply email. If
                     "in_reply_to": original_email.get('id', 'unknown')
                 }
                 
-                with open(email_file, "w", encoding="utf-8") as f:
-                    json.dump(reply_email, f, indent=2)
+                # Save to in-memory mailbox
+                self.config.mailbox.add_email(reply_email, folder="outbox")
                 
                 match_info = ""
                 if len(matches) > 1:
@@ -843,10 +815,8 @@ This is a one-step operation - no need to manually construct the reply email. If
             
             # Log tool result
             if self.config and self.config.session_id:
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_result",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "outputs": {"result": result, "matches_found": len(matches)},
@@ -861,10 +831,8 @@ This is a one-step operation - no need to manually construct the reply email. If
             
             # Log error
             if self.config and self.config.session_id:
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_result",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "outputs": {"error": error_msg},
@@ -920,10 +888,8 @@ Important: The original email body and all content is automatically included - y
                 )
                 
                 # Log blocked tool call
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_call",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "inputs": {"search_query": search_query, "forward_to": forward_to, "message": message},
@@ -933,10 +899,8 @@ Important: The original email body and all content is automatically included - y
                     }
                 )
                 
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_result",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "outputs": {"error": error_msg, "blocked": True},
@@ -972,10 +936,8 @@ Important: The original email body and all content is automatically included - y
                     )
                     
                     # Log blocked tool call
-                    append_trace_event(
-                        self.config.trace_file,
+                    self.config.append_trace_event(
                         "tool_call",
-                        self.config.session_id,
                         {
                             "tool_name": self.name,
                             "inputs": {"search_query": search_query, "forward_to": forward_to, "message": message},
@@ -985,10 +947,8 @@ Important: The original email body and all content is automatically included - y
                         }
                     )
                     
-                    append_trace_event(
-                        self.config.trace_file,
+                    self.config.append_trace_event(
                         "tool_result",
-                        self.config.session_id,
                         {
                             "tool_name": self.name,
                             "outputs": {"error": error_msg, "blocked": True},
@@ -1006,10 +966,8 @@ Important: The original email body and all content is automatically included - y
         
         # Log tool call
         if self.config and self.config.session_id:
-            append_trace_event(
-                self.config.trace_file,
+            self.config.append_trace_event(
                 "tool_call",
-                self.config.session_id,
                 {
                     "tool_name": self.name,
                     "inputs": {"search_query": search_query, "forward_to": forward_to, "message": message},
@@ -1042,10 +1000,8 @@ Important: The original email body and all content is automatically included - y
                 if not original_body or len(original_body.strip()) == 0:
                     result = f"Warning: Email found ('{original_subject}') but it has no body content. Cannot forward empty email."
                     if self.config and self.config.session_id:
-                        append_trace_event(
-                            self.config.trace_file,
+                        self.config.append_trace_event(
                             "tool_result",
-                            self.config.session_id,
                             {
                                 "tool_name": self.name,
                                 "outputs": {"error": result},
@@ -1076,7 +1032,6 @@ Important: The original email body and all content is automatically included - y
                 
                 # Create and send forward email
                 email_id = generate_id("sent")
-                email_file = self.config.outbox_dir / f"{email_id}.json"
                 
                 forward_email = {
                     "from": USER_EMAIL,
@@ -1090,10 +1045,8 @@ Important: The original email body and all content is automatically included - y
                     "forwarded_from": original_email.get('id', 'unknown')
                 }
                 
-                # Use ensure_ascii=False to preserve unicode characters, and don't indent to avoid
-                # potential issues with very long strings containing newlines
-                with open(email_file, "w", encoding="utf-8") as f:
-                    json.dump(forward_email, f, indent=2, ensure_ascii=False)
+                # Save to in-memory mailbox
+                self.config.mailbox.add_email(forward_email, folder="outbox")
                 
                 # Debug: Print the forwarded email contents to terminal
                 print("\n" + "="*80)
@@ -1122,10 +1075,8 @@ Important: The original email body and all content is automatically included - y
             
             # Log tool result
             if self.config and self.config.session_id:
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_result",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "outputs": {"result": result, "matches_found": len(matches)},
@@ -1140,10 +1091,8 @@ Important: The original email body and all content is automatically included - y
             
             # Log error
             if self.config and self.config.session_id:
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_result",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "outputs": {"error": error_msg},
@@ -1197,11 +1146,9 @@ class ComposeEmailTool(BaseTool):
                 )
                 
                 # Log blocked tool call
-                if self.config and self.config.trace_file:
-                    append_trace_event(
-                        self.config.trace_file,
+                if self.config and self.config.session_id:
+                    self.config.append_trace_event(
                         "tool_call",
-                        session_id,
                         {
                             "tool_name": self.name,
                             "inputs": {"to": to, "subject": subject, "body": body},
@@ -1211,10 +1158,8 @@ class ComposeEmailTool(BaseTool):
                         }
                     )
                     
-                    append_trace_event(
-                        self.config.trace_file,
+                    self.config.append_trace_event(
                         "tool_result",
-                        session_id,
                         {
                             "tool_name": self.name,
                             "outputs": {"error": error_msg, "blocked": True},
@@ -1226,10 +1171,8 @@ class ComposeEmailTool(BaseTool):
         
         # Log tool call
         if self.config and self.config.session_id:
-            append_trace_event(
-                self.config.trace_file,
+            self.config.append_trace_event(
                 "tool_call",
-                self.config.session_id,
                 {
                     "tool_name": self.name,
                     "inputs": {"to": to, "subject": subject, "body": body},
@@ -1240,7 +1183,6 @@ class ComposeEmailTool(BaseTool):
         try:
             # Generate email ID and filename
             email_id = generate_id("sent")
-            email_file = self.config.outbox_dir / f"{email_id}.json"
             
             # Create sent email object
             email = {
@@ -1253,9 +1195,8 @@ class ComposeEmailTool(BaseTool):
                 "status": "sent"
             }
             
-            # Save directly to outbox
-            with open(email_file, "w", encoding="utf-8") as f:
-                json.dump(email, f, indent=2)
+            # Save to in-memory mailbox
+            self.config.mailbox.add_email(email, folder="outbox")
             
             result = (
                 f"Email sent successfully!\n\n"
@@ -1266,10 +1207,8 @@ class ComposeEmailTool(BaseTool):
             
             # Log tool result
             if self.config and self.config.session_id:
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_result",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "outputs": {"result": result, "email_id": email_id},
@@ -1284,10 +1223,8 @@ class ComposeEmailTool(BaseTool):
             
             # Log error
             if self.config and self.config.session_id:
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_result",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "outputs": {"error": error_msg},
@@ -1311,10 +1248,8 @@ class DraftEmailTool(BaseTool):
         
         # Log tool call
         if self.config and self.config.session_id:
-            append_trace_event(
-                self.config.trace_file,
+            self.config.append_trace_event(
                 "tool_call",
-                self.config.session_id,
                 {
                     "tool_name": self.name,
                     "inputs": {"to": to, "subject": subject, "body": body},
@@ -1325,7 +1260,6 @@ class DraftEmailTool(BaseTool):
         try:
             # Generate draft ID and filename
             draft_id = generate_id("draft")
-            draft_file = self.config.drafts_dir / f"{draft_id}.json"
             
             # Create draft object
             draft = {
@@ -1337,9 +1271,8 @@ class DraftEmailTool(BaseTool):
                 "status": "draft"
             }
             
-            # Save draft to file
-            with open(draft_file, "w", encoding="utf-8") as f:
-                json.dump(draft, f, indent=2)
+            # Save to in-memory mailbox
+            self.config.mailbox.add_email(draft, folder="drafts")
             
             result = (
                 f"Draft created successfully!\n\n"
@@ -1350,10 +1283,8 @@ class DraftEmailTool(BaseTool):
             
             # Log tool result
             if self.config and self.config.session_id:
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_result",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "outputs": {"result": result, "draft_id": draft_id},
@@ -1368,10 +1299,8 @@ class DraftEmailTool(BaseTool):
             
             # Log error
             if self.config and self.config.session_id:
-                append_trace_event(
-                    self.config.trace_file,
+                self.config.append_trace_event(
                     "tool_result",
-                    self.config.session_id,
                     {
                         "tool_name": self.name,
                         "outputs": {"error": error_msg},

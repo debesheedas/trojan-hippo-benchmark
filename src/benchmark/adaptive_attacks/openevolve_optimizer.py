@@ -159,32 +159,44 @@ class CandidateDatabase:
             elite_ratio: Ratio of elite (grid) vs random candidates
         
         Returns:
-            List of sampled candidates
+            List of sampled candidates (no duplicates)
         """
         if not self.candidates:
             return []
         
         sampled = []
+        sampled_ids = set()  # Track IDs to avoid duplicates
         n_elite = int(n * elite_ratio)
         n_random = n - n_elite
         
-        # Sample elite candidates from grid
+        # Sample elite candidates from grid (no duplicates)
         if self.grid and n_elite > 0:
-            elite_ids = list(self.grid.values())
-            sampled_elite_ids = random.choices(elite_ids, k=min(n_elite, len(elite_ids)))
-            sampled.extend([self.candidates[cid] for cid in sampled_elite_ids if cid in self.candidates])
+            elite_ids = list(set(self.grid.values()))  # Remove duplicates from grid values
+            # Use random.sample to avoid duplicates
+            n_elite_available = min(n_elite, len(elite_ids))
+            sampled_elite_ids = random.sample(elite_ids, n_elite_available) if n_elite_available > 0 else []
+            for cid in sampled_elite_ids:
+                if cid in self.candidates and cid not in sampled_ids:
+                    sampled.append(self.candidates[cid])
+                    sampled_ids.add(cid)
         
-        # Sample random candidates from all candidates
+        # Sample random candidates from all candidates (no duplicates)
         if n_random > 0:
-            all_ids = list(self.candidates.keys())
-            sampled_random_ids = random.choices(all_ids, k=min(n_random, len(all_ids)))
-            sampled.extend([self.candidates[cid] for cid in sampled_random_ids if cid in self.candidates])
+            all_ids = [cid for cid in self.candidates.keys() if cid not in sampled_ids]
+            n_random_available = min(n_random, len(all_ids))
+            sampled_random_ids = random.sample(all_ids, n_random_available) if n_random_available > 0 else []
+            for cid in sampled_random_ids:
+                if cid not in sampled_ids:
+                    sampled.append(self.candidates[cid])
+                    sampled_ids.add(cid)
         
-        # If we don't have enough, pad with random sampling
-        while len(sampled) < n and self.candidates:
-            random_id = random.choice(list(self.candidates.keys()))
-            if random_id in self.candidates:
-                sampled.append(self.candidates[random_id])
+        # If we don't have enough unique candidates, pad with remaining unique ones
+        remaining_ids = [cid for cid in self.candidates.keys() if cid not in sampled_ids]
+        while len(sampled) < n and remaining_ids:
+            random_id = random.choice(remaining_ids)
+            sampled.append(self.candidates[random_id])
+            sampled_ids.add(random_id)
+            remaining_ids.remove(random_id)
         
         return sampled[:n]
     
@@ -427,13 +439,77 @@ class OpenEvolveOptimizer(BaseOptimizer):
             step_num=step_num,
             session_id=session_id,
             test_config=test_config,
-            environment_state=environment_state
+            environment_state=environment_state,
+            test_def=test_def,
+            attack_email_step_num=attack_email_step_num
         )
         
         self.database.add(initial_candidate)
         self._log_info(f"Initial candidate: score={initial_candidate.agentdojo_score}/10, partial={initial_candidate.partial_score:.2f}")
         self._log_info(f"   Explanation: {initial_candidate.explanation if initial_candidate.explanation else '[NONE]'}")
         self._log_info(f"   Improvement: {initial_candidate.improvement if initial_candidate.improvement else '[NONE]'}")
+        
+        # Initialize database with diverse candidates
+        # Generate initial diverse population using the mutator
+        init_population_size = self.openevolve_config.get("initial_population_size", 10)
+        self._log_info(f"\n{'='*80}")
+        self._log_info(f"INITIALIZING DATABASE WITH DIVERSE CANDIDATES")
+        self._log_info(f"   Generating {init_population_size} diverse initial candidates...")
+        self._log_info(f"{'='*80}")
+        
+        try:
+            # Use the initial candidate as the parent for generating diverse variants
+            attack_goal_dict = failed_step.get("attack_goal", {})
+            user_message = failed_step.get("user_message", "")
+            
+            # Generate diverse initial candidates
+            initial_variants = self._mutate(
+                parent_candidates=[initial_candidate],  # Use initial candidate as parent
+                original_attack_email=original_attack_email,
+                attack_goal=attack_goal_dict,
+                user_message=user_message,
+                num_variants=init_population_size
+            )
+            
+            if initial_variants:
+                self._log_info(f"Generated {len(initial_variants)} initial diverse candidates")
+                
+                # Score and add each initial variant
+                for i, variant_email in enumerate(initial_variants, 1):
+                    variant_id = self._generate_candidate_id()
+                    variant_candidate = self._create_candidate_from_email(
+                        candidate_id=variant_id,
+                        email=variant_email,
+                        parent_id=initial_id,
+                        iteration=0
+                    )
+                    
+                    # Score the variant
+                    self._score_candidate(
+                        variant_candidate,
+                        failed_step=failed_step,
+                        step_num=step_num,
+                        session_id=session_id,
+                        test_config=test_config,
+                        environment_state=environment_state,
+                        test_def=test_def,
+                        attack_email_step_num=attack_email_step_num
+                    )
+                    
+                    # Add to database
+                    self.database.add(variant_candidate)
+                    
+                    self._log_info(f"   Initial candidate {i}/{len(initial_variants)}: score={variant_candidate.agentdojo_score}/10")
+                
+                self._log_info(f"Database initialized with {len(initial_variants) + 1} total candidates (1 original + {len(initial_variants)} variants)")
+            else:
+                self._log_warning("Failed to generate initial diverse candidates, proceeding with original candidate only")
+        except Exception as e:
+            self._log_warning(f"Error during database initialization: {e}")
+            self._log_warning("Proceeding with original candidate only")
+            import traceback
+            if self.logger:
+                self.logger.warning(f"Traceback: {traceback.format_exc()}")
         
         feedback = [f"Initial candidate score: {initial_candidate.agentdojo_score}/10"]
         

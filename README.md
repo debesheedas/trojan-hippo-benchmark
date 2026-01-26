@@ -14,14 +14,14 @@ The benchmark system supports three memory backends (explicit, mem0, rag) with u
 # Activate virtual environment (if using one)
 source venv/bin/activate
 
-# Run explicit memory with no defense on benign tests
-python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite benign
+# Run explicit memory with no defense on utility test suite
+python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite memory_only
 
 # Run mem0 with all defense types
-python scripts/run_benchmark.py --memory-backend mem0 --all-defenses --suite benign
+python scripts/run_benchmark.py --memory-backend mem0 --all-defenses --suite memory_only
 
 # Run a specific test file with RAG memory
-python scripts/run_benchmark.py --memory-backend rag --defense-type user_prompt_only --test data/benchmark/tests/benign/00_email_tools.json
+python scripts/run_benchmark.py --memory-backend rag --defense-type user_prompt_only --test data/benchmark/tests/memory_only/memory_only_001.json
 ```
 
 #### Memory Backends
@@ -73,27 +73,27 @@ Unified defense types work consistently across all backends:
 
 #### Running Test Suites
 
-Test suites are organized by attack type:
+Utility test suites are organized under `data/benchmark/tests/`:
 
 ```bash
-# Run benign (normal behavior) tests
-python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite benign
+# Run utility test suites (memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory)
+python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite memory_only
 
-# Run direct attack tests
-python scripts/run_benchmark.py --memory-backend mem0 --defense-type user_prompt_only --suite direct
-
-# Run indirect attack tests
-python scripts/run_benchmark.py --memory-backend rag --defense-type none --suite indirect
+# Run attack bench tests (no suites, all tests directly under data/benchmark/attack_bench/)
+python scripts/run_benchmark.py --memory-backend mem0 --defense-type user_prompt_only --test data/benchmark/attack_bench/rag/00_exfiltrate.json
 ```
 
 #### Running Specific Tests
 
 ```bash
-# Run a single test file
-python scripts/run_benchmark.py --memory-backend explicit --defense-type none --test data/benchmark/tests/benign/00_email_tools.json
+# Run a single utility test file
+python scripts/run_benchmark.py --memory-backend explicit --defense-type none --test data/benchmark/tests/memory_only/memory_only_001.json
 
-# Run all tests in a directory
-python scripts/run_benchmark.py --memory-backend mem0 --defense-type user_prompt_only --test data/benchmark/tests/benign/
+# Run all tests in a utility suite directory
+python scripts/run_benchmark.py --memory-backend mem0 --defense-type user_prompt_only --test data/benchmark/tests/memory_only/
+
+# Run attack bench test
+python scripts/run_benchmark.py --memory-backend rag --defense-type none --test data/benchmark/attack_bench/rag/00_exfiltrate.json
 ```
 
 #### Running All Defenses
@@ -102,7 +102,7 @@ Run all defense types for a backend in one command:
 
 ```bash
 # Run all defenses for explicit memory
-python scripts/run_benchmark.py --memory-backend explicit --all-defenses --suite benign
+python scripts/run_benchmark.py --memory-backend explicit --all-defenses --suite memory_only
 
 # This runs: disable_memory, none, user_prompt_only, no_untrusted_tools, limit_memory_length
 ```
@@ -113,16 +113,16 @@ The benchmark automatically skips tests if results already exist, preventing unn
 
 ```bash
 # First run - executes all tests
-python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite benign
+python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite memory_only
 # Output: Running tests, saving results...
 
 # Second run - skips tests (results exist)
-python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite benign
+python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite memory_only
 # Output: ⏭️  Skipping test_name.json - result already exists
 #         Use --force to overwrite
 
 # Force overwrite existing results
-python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite benign --force
+python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite memory_only --force
 # Output: Running tests, overwriting existing results...
 ```
 
@@ -130,16 +130,16 @@ python scripts/run_benchmark.py --memory-backend explicit --defense-type none --
 
 ```bash
 # Use custom config file
-python scripts/run_benchmark.py --memory-backend mem0 --defense-type user_prompt_only --suite benign --config my_config.yaml
+python scripts/run_benchmark.py --memory-backend mem0 --defense-type user_prompt_only --suite memory_only --config my_config.yaml
 
 # Use custom results directory
-python scripts/run_benchmark.py --memory-backend rag --defense-type none --suite benign --results-dir data/custom_results
+python scripts/run_benchmark.py --memory-backend rag --defense-type none --suite memory_only --results-dir data/custom_results
 
 # Combine options
 python scripts/run_benchmark.py \
   --memory-backend explicit \
   --defense-type user_prompt_only \
-  --suite benign \
+  --suite memory_only \
   --config benchmark_config.yaml \
   --force \
   --results-dir data/benchmark/results
@@ -154,7 +154,7 @@ python scripts/run_benchmark.py --help
 --memory-backend {explicit,mem0,rag}  # Memory backend to use
 
 # Test selection (one required):
---suite {benign,direct,indirect}      # Test suite to run
+--suite {memory_only,assistant_responses,untrusted_probe,untrusted_send,disable_send,memory_tools,long_memory}  # Utility test suite to run
 --test TEST                           # Specific test file or directory
 
 # Defense selection (one required):
@@ -176,11 +176,11 @@ data/benchmark/results/
   {memory_backend}/           # explicit, mem0, or rag
     {defense_type}/           # none, disable_memory, user_prompt_only, etc.
       {model_name}/           # gpt-5-mini, gpt-4o, etc.
-        {attack_type}/        # benign, direct, or indirect
+        {attack_type}/        # memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory (for utility tests) or test filename (for attack_bench)
           {test_file}.json    # Individual test results
 ```
 
-Example: `data/benchmark/results/explicit/none/gpt-5-mini/benign/00_email_tools.json`
+Example: `data/benchmark/results/gpt-5-mini/explicit/none/memory_only/memory_only_001.json`
 
 ### Running the Adaptive Benchmark
 
@@ -198,10 +198,10 @@ source venv/bin/activate
 # Set memory.{backend}_memory.enabled: true
 
 # 3. Run adaptive benchmark
-python src/benchmark/test_bench.py --suite indirect --defense-type none
+python src/benchmark/test_bench.py --suite memory_only --defense-type none
 
 # Or use the unified runner (adaptive mode uses test_bench.py internally)
-python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite indirect
+python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite memory_only
 ```
 
 **What it does**: When a static attack fails, the system automatically attempts to optimize the attack using configured strategies (OpenEvolve or DSPy) to find a successful variant.
@@ -290,10 +290,15 @@ memory-agent-security-benchmark/
 ├── data/
 │   ├── agent/                   # Agent data (mailbox, drafts, outbox, memory)
 │   └── benchmark/              # Benchmark data
-│       ├── tests/              # Unified test directory
-│       │   ├── benign/         # Benign behavior tests
-│       │   ├── direct/         # Direct attack tests
-│       │   └── indirect/       # Indirect attack tests
+│       ├── tests/              # Utility test directory (organized by suite)
+│       │   ├── memory_only/    # Memory-only utility tests
+│       │   ├── assistant_responses/  # Assistant responses utility tests
+│       │   ├── untrusted_probe/ # Untrusted probe utility tests
+│       │   ├── untrusted_send/  # Untrusted send utility tests
+│       │   ├── disable_send/    # Disable send utility tests
+│       │   ├── memory_tools/   # Memory tools utility tests
+│       │   └── long_memory/    # Long memory utility tests
+│       ├── attack_bench/       # Attack bench tests (no suites, direct organization)
 │       ├── results/            # Unified results directory
 │       │   ├── explicit/       # Explicit memory results
 │       │   ├── mem0/           # Mem0 memory results
@@ -311,7 +316,7 @@ memory-agent-security-benchmark/
 ├── html_reports/               # HTML visualization reports
 │   ├── index.html              # Reports index
 │   └── gpt-4o/                 # Model-specific reports
-│       └── indirect/           # Attack type reports
+│       └── {suite}/            # Suite-specific reports
 ├── logs/                       # Application logs
 ├── mem0/                       # Mem0 library (dependency)
 └── useful_temp/                # Temporary utility scripts and notes
@@ -511,7 +516,7 @@ Tests are defined as JSON files with a **unified format** that works with all me
 {
   "name": "Test Name",
   "description": "Test description",
-  "attack_type": "benign|direct|indirect",
+  "attack_type": "memory_only|assistant_responses|untrusted_probe|untrusted_send|disable_send|memory_tools|long_memory (for utility tests) or attack_type from JSON (for attack_bench)",
   "initial_data": {
     "inbox_set": "inbox_set_1",
     "outbox_set": "outbox_set_1",
@@ -633,8 +638,8 @@ python scripts/consolidate_results.py
 
 # Consolidate specific model or attack type
 python scripts/consolidate_results.py --model gpt-5-mini
-python scripts/consolidate_results.py --attack-type benign
-python scripts/consolidate_results.py --model gpt-5-mini --attack-type benign
+python scripts/consolidate_results.py --suite memory_only
+python scripts/consolidate_results.py --model gpt-5-mini --suite memory_only
 
 # Custom results or output directory
 python scripts/consolidate_results.py --results-dir data/custom_results
@@ -644,7 +649,7 @@ python scripts/consolidate_results.py --output-dir data/consolidated
 The script generates comprehensive CSV tables with:
 - **Rows**: Defense types (disable_memory, none, user_prompt_only, no_untrusted_tools, limit_memory_length)
 - **Columns**: Memory backends (disable_memory, explicit, mem0, rag) with steps passed/total and percentage
-- **Output**: Separate CSV files for each model and attack type: `{model_name}_{attack_type}_consolidated.csv`
+- **Output**: Separate CSV files for each model and suite: `{model_name}_{suite}_consolidated.csv`
 
 Consolidated CSV files are saved to the output directory (default: `data/benchmark/consolidated_results/`).
 
@@ -663,15 +668,15 @@ data/benchmark/results/
   {model_name}/               # gpt-5-mini, gpt-4o, etc.
     {memory_backend}/         # explicit, mem0, rag, or none (for disable_memory)
       {defense_type}/         # none, disable_memory, user_prompt_only, etc.
-        {attack_type}/        # benign, direct, or indirect
+        {attack_type}/        # memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory (for utility tests) or test filename (for attack_bench)
           {test_file}.json
 ```
 
 **Example paths**:
-- `data/benchmark/results/gpt-5-mini/explicit/none/benign/00_email_tools.json`
-- `data/benchmark/results/gpt-5-mini/mem0/user_prompt_only/direct/01_attack_test.json`
-- `data/benchmark/results/gpt-4o/rag/no_untrusted_tools/indirect/02_poisoning_test.json`
-- `data/benchmark/results/gpt-5-mini/none/disable_memory/benign/00_email_tools.json` (no memory enabled)
+- `data/benchmark/results/gpt-5-mini/explicit/none/memory_only/memory_only_001.json` (utility test)
+- `data/benchmark/results/gpt-5-mini/mem0/user_prompt_only/assistant_responses/assistant_responses_001.json` (utility test)
+- `data/benchmark/results/gpt-4o/rag/none/00_exfiltrate.json` (attack bench test - no suite folder)
+- `data/benchmark/results/gpt-5-mini/none/disable_memory/memory_only/memory_only_001.json` (no memory enabled)
 
 ### Result File Format
 
@@ -680,7 +685,7 @@ Results are saved as **JSON files** with detailed test information:
 ```json
 {
   "test_name": "Test Name",
-  "test_file": "data/benchmark/tests/benign/00_email_tools.json",
+  "test_file": "data/benchmark/tests/memory_only/memory_only_001.json",
   "description": "Test description",
   "session_id": "bench_42188cb0",
   "timestamp": "2025-11-03T12:00:00",
@@ -689,7 +694,7 @@ Results are saved as **JSON files** with detailed test information:
   "defense_type": "none",
   "backend_defense": "none",
   "model_name": "gpt-5-mini",
-  "attack_type": "benign",
+  "attack_type": "memory_only",
   "steps": [
     {
       "step": 1,
@@ -765,10 +770,11 @@ The caching key is: `{memory_backend}/{defense_type}/{model_name}/{attack_type}/
 - Check that model name is correctly set in `agent_config.yaml` (`agent.target_model_name`)
 
 **Test cases not found:**
-- Check test directory: `data/benchmark/tests/{attack_type}/`
-- All test cases are in the unified location: `data/benchmark/tests/`
+- Check test directory: `data/benchmark/tests/{suite}/` for utility tests or `data/benchmark/attack_bench/` for attack bench tests
+- All utility test cases are in: `data/benchmark/tests/`
+- All attack bench test cases are in: `data/benchmark/attack_bench/`
 - Use `--test` with full path if test is in non-standard location
-- Ensure test suite directory exists (benign, direct, or indirect)
+- Ensure test suite directory exists (memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory) for utility tests
 
 **Defense type not working:**
 - Verify defense type is one of: `none`, `disable_memory`, `user_prompt_only`, `no_untrusted_tools`, `limit_memory_length`
@@ -791,13 +797,13 @@ The caching key is: `{memory_backend}/{defense_type}/{model_name}/{attack_type}/
 
 ```bash
 # Run explicit memory with no defense
-python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite benign
+python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite memory_only
 
 # Run mem0 with all defenses
-python scripts/run_benchmark.py --memory-backend mem0 --all-defenses --suite benign
+python scripts/run_benchmark.py --memory-backend mem0 --all-defenses --suite memory_only
 
 # Run specific test with force overwrite
-python scripts/run_benchmark.py --memory-backend rag --defense-type user_prompt_only --test data/benchmark/tests/benign/00_email_tools.json --force
+python scripts/run_benchmark.py --memory-backend rag --defense-type user_prompt_only --test data/benchmark/tests/memory_only/memory_only_001.json --force
 
 # Consolidate all results (generates comprehensive CSV tables)
 python scripts/consolidate_results.py
@@ -823,22 +829,44 @@ python scripts/consolidate_results.py
 
 ### Test Suite Organization
 
+**Utility Tests** (organized by suite):
 ```
 data/benchmark/tests/
-  benign/      # Normal behavior tests
-  direct/     # Direct attack tests
-  indirect/   # Indirect attack tests
+  memory_only/         # Memory-only utility tests
+  assistant_responses/ # Assistant responses utility tests
+  untrusted_probe/     # Untrusted probe utility tests
+  untrusted_send/      # Untrusted send utility tests
+  disable_send/        # Disable send utility tests
+  memory_tools/        # Memory tools utility tests
+  long_memory/         # Long memory utility tests
+```
+
+**Attack Bench Tests** (no suites):
+```
+data/benchmark/attack_bench/
+  {backend}/           # Backend-specific attack tests (e.g., rag/)
+    {test_file}.json   # Individual attack test files
 ```
 
 ### Result Structure
 
+**Utility Tests**:
 ```
 data/benchmark/results/
-  {memory_backend}/        # explicit, mem0, or rag
-    {defense_type}/        # none, disable_memory, user_prompt_only, etc.
-      {model_name}/        # gpt-5-mini, gpt-4o, etc.
-        {attack_type}/     # benign, direct, or indirect
-          {test_file}.json # Individual test results
+  {model_name}/        # gpt-5-mini, gpt-4o, etc.
+    {memory_backend}/  # explicit, mem0, rag, or none
+      {defense_type}/  # none, disable_memory, user_prompt_only, etc.
+        {suite}/       # memory_only, assistant_responses, etc.
+          {test_file}.json
+```
+
+**Attack Bench Tests**:
+```
+data/benchmark/results/
+  {model_name}/        # gpt-5-mini, gpt-4o, etc.
+    {memory_backend}/  # explicit, mem0, rag, or none
+      {defense_type}/  # none, disable_memory, user_prompt_only, etc.
+        {test_file}.json  # No suite folder for attack bench tests
 ```
 
 ### Configuration Priority
@@ -848,6 +876,79 @@ data/benchmark/results/
 3. **Defaults** - System defaults
 
 The `--memory-backend` argument automatically enables the specified backend and disables others, overriding config file settings.
+
+## CI Regression Tests
+
+The `CI-tests/` directory contains regression tests to verify the benchmark works correctly across all memory backends and defense types.
+
+### Running CI Tests
+
+Run test1 across all 5 backends × 5 defenses (23 valid combinations):
+
+```bash
+python scripts/run_benchmark.py \
+  --test CI-tests/testcases/test1.json \
+  --memory-backend none explicit mem0 rag context \
+  --defense-type none user_prompt_only no_untrusted_tools limit_memory_length provable_policy \
+  --results-dir CI-tests/results \
+  --logs-dir CI-tests/logs \
+  --num-workers 1 \
+  --force
+```
+
+### Quick Single-Combination Tests
+
+To quickly verify a specific backend works:
+
+```bash
+# explicit backend with none defense
+python scripts/run_benchmark.py \
+  --test CI-tests/testcases/test1.json \
+  --memory-backend explicit \
+  --defense-type none \
+  --results-dir CI-tests/results \
+  --logs-dir CI-tests/logs \
+  --force
+
+# rag backend with none defense  
+python scripts/run_benchmark.py \
+  --test CI-tests/testcases/test1.json \
+  --memory-backend rag \
+  --defense-type none \
+  --results-dir CI-tests/results \
+  --logs-dir CI-tests/logs \
+  --force
+
+# mem0 backend with none defense
+python scripts/run_benchmark.py \
+  --test CI-tests/testcases/test1.json \
+  --memory-backend mem0 \
+  --defense-type none \
+  --results-dir CI-tests/results \
+  --logs-dir CI-tests/logs \
+  --force
+
+# context backend with none defense
+python scripts/run_benchmark.py \
+  --test CI-tests/testcases/test1.json \
+  --memory-backend context \
+  --defense-type none \
+  --results-dir CI-tests/results \
+  --logs-dir CI-tests/logs \
+  --force
+```
+
+### Comparing Results Against Ground Truth
+
+After running tests, compare results:
+
+```bash
+python CI-tests/compare_results.py \
+  --results-dir CI-tests/results \
+  --test-file CI-tests/testcases/test1.json
+```
+
+See `CI-tests/README.md` for more details on the CI test infrastructure.
 
 ## License
 

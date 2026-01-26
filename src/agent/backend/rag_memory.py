@@ -24,16 +24,20 @@ Features:
 """
 
 import os
-from pathlib import Path
 from typing import List, Dict, Any, Optional
-import threading
-import json
+# Threading removed - each test runs in isolation, no locks needed
 from datetime import datetime, timezone
 from pydantic import SecretStr
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from agent.utils import debug_info, debug_debug, debug_print_exception
+
+# Import in-memory storage (optional - for backward compatibility)
+try:
+    from benchmark.in_memory_storage import InMemoryVectorstore
+except ImportError:
+    InMemoryVectorstore = None  # Type: ignore
 
 
 class RAGDefenseManager:
@@ -139,33 +143,31 @@ class RAGDefenseManager:
 
 class RAGMemoryManager:
     """
-    Manages embedding-based RAG memory using vector stores for semantic retrieval.
+    Manages embedding-based RAG memory using vector stores for semantic retrieval (in-memory only).
     """
     
     def __init__(
         self,
+        vectorstore: 'InMemoryVectorstore',
         embedding_model: str = "text-embedding-3-small",
         top_k: int = 8,
         chunk_size: int = 512,
-        vectorstore_path: Optional[str] = None,
-        api_key: Optional[str] = None
+        api_key: Optional[str] = None,
     ):
         """
-        Initialize the RAG memory manager.
+        Initialize the RAG memory manager (in-memory only).
         
         Args:
+            vectorstore: In-memory vectorstore (required)
             embedding_model: Name of the embedding model to use
             top_k: Number of top documents to retrieve
             chunk_size: Size of text chunks in tokens
-            vectorstore_path: Optional path to persist vector store
             api_key: Optional OpenAI API key (uses env var if not provided)
         """
-        
         self.embedding_model = embedding_model
         self.top_k = top_k
         self.chunk_size = chunk_size
-        self.vectorstore_path = Path(vectorstore_path) if vectorstore_path else None
-        self._lock = threading.Lock()
+        self.vectorstore_storage = vectorstore  # Renamed to avoid conflict with self.vectorstore
         
         # Initialize embedding model
         api_key = api_key or os.getenv("OPENAI_API_KEY")
@@ -182,49 +184,17 @@ class RAGMemoryManager:
         self.documents: List[str] = []  # Store raw documents for reference
         self._chunk_counter = 0
         
-        # Load existing vector store if path provided
-        if self.vectorstore_path and self.vectorstore_path.exists():
-            self._load_vectorstore()
-    
-    def _load_vectorstore(self):
-        """Load vector store from disk if it exists."""
-        try:
-            if self.vectorstore_path and (self.vectorstore_path / "index.faiss").exists():
-                self.vectorstore = FAISS.load_local(
-                    str(self.vectorstore_path),
-                    self.embeddings,
-                    allow_dangerous_deserialization=True
-                )
-                # Load document metadata
-                metadata_file = self.vectorstore_path / "documents.json"
-                if metadata_file.exists():
-                    with open(metadata_file, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        self.documents = data.get("documents", [])
-                        self._chunk_counter = data.get("chunk_counter", 0)
-                debug_debug(f"Loaded existing vector store from {self.vectorstore_path}")
-        except Exception as e:
-            debug_info(f"Could not load vector store from {self.vectorstore_path} (will create new one)")
-            debug_print_exception(e, context=f"Loading RAG vectorstore from {self.vectorstore_path}", include_traceback=True)
-            self.vectorstore = None
+        # Load existing vector store from in-memory storage
+        vectorstore, documents, chunk_counter = self.vectorstore_storage.load()
+        if vectorstore is not None:
+            self.vectorstore = vectorstore
+            self.documents = documents
+            self._chunk_counter = chunk_counter
     
     def _save_vectorstore(self):
-        """Save vector store to disk if path is configured."""
-        if self.vectorstore and self.vectorstore_path:
-            try:
-                self.vectorstore_path.mkdir(parents=True, exist_ok=True)
-                self.vectorstore.save_local(str(self.vectorstore_path))
-                # Save document metadata
-                metadata_file = self.vectorstore_path / "documents.json"
-                with open(metadata_file, 'w', encoding='utf-8') as f:
-                    json.dump({
-                        "documents": self.documents,
-                        "chunk_counter": self._chunk_counter,
-                        "last_updated": datetime.now(timezone.utc).isoformat()
-                    }, f, indent=2)
-            except Exception as e:
-                debug_info(f"Could not save vector store to {self.vectorstore_path}")
-                debug_print_exception(e, context=f"Saving RAG vectorstore to {self.vectorstore_path}", include_traceback=True)
+        """Save vector store to in-memory storage."""
+        if self.vectorstore and self.vectorstore_storage:
+            self.vectorstore_storage.save(self.vectorstore, self.documents, self._chunk_counter)
     
     def add_memory(self, text: str, metadata: Optional[Dict[str, Any]] = None, session_id: Optional[str] = None, defense_type: Optional[str] = None):
         """
@@ -250,92 +220,52 @@ class RAGMemoryManager:
             session_id: Optional session ID for provable_policy defense (P3: Memory Labeling)
             defense_type: Optional defense type to check if provable_policy is active
         """
-        with self._lock:
-            # Filter out empty texts
-            valid_texts = [t.strip() for t in texts if t and t.strip()]
-            if not valid_texts:
-                return
+        # No lock needed - each test runs in isolation
+        # Filter out empty texts
+        valid_texts = [t.strip() for t in texts if t and t.strip()]
+        if not valid_texts:
+            return
+        
+        # Create documents with metadata
+        docs = []
+        start_chunk_id = self._chunk_counter
+        for i, text in enumerate(valid_texts):
+            doc_metadata = (metadata or {}).copy()
+            doc_metadata["chunk_id"] = start_chunk_id + i
+            doc_metadata["timestamp"] = datetime.now(timezone.utc).isoformat()
             
-            # Create documents with metadata
-            docs = []
-            start_chunk_id = self._chunk_counter
-            for i, text in enumerate(valid_texts):
-                doc_metadata = (metadata or {}).copy()
-                doc_metadata["chunk_id"] = start_chunk_id + i
-                doc_metadata["timestamp"] = datetime.now(timezone.utc).isoformat()
-                
-                # P3: Memory Labeling - inherit session label for provable_policy defense
-                if defense_type == "provable_policy":
-                    if session_id:
-                        from agent.agent_core import ProvablePolicyManager
-                        session_label = ProvablePolicyManager.get_session_label(session_id)
-                        doc_metadata["label"] = session_label
-                    else:
-                        # Default to T if no session_id provided
-                        doc_metadata["label"] = "T"
-                elif "label" not in doc_metadata:
-                    # For non-provable_policy defenses, don't require label
-                    # But if label is explicitly provided, keep it
-                    pass
-                
-                doc = Document(page_content=text, metadata=doc_metadata)
-                docs.append(doc)
+            # P3: Memory Labeling - inherit session label for provable_policy defense
+            if defense_type == "provable_policy":
+                if session_id:
+                    from agent.agent_core import ProvablePolicyManager
+                    session_label = ProvablePolicyManager.get_session_label(session_id)
+                    doc_metadata["label"] = session_label
+                else:
+                    # Default to T if no session_id provided
+                    doc_metadata["label"] = "T"
+            elif "label" not in doc_metadata:
+                # For non-provable_policy defenses, don't require label
+                # But if label is explicitly provided, keep it
+                pass
             
-            # Add to vector store (batch operation - more efficient)
-            if self.vectorstore is None:
-                # Initialize vector store with first batch of documents
-                self.vectorstore = FAISS.from_documents(docs, self.embeddings)
-            else:
-                # Add to existing vector store (batched - single embedding API call for all docs)
-                self.vectorstore.add_documents(docs)
-            
-            # Store document references
-            for text in valid_texts:
-                self.documents.append(text)
-                self._chunk_counter += 1
-            
-            # Track recent chunks for efficient validation
-            # Store in a file in the test directory (if vectorstore_path is in a test directory)
-            if self.vectorstore_path:
-                try:
-                    vectorstore_path_obj = Path(self.vectorstore_path)
-                    # Check if this is a test directory (contains "test_env" or "rag_vectorstore" in test_envs)
-                    if "test_env" in str(vectorstore_path_obj) or "test_envs" in str(vectorstore_path_obj):
-                        # Get the test directory (parent of rag_vectorstore)
-                        test_dir = vectorstore_path_obj.parent
-                        recent_chunks_file = test_dir / "rag_recent_chunks.json"
-                        
-                        # Load existing recent chunks
-                        recent_chunks = []
-                        if recent_chunks_file.exists():
-                            try:
-                                with open(recent_chunks_file, 'r', encoding='utf-8') as f:
-                                    recent_chunks = json.load(f)
-                            except Exception:
-                                recent_chunks = []
-                        
-                        # Add new chunks to recent chunks list
-                        for i, text in enumerate(valid_texts):
-                            recent_chunks.append({
-                                "text": text,
-                                "chunk_id": start_chunk_id + i,
-                                "timestamp": datetime.now(timezone.utc).isoformat()
-                            })
-                        
-                        # Keep only recent chunks, limit to last 100 to avoid file bloat
-                        recent_chunks = recent_chunks[-100:]
-                        
-                        # Save updated recent chunks
-                        with open(recent_chunks_file, 'w', encoding='utf-8') as f:
-                            json.dump(recent_chunks, f, indent=2, ensure_ascii=False)
-                except Exception as e:
-                    # Fail gracefully if we can't track recent chunks (non-critical)
-                    debug_debug("Could not track recent chunks for validation (non-critical)")
-                    debug_print_exception(e, context="Tracking recent chunks in RAG memory", include_traceback=True)
-            
-            # Save if path is configured
-            if self.vectorstore_path:
-                self._save_vectorstore()
+            doc = Document(page_content=text, metadata=doc_metadata)
+            docs.append(doc)
+        
+        # Add to vector store (batch operation - more efficient)
+        if self.vectorstore is None:
+            # Initialize vector store with first batch of documents
+            self.vectorstore = FAISS.from_documents(docs, self.embeddings)
+        else:
+            # Add to existing vector store (batched - single embedding API call for all docs)
+            self.vectorstore.add_documents(docs)
+        
+        # Store document references
+        for text in valid_texts:
+            self.documents.append(text)
+            self._chunk_counter += 1
+        
+        # Save to in-memory vectorstore
+        self._save_vectorstore()
     
     def retrieve(self, query: str, top_k: Optional[int] = None, session_id: Optional[str] = None, defense_type: Optional[str] = None) -> List[str]:
         """
@@ -350,46 +280,46 @@ class RAGMemoryManager:
         Returns:
             List of retrieved document texts
         """
-        with self._lock:
-            if self.vectorstore is None:
-                return []
+        # No lock needed - each test runs in isolation
+        if self.vectorstore is None:
+            return []
+        
+        k = top_k or self.top_k
+        
+        try:
+            # Perform similarity search
+            debug_debug(f"RAG Memory: Performing similarity search with k={k}, query='{query[:100]}...'", truncate=False, max_length=500)
+            results = self.vectorstore.similarity_search(query, k=k)
+            debug_debug(f"RAG Memory: Similarity search returned {len(results)} results (requested k={k})", truncate=False)
             
-            k = top_k or self.top_k
+            # P1: Check if any retrieved memory has U label (provable_policy defense)
+            if defense_type == "provable_policy" and session_id:
+                from agent.agent_core import ProvablePolicyManager
+                for doc in results:
+                    label = doc.metadata.get("label", None)
+                    if label == "U":
+                        # Upgrade session to U if U-labeled memory is retrieved
+                        ProvablePolicyManager.set_untrusted(session_id)
+                        break
+                    elif label is None:
+                        # Error: memory should have a label
+                        raise ValueError(
+                            f"Memory chunk missing label in provable_policy defense. "
+                            f"Chunk ID: {doc.metadata.get('chunk_id', 'unknown')}, "
+                            f"All memories must have 'label' metadata set to 'T' or 'U'."
+                        )
             
-            try:
-                # Perform similarity search
-                debug_debug(f"RAG Memory: Performing similarity search with k={k}, query='{query[:100]}...'", truncate=False, max_length=500)
-                results = self.vectorstore.similarity_search(query, k=k)
-                debug_debug(f"RAG Memory: Similarity search returned {len(results)} results (requested k={k})", truncate=False)
-                
-                # P1: Check if any retrieved memory has U label (provable_policy defense)
-                if defense_type == "provable_policy" and session_id:
-                    from agent.agent_core import ProvablePolicyManager
-                    for doc in results:
-                        label = doc.metadata.get("label", None)
-                        if label == "U":
-                            # Upgrade session to U if U-labeled memory is retrieved
-                            ProvablePolicyManager.set_untrusted(session_id)
-                            break
-                        elif label is None:
-                            # Error: memory should have a label
-                            raise ValueError(
-                                f"Memory chunk missing label in provable_policy defense. "
-                                f"Chunk ID: {doc.metadata.get('chunk_id', 'unknown')}, "
-                                f"All memories must have 'label' metadata set to 'T' or 'U'."
-                            )
-                
-                retrieved_chunks = [doc.page_content for doc in results]
-                # Log each retrieved chunk (without truncation for full visibility)
-                debug_debug(f"RAG Memory: Retrieved {len(retrieved_chunks)} chunks", truncate=False)
-                for i, chunk in enumerate(retrieved_chunks, 1):
-                    debug_debug(f"RAG Memory Chunk {i}/{len(retrieved_chunks)} ({len(chunk)} chars):\n{chunk}", truncate=False)
-                
-                return retrieved_chunks
-            except Exception as e:
-                debug_info(f"Error during retrieval: {e}")
-                debug_print_exception(e, context="RAG memory retrieval", include_traceback=True)
-                return []
+            retrieved_chunks = [doc.page_content for doc in results]
+            # Log each retrieved chunk (without truncation for full visibility)
+            debug_debug(f"RAG Memory: Retrieved {len(retrieved_chunks)} chunks", truncate=False)
+            for i, chunk in enumerate(retrieved_chunks, 1):
+                debug_debug(f"RAG Memory Chunk {i}/{len(retrieved_chunks)} ({len(chunk)} chars):\n{chunk}", truncate=False)
+            
+            return retrieved_chunks
+        except Exception as e:
+            debug_info(f"Error during retrieval: {e}")
+            debug_print_exception(e, context="RAG memory retrieval", include_traceback=True)
+            return []
     
     def get_context(self, query: str, top_k: Optional[int] = None, session_id: Optional[str] = None, defense_type: Optional[str] = None) -> str:
         """
@@ -429,19 +359,14 @@ class RAGMemoryManager:
     
     def clear_all_memory(self):
         """Clear all memory from the vector store."""
-        with self._lock:
-            self.vectorstore = None
-            self.documents = []
-            self._chunk_counter = 0
-            
-            # Delete persisted vector store if it exists
-            if self.vectorstore_path and self.vectorstore_path.exists():
-                import shutil
-                try:
-                    shutil.rmtree(self.vectorstore_path)
-                except Exception as e:
-                    debug_info(f"Could not delete vector store at {self.vectorstore_path}")
-                    debug_print_exception(e, context=f"Deleting RAG vectorstore at {self.vectorstore_path}", include_traceback=True)
+        # No lock needed - each test runs in isolation
+        self.vectorstore = None
+        self.documents = []
+        self._chunk_counter = 0
+        
+        # Clear in-memory vectorstore
+        if self.vectorstore_storage:
+            self.vectorstore_storage.clear()
     
     def get_stats(self) -> Dict[str, Any]:
         """
@@ -450,15 +375,15 @@ class RAGMemoryManager:
         Returns:
             Dictionary with memory statistics
         """
-        with self._lock:
-            return {
-                "total_chunks": len(self.documents),
-                "chunk_counter": self._chunk_counter,
-                "vectorstore_initialized": self.vectorstore is not None,
-                "embedding_model": self.embedding_model,
-                "top_k": self.top_k,
-                "chunk_size": self.chunk_size
-            }
+        # No lock needed - each test runs in isolation
+        return {
+            "total_chunks": len(self.documents),
+            "chunk_counter": self._chunk_counter,
+            "vectorstore_initialized": self.vectorstore is not None,
+            "embedding_model": self.embedding_model,
+            "top_k": self.top_k,
+            "chunk_size": self.chunk_size
+        }
 
 
 def get_rag_defense_manager(
@@ -481,28 +406,28 @@ def get_rag_defense_manager(
 
 
 def get_rag_memory_manager(
+    vectorstore: 'InMemoryVectorstore',
     embedding_model: str = "text-embedding-3-small",
     top_k: int = 10,
     chunk_size: int = 512,
-    vectorstore_path: Optional[str] = None,
 ) -> RAGMemoryManager:
     """
-    Create a new RAG memory manager instance.
+    Create a new RAG memory manager instance (in-memory only).
     
     Args:
+        vectorstore: In-memory vectorstore (required)
         embedding_model: Name of the embedding model
         top_k: Number of top documents to retrieve
         chunk_size: Size of text chunks
-        vectorstore_path: Optional path to persist vector store
     
     Returns:
         A new RAGMemoryManager instance
     """
     return RAGMemoryManager(
+        vectorstore=vectorstore,
         embedding_model=embedding_model,
         top_k=top_k,
         chunk_size=chunk_size,
-        vectorstore_path=vectorstore_path
     )
 
 
@@ -516,12 +441,17 @@ def get_rag_memory_context(text: str, session_id: str, memory_config: dict, memo
         return ""
     
     try:
+        vectorstore = rag_memory_config.get("vectorstore")
+        if not vectorstore:
+            debug_debug("No vectorstore in config, cannot retrieve RAG memory")
+            return ""
+        
         debug_debug(f"get_rag_memory_context called: text='{text[:100]}...', session_id={session_id}, defense_type={rag_defense_type}", truncate=False, max_length=500)
         rag_memory_manager = get_rag_memory_manager(
+            vectorstore=vectorstore,
             embedding_model=rag_memory_config.get("embedding_model", "text-embedding-3-small"),
             top_k=rag_memory_config.get("top_k", 8),  # Default to 8 for RAG backend
             chunk_size=rag_memory_config.get("chunk_size", 512),
-            vectorstore_path=rag_memory_config.get("vectorstore_path", "data/agent/rag_vectorstore"),
         )
         debug_debug(f"RAG memory manager created with top_k={rag_memory_manager.top_k}", truncate=False)
         rag_context = rag_memory_manager.get_context(text, session_id=session_id, defense_type=rag_defense_type)
@@ -549,11 +479,16 @@ def index_rag_memory(text: str, response_text: str, session_id: str, rag_memory_
         effective_chunk_size = defense_manager.get_chunk_size(default_chunk_size, limit_memory_size=limit_memory_size)
         conversation_turn = defense_manager.filter_conversation_turn(text, response_text)
         
+        vectorstore = rag_memory_config.get("vectorstore")
+        if not vectorstore:
+            debug_debug("No vectorstore in config, cannot index RAG memory")
+            return
+        
         rag_memory_manager = get_rag_memory_manager(
+            vectorstore=vectorstore,
             embedding_model=rag_memory_config.get("embedding_model", "text-embedding-3-small"),
             top_k=rag_memory_config.get("top_k", 3),
             chunk_size=effective_chunk_size,
-            vectorstore_path=rag_memory_config.get("vectorstore_path", "data/agent/rag_vectorstore"),
         )
         
         # Chunk conversation turn
@@ -636,76 +571,24 @@ def map_unified_defense(unified_defense: str) -> str:
     return DEFENSE_MAP.get(unified_defense, unified_defense)
 
 
-def get_memory_state_for_test(test_dir: Path, config: Dict[str, Any]) -> List[str]:
+def get_memory_state_for_test(test_dir, config: Dict[str, Any]) -> List[str]:
     """
-    Get RAG memory contents for test validation.
-    
-    This is a test utility function that reads memory state from the test directory.
-    For efficiency, it first checks for recent chunks added in the current step.
-    If no recent chunks file exists, it falls back to checking all documents.
+    Get RAG memory contents for test validation (from in-memory storage).
     
     Args:
-        test_dir: Test-specific directory
-        config: Configuration dictionary
-        
+        test_dir: Ignored - kept for API compatibility
+        config: Configuration dictionary (should contain vectorstore)
+    
     Returns:
         List of memory chunk strings
     """
-    import json
+    # Get vectorstore from config
+    rag_memory_config = config.get("memory", {}).get("rag_memory", {})
+    vectorstore = rag_memory_config.get("vectorstore")
     
-    # First, try to get recent chunks (much faster - only checks what was added this step)
-    recent_chunks_file = test_dir / "rag_recent_chunks.json"
-    if recent_chunks_file.exists():
-        try:
-            with open(recent_chunks_file, 'r', encoding='utf-8') as f:
-                recent_chunks = json.load(f)
-            if recent_chunks:
-                # Return recent chunks - these are what were added in the current turn
-                # Extract text from dict format if needed
-                result = []
-                for chunk in recent_chunks:
-                    if isinstance(chunk, dict):
-                        text = chunk.get("text", "")
-                        if text:
-                            result.append(str(text))
-                    else:
-                        result.append(str(chunk))
-                return result
-        except Exception as e:
-            # If we can't read recent chunks, fall back to full retrieval
-            debug_debug(f"Could not read recent chunks file, falling back to full retrieval")
-            debug_print_exception(e, context="Reading recent chunks file", include_traceback=True)
+    if vectorstore:
+        # Get documents directly from in-memory vectorstore
+        _, documents, _ = vectorstore.load()
+        return [str(doc) for doc in documents] if documents else []
     
-    # Fallback: Get all memory chunks from the documents list
-    # This is slower but ensures we check everything if recent chunks aren't available
-    rag_config = config.get("memory", {}).get("rag_memory", {})
-    vectorstore_path = str(test_dir / "rag_vectorstore")
-    
-    try:
-        rag_memory_manager = get_rag_memory_manager(
-            embedding_model=rag_config.get("embedding_model", "text-embedding-3-small"),
-            top_k=rag_config.get("top_k", 3),
-            chunk_size=rag_config.get("chunk_size", 512),
-            vectorstore_path=vectorstore_path,
-        )
-        
-        # Get all memory chunks from the documents list
-        # RAGMemoryManager stores all chunks in self.documents
-        if hasattr(rag_memory_manager, 'documents') and rag_memory_manager.documents:
-            # documents is a list of strings (chunk texts)
-            return list(rag_memory_manager.documents)
-        
-        # Fallback: Try to retrieve from vectorstore using a broad query
-        if rag_memory_manager.vectorstore:
-            try:
-                results = rag_memory_manager.vectorstore.similarity_search("", k=1000)
-                return [doc.page_content for doc in results]
-            except Exception as e:
-                debug_debug("Could not retrieve from vectorstore, returning empty list")
-                debug_print_exception(e, context="Retrieving from RAG vectorstore", include_traceback=True)
-        
-        return []
-    except Exception as e:
-        debug_info("Could not read RAG memory")
-        debug_print_exception(e, context="Reading RAG memory", include_traceback=True)
-        return []
+    return []

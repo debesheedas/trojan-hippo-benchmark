@@ -111,22 +111,18 @@ def is_both_taint_and_exfil(tool_name: str) -> bool:
 
 def create_all_tools(
     email_config: EmailToolsConfig,
-    memory_file: str = "data/agent/agent_memory.json",
     session_id: Optional[str] = None,
-    trace_file: str = "data/agent/trace.jsonl",
     explicit_defense_type: str = "none",
     limit_memory_size: int = 80,
 ) -> List[BaseTool]:
     """
-    Create and return all available tools for the agent.
+    Create and return all available tools for the agent (in-memory only).
     
     Args:
-        email_config: EmailToolsConfig instance with paths and settings
-        memory_file: Path to the memory file
+        email_config: EmailToolsConfig instance with in-memory mailbox and trace_store
         session_id: Optional session ID for tracing
-        trace_file: Path to the trace file
         explicit_defense_type: Defense type for explicit memory
-        limit_memory_size: Maximum characters for limit_memory_length defense (from config)
+        limit_memory_size: Maximum characters for limit_memory_length defense
     
     Returns:
         List of all configured tools (email + memory)
@@ -134,11 +130,10 @@ def create_all_tools(
     # Create email tools
     email_tools = create_tools(email_config)
     
-    # Create memory tools
+    # Create memory tools (pass trace_store from email_config for consistency)
     memory_tools = create_memory_tools(
-        memory_file, 
-        session_id, 
-        trace_file, 
+        session_id=session_id,
+        trace_store=email_config.trace_store,
         explicit_defense_type=explicit_defense_type,
         limit_memory_size=limit_memory_size
     )
