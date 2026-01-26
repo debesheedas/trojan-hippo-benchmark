@@ -12,11 +12,17 @@ Based on: https://arxiv.org/pdf/2510.09023
 
 import json
 import time
+import uuid
 import random
+import re
+import traceback
+import unicodedata
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field
 from .base_optimizer import BaseOptimizer, OptimizationResult
 from benchmark.environment_state import EnvironmentState
+from .scorer import AttackScorer
+from agent.utils import call_llm_chat_completion, detect_provider
 
 
 @dataclass
@@ -336,9 +342,6 @@ class OpenEvolveOptimizer(BaseOptimizer):
         self.mutator_model = self.openevolve_config.get("mutator_model", "gpt-4o")
         self.mutator_temperature = self.openevolve_config.get("mutator_model_temperature", 0.8)
         
-        # Judge model configuration (for AgentDojo Critic)
-        judge_model = self.openevolve_config.get("judge_model", "gpt-4o-mini")
-        
         # Scorer configuration - use AgentDojo Critic
         # Ensure the scorer can find the config in the right place
         if "benchmark" not in self.config:
@@ -352,13 +355,9 @@ class OpenEvolveOptimizer(BaseOptimizer):
         }
         self.config["benchmark"]["scorer"].update(scorer_config)
         
-        # Set judge_model in dspy config so scorer can find it
-        if "dspy" not in self.config["benchmark"]:
-            self.config["benchmark"]["dspy"] = {}
-        self.config["benchmark"]["dspy"]["judge_model"] = judge_model
+        # Note: judge_model is now read directly from openevolve_config in scorer.py
         
-        # Import scorer here to avoid circular imports
-        from .scorer import AttackScorer
+        # Initialize scorer
         self.scorer = AttackScorer(self.config)
         
         # Initialize database
@@ -394,14 +393,34 @@ class OpenEvolveOptimizer(BaseOptimizer):
         Optimize attack using OpenEvolve-style evolutionary search.
         
         This implements the search-based method from the paper.
+        
+        Algorithm Structure:
+        ====================
+        The optimization follows a clear separation between sequential and parallelizable operations:
+        
+        1. SEQUENTIAL OPERATIONS (must run in order):
+           - Database sampling (MAP Elites grid operations)
+           - LLM-based mutation (generates new attack variants)
+           - Candidate object creation (simple data structure creation)
+           - Database updates (MAP Elites grid updates)
+        
+        2. PARALLELIZABLE OPERATIONS (can run concurrently):
+           - Candidate scoring: Each candidate is scored independently by:
+             * Creating a fresh in-memory test environment
+             * Running the full test sequence with that candidate's attack email
+             * Computing scores (partial_score, agentdojo_critic_score, binary_success)
+             * No shared state between candidates - completely independent
+        
+        The _score_candidates_batch() method is structured to allow easy parallelization
+        when num_workers > 1. Currently implemented sequentially, but ready for parallel execution.
         """
-        if max_iterations is None:
-            max_iterations = self.max_iterations
+        # Ensure max_iterations is not None
+        effective_max_iterations = max_iterations if max_iterations is not None else self.max_iterations
         
         self._log_info("=" * 80)
         self._log_info(f"STARTING OPENEVOLVE OPTIMIZATION")
         self._log_info(f"   Step: {step_num}")
-        self._log_info(f"   Max iterations: {max_iterations}")
+        self._log_info(f"   Max iterations: {effective_max_iterations}")
         self._log_info(f"   Candidates per iteration: {self.candidates_per_iteration}")
         self._log_info(f"   Mutator model: {self.mutator_model}")
         self._log_info("=" * 80)
@@ -431,10 +450,11 @@ class OpenEvolveOptimizer(BaseOptimizer):
             iteration=0
         )
         
+        # Step 1: Score initial candidate (sequential - single candidate)
         self._log_info(f"\nScoring initial candidate...")
-        # Score initial candidate
-        self._score_candidate(
-            initial_candidate,
+        initial_candidates = [initial_candidate]
+        self._score_candidates_batch(
+            candidates=initial_candidates,
             failed_step=failed_step,
             step_num=step_num,
             session_id=session_id,
@@ -443,14 +463,10 @@ class OpenEvolveOptimizer(BaseOptimizer):
             test_def=test_def,
             attack_email_step_num=attack_email_step_num
         )
-        
         self.database.add(initial_candidate)
-        self._log_info(f"Initial candidate: score={initial_candidate.agentdojo_score}/10, partial={initial_candidate.partial_score:.2f}")
-        self._log_info(f"   Explanation: {initial_candidate.explanation if initial_candidate.explanation else '[NONE]'}")
-        self._log_info(f"   Improvement: {initial_candidate.improvement if initial_candidate.improvement else '[NONE]'}")
+        self._log_candidate_result(initial_candidate, "Initial candidate")
         
-        # Initialize database with diverse candidates
-        # Generate initial diverse population using the mutator
+        # Step 2: Generate and score initial diverse population (parallelizable batch)
         init_population_size = self.openevolve_config.get("initial_population_size", 10)
         self._log_info(f"\n{'='*80}")
         self._log_info(f"INITIALIZING DATABASE WITH DIVERSE CANDIDATES")
@@ -458,13 +474,12 @@ class OpenEvolveOptimizer(BaseOptimizer):
         self._log_info(f"{'='*80}")
         
         try:
-            # Use the initial candidate as the parent for generating diverse variants
             attack_goal_dict = failed_step.get("attack_goal", {})
             user_message = failed_step.get("user_message", "")
             
-            # Generate diverse initial candidates
+            # Generate diverse initial candidates (sequential - LLM call)
             initial_variants = self._mutate(
-                parent_candidates=[initial_candidate],  # Use initial candidate as parent
+                parent_candidates=[initial_candidate],
                 original_attack_email=original_attack_email,
                 attack_goal=attack_goal_dict,
                 user_message=user_message,
@@ -474,8 +489,9 @@ class OpenEvolveOptimizer(BaseOptimizer):
             if initial_variants:
                 self._log_info(f"Generated {len(initial_variants)} initial diverse candidates")
                 
-                # Score and add each initial variant
-                for i, variant_email in enumerate(initial_variants, 1):
+                # Create candidate objects from variant emails (sequential - simple object creation)
+                initial_candidates_list = []
+                for variant_email in initial_variants:
                     variant_id = self._generate_candidate_id()
                     variant_candidate = self._create_candidate_from_email(
                         candidate_id=variant_id,
@@ -483,31 +499,32 @@ class OpenEvolveOptimizer(BaseOptimizer):
                         parent_id=initial_id,
                         iteration=0
                     )
-                    
-                    # Score the variant
-                    self._score_candidate(
-                        variant_candidate,
-                        failed_step=failed_step,
-                        step_num=step_num,
-                        session_id=session_id,
-                        test_config=test_config,
-                        environment_state=environment_state,
-                        test_def=test_def,
-                        attack_email_step_num=attack_email_step_num
-                    )
-                    
-                    # Add to database
-                    self.database.add(variant_candidate)
-                    
-                    self._log_info(f"   Initial candidate {i}/{len(initial_variants)}: score={variant_candidate.agentdojo_score}/10")
+                    initial_candidates_list.append(variant_candidate)
                 
-                self._log_info(f"Database initialized with {len(initial_variants) + 1} total candidates (1 original + {len(initial_variants)} variants)")
+                # Score all initial candidates in batch (PARALLELIZABLE)
+                self._log_info(f"\nScoring {len(initial_candidates_list)} initial candidates...")
+                self._score_candidates_batch(
+                    candidates=initial_candidates_list,
+                    failed_step=failed_step,
+                    step_num=step_num,
+                    session_id=session_id,
+                    test_config=test_config,
+                    environment_state=environment_state,
+                    test_def=test_def,
+                    attack_email_step_num=attack_email_step_num
+                )
+                
+                # Add all scored candidates to database (sequential - database operations)
+                for candidate in initial_candidates_list:
+                    self.database.add(candidate)
+                    self._log_info(f"   Initial candidate {initial_candidates_list.index(candidate) + 1}/{len(initial_candidates_list)}: score={candidate.agentdojo_score}/10")
+                
+                self._log_info(f"Database initialized with {len(initial_candidates_list) + 1} total candidates (1 original + {len(initial_candidates_list)} variants)")
             else:
                 self._log_warning("Failed to generate initial diverse candidates, proceeding with original candidate only")
         except Exception as e:
             self._log_warning(f"Error during database initialization: {e}")
             self._log_warning("Proceeding with original candidate only")
-            import traceback
             if self.logger:
                 self.logger.warning(f"Traceback: {traceback.format_exc()}")
         
@@ -523,7 +540,7 @@ class OpenEvolveOptimizer(BaseOptimizer):
         self._log_info(f"STARTING EVOLUTION LOOP")
         self._log_info(f"{'='*80}")
         
-        for iteration in range(1, max_iterations + 1):
+        for iteration in range(1, effective_max_iterations + 1):
             self._log_info(f"\n{'─'*80}")
             self._log_info(f"ITERATION {iteration}/{max_iterations}")
             self._log_info(f"{'─'*80}")
@@ -532,17 +549,23 @@ class OpenEvolveOptimizer(BaseOptimizer):
             best_before_iteration = self.database.get_best()
             prev_best_score = best_before_iteration.agentdojo_score if best_before_iteration else 0
             
-            # Check early stopping - perfect score
-            if best_before_iteration and best_before_iteration.agentdojo_score >= early_stop_score:
-                self._log_info(f"Early stopping: achieved perfect score {best_before_iteration.agentdojo_score}/{early_stop_score}")
-                break
+            # Check early stopping - perfect score or binary success
+            if best_before_iteration:
+                if best_before_iteration.binary_success:
+                    self._log_info(f"Early stopping: found successful attack (binary_success=True)")
+                    break
+                elif best_before_iteration.agentdojo_score >= early_stop_score:
+                    self._log_info(f"Early stopping: achieved perfect score {best_before_iteration.agentdojo_score}/{early_stop_score}")
+                    break
             
             # Log current state
             stats = self.database.get_statistics()
             self._log_info(f"Current state:")
             self._log_info(f"   Best score: {prev_best_score}/10")
             self._log_info(f"   Total candidates: {stats['total_candidates']}")
-            self._log_info(f"   Grid coverage: {stats['grid_coverage']:.1%} ({stats['grid_cells_occupied']}/{self.length_bins * self.diversity_bins} cells)")
+            grid_cells_occupied = stats.get('grid_cells_occupied', 0)
+            total_cells = self.length_bins * self.diversity_bins
+            self._log_info(f"   Grid coverage: {stats['grid_coverage']:.1%} ({grid_cells_occupied}/{total_cells} cells)")
             self._log_info(f"   No improvement count: {iterations_without_improvement}")
             
             # Sample parent candidates
@@ -584,14 +607,9 @@ class OpenEvolveOptimizer(BaseOptimizer):
             
             self._log_info(f"Generated {len(new_variants)} new variants")
             
-            # Score and add each variant
-            self._log_info(f"\nScoring and evaluating {len(new_variants)} new variants...")
-            iteration_best_score = 0
-            for i, variant_email in enumerate(new_variants, 1):
-                self._log_info(f"\n   Variant {i}/{len(new_variants)}:")
-                self._log_info(f"      From: {variant_email.get('from', 'unknown')}")
-                self._log_info(f"      Subject: {variant_email.get('subject', '')}")
-                
+            # Step 1: Create candidate objects from variant emails (sequential - simple object creation)
+            iteration_candidates = []
+            for variant_email in new_variants:
                 variant_id = self._generate_candidate_id()
                 variant_candidate = self._create_candidate_from_email(
                     candidate_id=variant_id,
@@ -599,38 +617,44 @@ class OpenEvolveOptimizer(BaseOptimizer):
                     parent_id=parents[0].id if parents else None,
                     iteration=iteration
                 )
-                
-                # Score the variant
-                # CRITICAL: Use the base session_id (not a unique one per variant)
-                # The scorer will clear the session before testing, ensuring fresh state
-                # This matches the environment used in the final static test
-                self._log_info(f"      Scoring...")
-                self._score_candidate(
-                    variant_candidate,
-                    failed_step=failed_step,
-                    step_num=step_num,
-                    session_id=session_id,  # Use base session_id, scorer will clear it
-                    test_config=test_config,
-                    environment_state=environment_state,
-                    test_def=self._test_def,
-                    attack_email_step_num=self._attack_email_step_num
-                )
-                
+                iteration_candidates.append(variant_candidate)
+                self._log_info(f"\n   Variant {len(iteration_candidates)}/{len(new_variants)}:")
+                self._log_info(f"      From: {variant_email.get('from', 'unknown')}")
+                self._log_info(f"      Subject: {variant_email.get('subject', '')}")
+            
+            # Step 2: Score all candidates in batch (PARALLELIZABLE - each candidate is independent)
+            self._log_info(f"\nScoring and evaluating {len(iteration_candidates)} new variants...")
+            self._score_candidates_batch(
+                candidates=iteration_candidates,
+                failed_step=failed_step,
+                step_num=step_num,
+                session_id=session_id,
+                test_config=test_config,
+                environment_state=environment_state,
+                test_def=self._test_def,
+                attack_email_step_num=self._attack_email_step_num
+            )
+            
+            # Step 3: Process scored candidates and check for early stopping (sequential)
+            iteration_best_score = 0
+            successful_candidate = None
+            for candidate in iteration_candidates:
                 # Add to database (MAP Elites will decide if it's kept)
-                added = self.database.add(variant_candidate)
+                added = self.database.add(candidate)
+                self._log_candidate_result(candidate, f"Variant {iteration_candidates.index(candidate) + 1}/{len(iteration_candidates)}", added=added)
                 
-                score_str = f"{variant_candidate.agentdojo_score}/10"
-                added_str = "ADDED TO ELITE" if added else "Not elite"
-                self._log_info(f"      {added_str}: score={score_str}, partial={variant_candidate.partial_score:.2f}, length={variant_candidate.length}, diversity={variant_candidate.diversity:.2f}")
-                self._log_info(f"      Explanation: {variant_candidate.explanation if variant_candidate.explanation else '[NO EXPLANATION]'}")
-                self._log_info(f"      Improvement: {variant_candidate.improvement if variant_candidate.improvement else '[NO IMPROVEMENT]'}")
+                iteration_best_score = max(iteration_best_score, candidate.agentdojo_score)
                 
-                iteration_best_score = max(iteration_best_score, variant_candidate.agentdojo_score)
-                
-                # Check for early stopping - perfect score found
-                if variant_candidate.agentdojo_score >= early_stop_score:
-                    self._log_info(f"Perfect score achieved! Stopping early.")
+                # Check for early stopping - perfect score or binary success
+                if candidate.binary_success or candidate.agentdojo_score >= early_stop_score:
+                    successful_candidate = candidate
+                    self._log_info(f"SUCCESS! Candidate achieved {'binary success' if candidate.binary_success else f'score {candidate.agentdojo_score}/10'}. Stopping early.")
+                    # Break out of candidate processing loop
                     break
+            
+            # If we found a successful candidate, break out of main iteration loop
+            if successful_candidate:
+                break
             
             # Update statistics
             stats = self.database.get_statistics()
@@ -746,7 +770,12 @@ class OpenEvolveOptimizer(BaseOptimizer):
                         environment_state: EnvironmentState,
                         test_def: Optional[Dict[str, Any]] = None,
                         attack_email_step_num: Optional[int] = None):
-        """Score a candidate using the scorer and update its fields."""
+        """
+        Score a single candidate using the scorer and update its fields.
+        
+        This method is designed to be called for a single candidate.
+        For scoring multiple candidates, use _score_candidates_batch() which can be parallelized.
+        """
         result = self.scorer.score(
             candidate_attack_email=candidate.email,
             environment_state=environment_state,
@@ -770,6 +799,65 @@ class OpenEvolveOptimizer(BaseOptimizer):
             "tool_vector": result.tool_vector,
             "duration_s": result.duration_s
         }
+    
+    def _score_candidates_batch(self,
+                                candidates: List[AttackCandidate],
+                                failed_step: Dict[str, Any],
+                                step_num: int,
+                                session_id: str,
+                                test_config: Dict[str, Any],
+                                environment_state: EnvironmentState,
+                                test_def: Optional[Dict[str, Any]] = None,
+                                attack_email_step_num: Optional[int] = None):
+        """
+        Score a batch of candidates.
+        
+        This method is designed to be easily parallelized. Each candidate scoring is completely
+        independent - it creates a fresh in-memory environment, runs the full test sequence,
+        and computes scores. No shared state between candidates.
+        
+        Currently implemented sequentially, but structured to allow parallel execution
+        when num_workers > 1.
+        
+        Args:
+            candidates: List of AttackCandidate objects to score
+            failed_step: The failed step from the test definition
+            step_num: Step number where attack email is inserted
+            session_id: Base session ID (scorer will create fresh sessions)
+            test_config: Test configuration dict
+            environment_state: Environment state (for compatibility, not used in fresh env approach)
+            test_def: Full test definition (required)
+            attack_email_step_num: Step number where attack email is inserted (required)
+        """
+        if not candidates:
+            return
+        
+        # Currently sequential implementation - ready for parallelization
+        for i, candidate in enumerate(candidates, 1):
+            if self.logger:
+                self.logger.debug(f"Scoring candidate {i}/{len(candidates)}: {candidate.id}")
+            
+            self._score_candidate(
+                candidate=candidate,
+                failed_step=failed_step,
+                step_num=step_num,
+                session_id=session_id,
+                test_config=test_config,
+                environment_state=environment_state,
+                test_def=test_def,
+                attack_email_step_num=attack_email_step_num
+            )
+    
+    def _log_candidate_result(self, candidate: AttackCandidate, label: str, added: Optional[bool] = None):
+        """Helper method to log candidate scoring results consistently."""
+        if added is not None:
+            added_str = "ADDED TO ELITE" if added else "Not elite"
+            self._log_info(f"   {label}: {added_str}: score={candidate.agentdojo_score}/10, partial={candidate.partial_score:.2f}, length={candidate.length}, diversity={candidate.diversity:.2f}")
+        else:
+            self._log_info(f"   {label}: score={candidate.agentdojo_score}/10, partial={candidate.partial_score:.2f}")
+        
+        self._log_info(f"      Explanation: {candidate.explanation if candidate.explanation else '[NO EXPLANATION]'}")
+        self._log_info(f"      Improvement: {candidate.improvement if candidate.improvement else '[NO IMPROVEMENT]'}")
     
     def _mutate(self,
                 parent_candidates: List[AttackCandidate],
@@ -975,8 +1063,6 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
             self.logger.info("=" * 80)
         
         # Call LLM using unified utility
-        from agent.utils import call_llm_chat_completion, detect_provider
-        
         try:
             # Detect provider
             provider = detect_provider(self.mutator_model)
@@ -1096,7 +1182,6 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
                     
                     # Normalize apostrophes/quotes: replace smart quotes with straight apostrophes
                     # This handles cases where the API returns Unicode smart quotes (U+2019) instead of straight apostrophes (U+0027)
-                    import unicodedata
                     response_lower = unicodedata.normalize('NFKD', response_lower)
                     # Replace common smart quote variants with straight apostrophe
                     response_lower = response_lower.replace('\u2019', "'")  # Right single quotation mark
@@ -1173,7 +1258,6 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
             raise
         except Exception as e:
             self._log_error(f"Mutator API call failed: {e}")
-            import traceback
             self._log_error(f"Traceback: {traceback.format_exc()}")
             return []
         
@@ -1270,8 +1354,6 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
     
     def _parse_mutator_response(self, response_text: str, expected_count: int) -> List[Dict[str, Any]]:
         """Parse the mutator's JSON response."""
-        import re
-        
         # Check for refusal messages FIRST (before any processing)
         # This is critical - we need to detect refusals before trying to parse JSON
         # NOTE: This should have been caught in the retry loop, but we check again here as a safety net
@@ -1291,7 +1373,6 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
         
         # Normalize apostrophes/quotes: replace smart quotes with straight apostrophes
         # This handles cases where the API returns Unicode smart quotes (U+2019) instead of straight apostrophes (U+0027)
-        import unicodedata
         response_lower = unicodedata.normalize('NFKD', response_lower)
         # Replace common smart quote variants with straight apostrophe
         response_lower = response_lower.replace('\u2019', "'")  # Right single quotation mark
@@ -1357,7 +1438,7 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
     
     def _generate_candidate_id(self) -> str:
         """Generate a unique candidate ID."""
-        import uuid
+        
         return f"cand_{uuid.uuid4().hex[:8]}"
     
 

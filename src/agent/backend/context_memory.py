@@ -403,7 +403,7 @@ def get_context_defense_manager(
     )
 
 
-def get_context_memory_context(text: str, session_id: str, model_name: str, memory_config: dict, memory_backend: str) -> str:
+def get_context_memory_context(text: str, session_id: str, model_name: str, memory_config: dict, memory_backend: str, in_memory_env = None) -> str:
     """Retrieve context memory context if enabled."""
     context_memory_config = memory_config.get("context_memory", {})
     context_memory_enabled = context_memory_config.get("enabled", False) or (memory_backend == "context")
@@ -415,8 +415,13 @@ def get_context_memory_context(text: str, session_id: str, model_name: str, memo
         return ""
     
     try:
-        # Use shared manager from config if available (persists memories across invocations)
-        context_memory_manager = context_memory_config.get("manager")
+        # Get manager from in_memory_env (preferred) or from config (backward compatibility)
+        context_memory_manager = None
+        if in_memory_env:
+            context_memory_manager = in_memory_env.context_manager
+        else:
+            context_memory_manager = context_memory_config.get("manager")
+        
         if not context_memory_manager:
             # Fallback: create new manager (memories won't persist across calls)
             max_context_length = context_memory_config.get("max_context_length")

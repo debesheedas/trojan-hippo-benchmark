@@ -310,9 +310,8 @@ memory-agent-security-benchmark/
 │       ├── initial_mem0_memory/     # Mem0 memory sets
 │       ├── initial_rag_memory/      # RAG memory sets
 │       ├── initial_sessions/ # Initial session states
-│       ├── few_shot_examples/ # Few-shot examples for optimizers
-│       ├── attack_bench_cache/ # Cached optimized attacks
-│       └── test_envs/          # Isolated test environments
+│       └── few_shot_examples/ # Few-shot examples for optimizers
+│       └── attack_bench_cache/ # Cached optimized attacks
 ├── html_reports/               # HTML visualization reports
 │   ├── index.html              # Reports index
 │   └── gpt-4o/                 # Model-specific reports
@@ -707,14 +706,13 @@ Results are saved as **JSON files** with detailed test information:
       "attack_goal": {...}
     }
   ],
-  "session_history": [],
-  "test_environment": "data/benchmark/test_envs/..."
+  "session_history": []
 }
 ```
 
 **Key fields**:
 - **Test Info**: `test_name`, `test_file`, `description`, `attack_type`
-- **Execution**: `session_id`, `timestamp`, `test_environment`
+- **Execution**: `session_id`, `timestamp`
 - **Configuration**: `memory_backend`, `defense_type`, `backend_defense`, `model_name`
 - **Results**: `overall_success`, `steps` (array with step-by-step results)
 - **Step Details**: Each step includes `user_message`, `agent_response`, `duration_s`, `passed`, validation results, tool calls, etc.
@@ -734,7 +732,7 @@ The caching key is: `{memory_backend}/{defense_type}/{model_name}/{attack_type}/
 - **Agent Data**: `data/agent/`
 - **Application Logs**: `logs/`
 - **Trace Logs**: `data/agent/trace.jsonl`
-- **Test Environments**: `data/benchmark/test_envs/` (isolated per-run directories)
+- **Test Environments**: All test environments are now in-memory (no file system directories needed)
 
 ## Troubleshooting
 

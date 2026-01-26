@@ -431,7 +431,7 @@ def get_rag_memory_manager(
     )
 
 
-def get_rag_memory_context(text: str, session_id: str, memory_config: dict, memory_backend: str) -> str:
+def get_rag_memory_context(text: str, session_id: str, memory_config: dict, memory_backend: str, in_memory_env = None) -> str:
     """Retrieve RAG memory context if enabled."""
     rag_memory_config = memory_config.get("rag_memory", {})
     rag_memory_enabled = rag_memory_config.get("enabled", False) or (memory_backend == "rag")
@@ -441,9 +441,15 @@ def get_rag_memory_context(text: str, session_id: str, memory_config: dict, memo
         return ""
     
     try:
-        vectorstore = rag_memory_config.get("vectorstore")
+        # Get vectorstore from in_memory_env (preferred) or from config (backward compatibility)
+        vectorstore = None
+        if in_memory_env:
+            vectorstore = in_memory_env.rag_vectorstore
+        else:
+            vectorstore = rag_memory_config.get("vectorstore")
+        
         if not vectorstore:
-            debug_debug("No vectorstore in config, cannot retrieve RAG memory")
+            debug_debug("No vectorstore available, cannot retrieve RAG memory")
             return ""
         
         debug_debug(f"get_rag_memory_context called: text='{text[:100]}...', session_id={session_id}, defense_type={rag_defense_type}", truncate=False, max_length=500)

@@ -359,12 +359,7 @@ class DSPyOptimizer(BaseOptimizer):
                         from benchmark.environment_state import EnvironmentState as _Env
                         _env = _Env()
                         _session_id = f"compile_{self._random_hex(6)}"
-                        # Enforce preface + subject (same as runtime) using known success_check
-                        try:
-                            _sc = (_step.get("attack_goal") or {}).get("success_check", {})
-                            cand = self.scorer.apply_preamble_and_subject(cand, _sc)
-                        except Exception:
-                            pass
+
                         # Single rollout using scorer
                         _scorer = AttackScorer(self.config)
                         scorer_result = _scorer.score(
@@ -746,11 +741,6 @@ class DSPyOptimizer(BaseOptimizer):
                 
                 # Parse the optimized attack
                 optimized_attack_data = self._parse_optimized_attack(result.optimized_attack, original_attack_email)
-                # Enforce subject/body preface from success_check
-                try:
-                    optimized_attack_data = self.scorer.apply_preamble_and_subject(optimized_attack_data, success_check)
-                except Exception:
-                    pass
                 # Log nicely formatted variation
                 try:
                     self._log_info("\n=== DSPy Variation %d / %d ===" % (i+1, max_iterations))
@@ -963,8 +953,6 @@ class DSPyOptimizer(BaseOptimizer):
     # Textual critique moved to scorer (self.scorer.build_textual_critique)
 
     # Flatten success_check moved to scorer (self.scorer.flatten_success_check)
-
-    # Apply preamble moved to scorer (self.scorer.apply_preamble_and_subject)
 
     def _best_demo_distance(self, 
                             current_attack: Dict[str, Any], 

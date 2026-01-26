@@ -162,11 +162,14 @@ def get_result_path(
     )
     
     # Check if test is in attack_bench (skip attack_type folder for attack_bench tests)
+    # Also check if results_base_dir is attack_results (never use attack_type folder for attack_results)
     test_file_str = str(test_file)
+    results_base_dir_str = str(results_base_dir)
     is_attack_bench = "attack_bench" in test_file_str
+    is_attack_results = "attack_results" in results_base_dir_str
     
-    if is_attack_bench:
-        # For attack_bench tests, skip the attack_type folder (all are indirect attacks)
+    if is_attack_bench or is_attack_results:
+        # For attack_bench tests or attack_results, skip the attack_type folder (all are indirect attacks)
         result_path = (
             results_base_dir /
             model_name /
@@ -390,31 +393,6 @@ def should_skip_test(
     )
 
 
-def create_isolated_test_dir(test_name: str, base_dir: Path = Path("data/benchmark/test_envs")) -> Path:
-    """
-    Create an isolated test directory with unique name.
-    
-    Uses process ID + timestamp for uniqueness to avoid race conditions
-    in parallel execution.
-    
-    Args:
-        test_name: Test name (for readability)
-        base_dir: Base directory for test environments
-        
-    Returns:
-        Path to isolated test directory
-    """
-    # Generate unique identifier
-    pid = os.getpid()
-    timestamp = int(time.time() * 1000000)  # microseconds
-    unique_id = f"{test_name}_{pid}_{timestamp}"
-    
-    test_dir = base_dir / unique_id
-    test_dir.mkdir(parents=True, exist_ok=True)
-    
-    return test_dir
-
-
 def get_memory_backend_from_config(config: Dict[str, Any]) -> str:
     """
     Determine memory backend from config.
@@ -491,80 +469,6 @@ def get_unified_defense_from_config(config: Dict[str, Any], memory_backend: str)
         return "none"
     
     return defense
-
-
-def cleanup_old_test_environments(
-    base_dir: Path = Path("data/benchmark/test_envs"),
-    max_age_hours: int = 24,
-    dry_run: bool = False
-) -> tuple[int, int]:
-    """
-    Clean up old test environment directories that are no longer needed.
-    
-    Test environments are created for each test run and should be cleaned up
-    immediately after the test completes. This function removes any that were
-    left behind (e.g., from crashed processes or interrupted runs).
-    
-    Args:
-        base_dir: Base directory containing test environments
-        max_age_hours: Maximum age in hours before cleanup (default: 24 hours)
-        dry_run: If True, only report what would be deleted without actually deleting
-        
-    Returns:
-        Tuple of (deleted_count, failed_count)
-    """
-    if not base_dir.exists():
-        return 0, 0
-    
-    import time
-    from datetime import datetime, timedelta
-    
-    current_time = time.time()
-    max_age_seconds = max_age_hours * 3600
-    deleted_count = 0
-    failed_count = 0
-    
-    # Get all test environment directories
-    test_envs = [d for d in base_dir.iterdir() if d.is_dir()]
-    
-    if not test_envs:
-        return 0, 0
-    
-    print(f"\n🧹 Checking {len(test_envs)} test environment(s) for cleanup...")
-    
-    for test_env in test_envs:
-        try:
-            # Get directory modification time (when it was last modified)
-            # This is a good proxy for when the test finished
-            mtime = test_env.stat().st_mtime
-            age_seconds = current_time - mtime
-            age_hours = age_seconds / 3600
-            
-            if age_seconds > max_age_seconds:
-                if dry_run:
-                    print(f"  [DRY RUN] Would delete: {test_env.name} (age: {age_hours:.1f} hours)")
-                    deleted_count += 1
-                else:
-                    try:
-                        shutil.rmtree(test_env)
-                        print(f"  Deleted: {test_env.name} (age: {age_hours:.1f} hours)")
-                        deleted_count += 1
-                    except Exception as e:
-                        print(f"  WARNING: Failed to delete {test_env.name}: {e}")
-                        failed_count += 1
-        except Exception as e:
-            print(f"  WARNING: Error checking {test_env.name}: {e}")
-            failed_count += 1
-    
-    if not dry_run and deleted_count > 0:
-        print(f"Cleaned up {deleted_count} old test environment(s)")
-    elif dry_run:
-        print(f"  [DRY RUN] Would clean up {deleted_count} old test environment(s)")
-    
-    if failed_count > 0:
-        print(f"WARNING: Failed to clean up {failed_count} test environment(s)")
-    
-    return deleted_count, failed_count
 
 
 def discover_test_files(

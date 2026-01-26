@@ -179,9 +179,9 @@ def clear_session_agent(session_id: str):
         del _session_store[session_id]
     SessionTrustManager.reset_session(session_id)
 
-def _get_or_create_agent_executor(session_id: str, config: dict) -> Any:
+def _get_or_create_agent_executor(session_id: str, config: dict, in_memory_env) -> Any:
     if session_id not in _agent_cache:
-        _agent_cache[session_id] = _create_agent_executor(config, session_id=session_id)
+        _agent_cache[session_id] = _create_agent_executor(config, session_id=session_id, in_memory_env=in_memory_env)
     return _agent_cache[session_id]
 
 
@@ -329,11 +329,13 @@ def _safe_deepcopy_config(config: dict) -> dict:
 def _create_agent_executor(
     config: dict,
     session_id: Optional[str] = None,
+    in_memory_env = None,
 ) -> Any:
-    # Benchmarks always provide config - require it to fail fast if missing
-    # Use safe deep copy to avoid pickle errors with threading locks in vectorstores
-    config = _safe_deepcopy_config(config)
+    # Benchmarks always provide config and in_memory_env - require them to fail fast if missing
+    if in_memory_env is None:
+        raise ValueError("in_memory_env is required")
     
+    # Config should only contain serializable values - no need for deepcopy since no complex objects
     if "seed" in config:
         set_global_seeds(config["seed"])
     
@@ -343,24 +345,15 @@ def _create_agent_executor(
     memory_backend_for_defense = config.get("memory", {}).get("backend", "explicit")
     unified_defense = get_unified_defense_from_config(config, memory_backend_for_defense)
     
-    # Get in_memory_environment (required for mailbox and trace_store)
-    in_memory_env = config.get("in_memory_environment")
-    
-    # Get mailbox (required)
-    mailbox = config.get("mailbox")
-    if not mailbox and in_memory_env:
-        mailbox = in_memory_env.mailbox
+    # Get mailbox and trace_store from in_memory_env (passed directly, not from config)
+    mailbox = in_memory_env.mailbox
+    trace_store = in_memory_env.trace_store
     
     if not mailbox:
-        raise ValueError("mailbox is required in config")
-    
-    # Get trace_store (required for tools to log events)
-    trace_store = None
-    if in_memory_env:
-        trace_store = in_memory_env.trace_store
+        raise ValueError("mailbox is required in in_memory_env")
     
     if not trace_store:
-        raise ValueError("trace_store is required - in_memory_environment must be provided in config")
+        raise ValueError("trace_store is required in in_memory_env")
     
     tools_config = EmailToolsConfig(
         mailbox=mailbox,
@@ -483,13 +476,13 @@ def _create_agent_executor(
     )
     return agent
 
-def invoke_agent(text: str, session_id: str, config: dict) -> Dict[str, Any]:
-    # Benchmarks always provide both session_id and config - require them to fail fast
-    # Validation of data config happens in _create_agent_executor_for_python
+def invoke_agent(text: str, session_id: str, config: dict, in_memory_env) -> Dict[str, Any]:
+    # Benchmarks always provide session_id, config, and in_memory_env - require them to fail fast
+    if in_memory_env is None:
+        raise ValueError("in_memory_env is required")
     
-    # Get trace_store from in_memory_environment
-    in_memory_env = config.get("in_memory_environment")
-    trace_store = in_memory_env.trace_store if in_memory_env else None
+    # Get trace_store from in_memory_env (passed directly, not from config)
+    trace_store = in_memory_env.trace_store
     
     def log_trace_event(event_type: str, payload: dict):
         """Helper to log trace events using the environment's trace_store."""
@@ -505,7 +498,7 @@ def invoke_agent(text: str, session_id: str, config: dict) -> Dict[str, Any]:
             }
             trace_store.append_event(session_id, event)
     
-    agent = _get_or_create_agent_executor(session_id, config)
+    agent = _get_or_create_agent_executor(session_id, config, in_memory_env)
 
     # Log user input
     log_trace_event("user_input", {"text": text})
@@ -517,10 +510,10 @@ def invoke_agent(text: str, session_id: str, config: dict) -> Dict[str, Any]:
     agent_config = config.get("agent", {})
     model_name = agent_config.get("target_model_name", "gpt-5-mini")
     
-    # Retrieve memory contexts
-    rag_context = "" if memory_disabled else get_rag_memory_context(text, session_id, memory_config, memory_backend)
-    mem0_context = "" if memory_disabled else get_mem0_memory_context(text, session_id, memory_config)
-    context_memory_context = "" if memory_disabled else get_context_memory_context(text, session_id, model_name, memory_config, memory_backend)
+    # Retrieve memory contexts (pass in_memory_env directly)
+    rag_context = "" if memory_disabled else get_rag_memory_context(text, session_id, memory_config, memory_backend, in_memory_env)
+    mem0_context = "" if memory_disabled else get_mem0_memory_context(text, session_id, memory_config, in_memory_env)
+    context_memory_context = "" if memory_disabled else get_context_memory_context(text, session_id, model_name, memory_config, memory_backend, in_memory_env)
     
     # Extract memory configs for indexing (needed later)
     rag_memory_config = memory_config.get("rag_memory", {}) if not memory_disabled else {}

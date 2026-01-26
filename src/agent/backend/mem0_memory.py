@@ -1276,7 +1276,7 @@ def get_mem0_memory_manager(
     )
 
 
-def get_mem0_memory_context(text: str, session_id: str, memory_config: dict) -> str:
+def get_mem0_memory_context(text: str, session_id: str, memory_config: dict, in_memory_env = None) -> str:
     """Retrieve mem0 memory context if enabled (in-memory only)."""
     mem0_memory_config = memory_config.get("mem0_memory", {})
     mem0_memory_enabled = mem0_memory_config.get("enabled", False)
@@ -1286,8 +1286,13 @@ def get_mem0_memory_context(text: str, session_id: str, memory_config: dict) -> 
         return ""
     
     try:
-        # Use shared manager from config if available (persists memories across invocations)
-        mem0_memory_manager = mem0_memory_config.get("manager")
+        # Get manager from in_memory_env (preferred) or from config (backward compatibility)
+        mem0_memory_manager = None
+        if in_memory_env:
+            mem0_memory_manager = in_memory_env.mem0_manager
+        else:
+            mem0_memory_manager = mem0_memory_config.get("manager")
+        
         if not mem0_memory_manager:
             # Fallback: create new manager (memories won't persist across calls)
             mem0_memory_manager = get_mem0_memory_manager(

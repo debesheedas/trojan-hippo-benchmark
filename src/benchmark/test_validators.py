@@ -21,9 +21,10 @@ from agent.utils import print_validator_result
 class TestValidator:
     """Base class for test validators."""
     
-    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None, in_memory_env = None):
         self.config = config
         self.test_config = test_config
+        self.in_memory_env = in_memory_env
     
     def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None) -> bool:
         """Validate the test result. Override in subclasses."""
@@ -92,8 +93,8 @@ class KeywordValidator(TestValidator):
     - case_sensitive: Whether to do case-sensitive matching (default: False)
     """
     
-    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
-        super().__init__(config, test_config)
+    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None, in_memory_env = None):
+        super().__init__(config, test_config, in_memory_env)
         # Pre-normalize keywords for performance
         self._keywords = config.get("keywords", [])
         self._case_sensitive = config.get("case_sensitive", False)
@@ -154,8 +155,8 @@ class ToolCallValidator(TestValidator):
     - check_params: Whether to validate tool parameters (default: True)
     """
     
-    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
-        super().__init__(config, test_config)
+    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None, in_memory_env = None):
+        super().__init__(config, test_config, in_memory_env)
         # Pre-normalize for performance
         self._required_tools = set(config.get("required_tools", []))  # Use set for O(1) lookup
         self._tool_params = config.get("tool_params", {})
@@ -368,8 +369,8 @@ class FileSystemValidator(TestValidator):
     - min_files: Minimum number of files that must exist
     """
     
-    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
-        super().__init__(config, test_config)
+    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None, in_memory_env = None):
+        super().__init__(config, test_config, in_memory_env)
         self._check_files = config.get("check_files", [])
         self._json_fields = config.get("json_fields", {})
         self._require_all_files = config.get("require_all_files", True)
@@ -402,18 +403,20 @@ class FileSystemValidator(TestValidator):
         
         # Check if using in-memory mailbox
         mailbox = None
-        if self.test_config:
-            # Check if test_config has mailbox directly
+        # Get mailbox from in_memory_env (passed directly, not from config)
+        if self.in_memory_env:
+            mailbox = self.in_memory_env.mailbox
+        elif self.test_config:
+            # Fallback for backward compatibility
             mailbox = self.test_config.get("mailbox")
-            # Or check if it's in an InMemoryTestEnvironment
             if not mailbox:
-                in_memory_env = self.test_config.get("in_memory_environment")
+                in_memory_env = self.in_memory_env or (self.test_config.get("in_memory_environment") if self.test_config else None)
                 if in_memory_env:
                     mailbox = in_memory_env.mailbox
         
         # Use in-memory mailbox (required)
         if not mailbox:
-            raise ValueError("mailbox is required in test_config - file system storage is no longer supported")
+            raise ValueError("mailbox is required - in_memory_env must be provided")
         
         # Use in-memory mailbox
         for resolved_pattern in self._resolved_files:
@@ -579,7 +582,7 @@ class FileSystemValidator(TestValidator):
         if self.test_config:
             mailbox = self.test_config.get("mailbox")
             if not mailbox:
-                in_memory_env = self.test_config.get("in_memory_environment")
+                in_memory_env = self.in_memory_env or (self.test_config.get("in_memory_environment") if self.test_config else None)
                 if in_memory_env:
                     mailbox = in_memory_env.mailbox
         
@@ -621,8 +624,8 @@ class SemanticJudgeValidator(TestValidator):
         - "outbox.email.to.{email_address}.{field}" - check email sent to specific address
     """
     
-    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
-        super().__init__(config, test_config)
+    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None, in_memory_env = None):
+        super().__init__(config, test_config, in_memory_env)
         self._query = config.get("query", "")
         self._check_target = config.get("check_target", "agent_response")
         
@@ -701,7 +704,7 @@ class SemanticJudgeValidator(TestValidator):
             mailbox = None
             mailbox = self.test_config.get("mailbox")
             if not mailbox:
-                in_memory_env = self.test_config.get("in_memory_environment")
+                in_memory_env = self.in_memory_env or (self.test_config.get("in_memory_environment") if self.test_config else None)
                 if in_memory_env:
                     mailbox = in_memory_env.mailbox
             
@@ -948,8 +951,8 @@ class CrossStepSemanticJudgeValidator(TestValidator):
     The validator stores extracted information in test_config["_cross_step_data"] for debugging.
     """
     
-    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None):
-        super().__init__(config, test_config)
+    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None, in_memory_env = None):
+        super().__init__(config, test_config, in_memory_env)
         self._reference_step = config.get("reference_step")
         self._extract_focus = config.get("extract_focus", "")
         self._compare_focus = config.get("compare_focus", self._extract_focus)
@@ -1172,6 +1175,9 @@ class CompositeValidator(TestValidator):
     - operator: "AND" or "OR" (default: "AND")
     """
     
+    def __init__(self, config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None, in_memory_env = None):
+        super().__init__(config, test_config, in_memory_env)
+    
     def validate(self, agent_response: str, session_id: str, traces: List[Dict] = None, prefix: str = "") -> bool:
         """
         Validate with optional printing.
@@ -1197,7 +1203,7 @@ class CompositeValidator(TestValidator):
         
         for i, validator_config in enumerate(validators):
             validator_type = validator_config.get("type")
-            validator = create_validator(validator_config, self.test_config)
+            validator = create_validator(validator_config, self.test_config, self.in_memory_env)
             if not validator:
                 continue
             
@@ -1229,7 +1235,7 @@ class CompositeValidator(TestValidator):
         # Log validator results to in-memory trace store
         if validator_results and self.test_config:
             try:
-                in_memory_env = self.test_config.get("in_memory_environment")
+                in_memory_env = self.in_memory_env or (self.test_config.get("in_memory_environment") if self.test_config else None)
                 if in_memory_env:
                     in_memory_env.log_event(
                         session_id,
@@ -1278,7 +1284,7 @@ class CompositeValidator(TestValidator):
             return 1.0
         scores: List[float] = []
         for validator_config in validators:
-            validator = create_validator(validator_config, self.test_config)
+            validator = create_validator(validator_config, self.test_config, self.in_memory_env)
             if validator:
                 try:
                     scores.append(float(validator.score(agent_response, session_id, traces)))
@@ -1290,13 +1296,14 @@ class CompositeValidator(TestValidator):
         return sum(scores) / len(scores) if scores else 0.0
 
 
-def create_validator(validator_config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None) -> TestValidator:
+def create_validator(validator_config: Dict[str, Any], test_config: Optional[Dict[str, Any]] = None, in_memory_env = None) -> TestValidator:
     """
     Create a validator instance from configuration.
     
     Args:
         validator_config: Dictionary containing validator configuration
         test_config: Test-specific configuration (for path resolution)
+        in_memory_env: In-memory test environment (preferred over test_config)
         
     Returns:
         TestValidator instance
@@ -1304,17 +1311,17 @@ def create_validator(validator_config: Dict[str, Any], test_config: Optional[Dic
     validator_type = validator_config.get("type", "keyword")
     
     if validator_type == "keyword":
-        return KeywordValidator(validator_config)
+        return KeywordValidator(validator_config, test_config, in_memory_env)
     elif validator_type == "tool_call":
-        return ToolCallValidator(validator_config)
+        return ToolCallValidator(validator_config, test_config, in_memory_env)
     elif validator_type == "file_system":
-        return FileSystemValidator(validator_config, test_config)
+        return FileSystemValidator(validator_config, test_config, in_memory_env)
     elif validator_type == "semantic_judge":
-        return SemanticJudgeValidator(validator_config, test_config)
+        return SemanticJudgeValidator(validator_config, test_config, in_memory_env)
     elif validator_type == "cross_step_semantic_judge":
-        return CrossStepSemanticJudgeValidator(validator_config, test_config)
+        return CrossStepSemanticJudgeValidator(validator_config, test_config, in_memory_env)
     elif validator_type == "composite":
-        return CompositeValidator(validator_config, test_config)
+        return CompositeValidator(validator_config, test_config, in_memory_env)
 
 
 

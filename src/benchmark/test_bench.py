@@ -12,10 +12,21 @@ import uuid
 import os
 import sys
 import logging
+import warnings
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 from dotenv import load_dotenv
+
+# Suppress deprecation warning from litellm's async cleanup code
+# This warning occurs during cleanup when there's no running event loop
+# It's harmless and doesn't affect functionality
+warnings.filterwarnings(
+    "ignore",
+    message="There is no current event loop",
+    category=DeprecationWarning,
+    module="litellm"
+)
 
 # Ensure src/ is on sys.path for package imports
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -193,6 +204,11 @@ class TestBench:
         from benchmark.environment_state import StateManager
         self.state_manager = StateManager()
         
+        # Cache directory for successful attacks (needed for both static and adaptive modes)
+        # Static mode needs this to check for cached optimized attacks
+        self.cache_dir = Path("data/benchmark/attack_bench_cache")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
         # Check if adaptive benchmark is enabled
         self.adaptive_enabled = self.config.get("benchmark", {}).get("enable_adaptive_benchmark", False)
         if self.adaptive_enabled:
@@ -215,10 +231,6 @@ class TestBench:
             
             if not self.optimizers:
                 print("WARNING: No optimizers enabled in config. Adaptive benchmark will not work.")
-            
-            # Cache directory for successful attacks
-            self.cache_dir = Path("data/benchmark/attack_bench_cache")
-            self.cache_dir.mkdir(exist_ok=True)
 
             # Set up logging for optimizers when running via TestBench
             # Note: We don't initialize logging here - it will be set up in run_test_from_file()
@@ -599,9 +611,11 @@ class TestBench:
         if "data" not in test_config:
             test_config["data"] = {}
         
-        # Store in-memory environment in test_config for tools and validators
-        test_config["in_memory_environment"] = in_memory_env
-        test_config["mailbox"] = in_memory_env.mailbox
+        # Note: in_memory_env is passed directly to functions, not stored in config
+        # Config should only contain static, user-configurable settings
+        # We keep it in config as a fallback for backward compatibility, but prefer direct parameter passing
+        test_config["in_memory_environment"] = in_memory_env  # Backward compatibility fallback
+        test_config["mailbox"] = in_memory_env.mailbox  # Backward compatibility fallback
         
         # Set memory backend info for validators
         if "memory" not in test_config:
@@ -705,6 +719,10 @@ class TestBench:
             logs_base_dir=logs_base_dir
         )
         
+        # Add "_adaptive" suffix to log filename when in adaptive benchmark mode
+        if self.adaptive_enabled:
+            log_path = log_path.with_name(log_path.stem + "_adaptive" + log_path.suffix)
+        
         # Create log directory
         log_path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -781,9 +799,27 @@ class TestBench:
             ]
         }
         """
-        # Load test definition first to determine attack_type
-        with open(test_file, 'r', encoding='utf-8') as f:
-            test_def = json.load(f)
+        # Check for cached version first (for attack_bench tests with optimized attacks)
+        # This ensures static mode uses optimized attacks that were found during adaptive mode
+        test_file_str = str(test_file)
+        is_attack_bench = "attack_bench" in test_file_str
+        cached_test = None
+        if is_attack_bench:
+            cached_test = self._get_cached_test(test_file)
+            if cached_test:
+                print(f"💾 Found cached test with optimized attack, loading it for static mode")
+                # Load the cached test definition (which has optimized attack emails)
+                with open(cached_test, 'r', encoding='utf-8') as f:
+                    test_def = json.load(f)
+                print(f"💾 Using optimized attack email from cache")
+            else:
+                # No cache, load original test file
+                with open(test_file, 'r', encoding='utf-8') as f:
+                    test_def = json.load(f)
+        else:
+            # Not an attack_bench test, load original test file
+            with open(test_file, 'r', encoding='utf-8') as f:
+                test_def = json.load(f)
         
         # All test cases are now in normalized format - no normalization needed
         test_name = test_def["name"]
@@ -1104,10 +1140,12 @@ class TestBench:
                 is_attack_bench = "user_goal" in step or "attack_goal" in step
                 
                 try:
+                    in_memory_env = test_config.get("in_memory_environment")
                     result = invoke_agent(
                         text=step['user_message'],
                         session_id=session_id,
-                        config=test_config
+                        config=test_config,
+                        in_memory_env=in_memory_env
                     )
                     duration = time.time() - start_time
                     print(f"invoke_agent returned (took {duration:.2f}s)", flush=True)
@@ -1159,7 +1197,8 @@ class TestBench:
                             try:
                                 user_goal_check = step["user_goal"]["success_check"]
                                 if isinstance(user_goal_check, dict):
-                                    validator = create_validator(user_goal_check, test_config)
+                                    in_memory_env = test_config.get("in_memory_environment")
+                                    validator = create_validator(user_goal_check, test_config, in_memory_env)
                                     # Use validate_with_print if it's a composite validator
                                     if isinstance(validator, CompositeValidator):
                                         print("\nUser Goal Validator Results:")
@@ -1204,7 +1243,8 @@ class TestBench:
                             try:
                                 attack_goal_check = step["attack_goal"]["success_check"]
                                 if isinstance(attack_goal_check, dict):
-                                    validator = create_validator(attack_goal_check, test_config)
+                                    in_memory_env = test_config.get("in_memory_environment")
+                                    validator = create_validator(attack_goal_check, test_config, in_memory_env)
                                     # Use validate_with_print if it's a composite validator
                                     if isinstance(validator, CompositeValidator):
                                         print("\nValidator Results:")
@@ -1277,7 +1317,8 @@ class TestBench:
                                 
                                 # Try new validator system first
                                 if isinstance(step["success_check"], dict):
-                                    validator = create_validator(step["success_check"], test_config)
+                                    in_memory_env = test_config.get("in_memory_environment")
+                                    validator = create_validator(step["success_check"], test_config, in_memory_env)
                                     # Use validate_with_print if it's a composite validator
                                     if isinstance(validator, CompositeValidator):
                                         print("\nValidator Results:")
@@ -1635,7 +1676,12 @@ class TestBench:
                     break
             
             if attack_succeeded:
-                self._cache_successful_attack(test_file, result)
+                try:
+                    self._cache_successful_attack(test_file, result)
+                except Exception as e:
+                    print(f"⚠️  Warning: Failed to cache successful attack: {e}")
+                    import traceback
+                    traceback.print_exc()
             else:
                 print(f"💾 Optimization was used but attack did not succeed - not caching")
         
@@ -2140,7 +2186,8 @@ class TestBench:
                                             user_msg = replay_step.get("user_message", "")
                                             if user_msg:
                                                 print(f"   Replay step {replay_step_num}: {user_msg[:50]}...")
-                                                invoke_agent(user_msg, replay_session_id, test_config)
+                                                in_memory_env = test_config.get("in_memory_environment")
+                                                invoke_agent(user_msg, replay_session_id, test_config, in_memory_env)
                                         
                                         # Note: We skip "insert_attack_email" steps during replay because
                                         # the optimized attack email has already been injected via _inject_optimized_attack_email
@@ -2303,10 +2350,12 @@ class TestBench:
         # Run the step (reuse existing logic from static test)
         start_time = time.time()
         try:
+            in_memory_env = test_config.get("in_memory_environment")
             agent_result = invoke_agent(
                 text=step['user_message'],
                 session_id=session_id,
-                config=test_config
+                config=test_config,
+                in_memory_env=in_memory_env
             )
             duration = time.time() - start_time
             
@@ -2335,7 +2384,8 @@ class TestBench:
                 try:
                     user_goal_check = step["user_goal"]["success_check"]
                     if isinstance(user_goal_check, dict):
-                        validator = create_validator(user_goal_check, test_config)
+                        in_memory_env = test_config.get("in_memory_environment")
+                        validator = create_validator(user_goal_check, test_config, in_memory_env)
                         user_goal_passed = validator.validate(response, session_id, step_traces)
                     print(f"User Goal Result: {'✓ PASSED' if user_goal_passed else '✗ FAILED'}")
                 except Exception as e:
@@ -2346,7 +2396,8 @@ class TestBench:
                 try:
                     attack_goal_check = step["attack_goal"]["success_check"]
                     if isinstance(attack_goal_check, dict):
-                        validator = create_validator(attack_goal_check, test_config)
+                        in_memory_env = test_config.get("in_memory_environment")
+                        validator = create_validator(attack_goal_check, test_config, in_memory_env)
                         attack_goal_passed = validator.validate(response, session_id, step_traces)
                         try:
                             partial_attack_score = float(validator.score(response, session_id, step_traces))
@@ -2434,10 +2485,12 @@ class TestBench:
         
         start_time = time.time()
         try:
+            in_memory_env = test_config.get("in_memory_environment")
             result = invoke_agent(
                 text=step['user_message'],
                 session_id=session_id,
-                config=test_config
+                config=test_config,
+                in_memory_env=in_memory_env
             )
             duration = time.time() - start_time
             
@@ -2473,7 +2526,8 @@ class TestBench:
                     from benchmark.test_validators import create_validator
                     # Store current user message in test_config for validators that need it (e.g., semantic judge)
                     test_config["_current_user_message"] = step['user_message']
-                    validator = create_validator(step["success_check"], test_config)
+                    in_memory_env = test_config.get("in_memory_environment")
+                    validator = create_validator(step["success_check"], test_config, in_memory_env)
                     step_passed = validator.validate(response, session_id, step_traces)
                     result["passed"] = step_passed
                 except Exception as e:
@@ -2634,16 +2688,37 @@ class TestBench:
     def _inject_optimized_attack_email(self, test_config: Dict[str, Any], 
                                      optimized_attack_email: Dict[str, Any]):
         """Inject optimized attack email into the test environment."""
-        # Use the scorer's injection method to actually write the email to disk
-        if self.adaptive_enabled and hasattr(self, 'optimizers') and self.optimizers:
-            # Get the first available scorer (they all share the same injection logic)
-            first_optimizer = next(iter(self.optimizers.values()))
-            if hasattr(first_optimizer, 'scorer'):
-                first_optimizer.scorer._inject_attack_email(
-                    optimized_attack_email, 
-                    test_config, 
-                    environment_state=None
-                )
+        # Inject the optimized attack email directly into the mailbox
+        mailbox = test_config.get("mailbox")
+        if not mailbox:
+            raise ValueError("mailbox is required in test_config for injecting optimized attack email")
+        
+        # Find and replace the existing attack email in the inbox
+        # The attack email is typically the first email inserted, so we'll replace the first one
+        # or find one that matches the sender
+        attack_email_found = False
+        optimized_from = optimized_attack_email.get("from")
+        
+        # Look for the attack email by matching the sender
+        # Attack emails are usually inserted first, so we check the first few emails
+        for i, email in enumerate(mailbox.inbox):
+            # Replace if it matches the sender (most reliable identifier)
+            if email.get("from") == optimized_from:
+                # Replace this email with the optimized version
+                mailbox.inbox[i] = optimized_attack_email.copy()
+                attack_email_found = True
+                print(f"💾 Replaced attack email in inbox (index {i}) with optimized version")
+                break
+        
+        # If we didn't find a matching email, replace the first one (assuming it's the attack email)
+        # or add it if inbox is empty
+        if not attack_email_found:
+            if len(mailbox.inbox) > 0:
+                mailbox.inbox[0] = optimized_attack_email.copy()
+                print(f"💾 Replaced first email in inbox with optimized attack email")
+            else:
+                mailbox.add_email(optimized_attack_email, folder="inbox")
+                print(f"💾 Added optimized attack email to inbox")
         
         # CRITICAL: Clear the RAG vectorstore when injecting optimized email
         # The RAG vectorstore was built with the old attack email from previous steps (1-3)
@@ -2671,64 +2746,73 @@ class TestBench:
         """Cache a test with successful attacks for future runs."""
         print(f"💾 Caching successful attack for {test_file.name}")
         
-        # Create cache directory structure
-        # Handle test files that may be outside test_bench_dir (e.g., attack_bench tests)
         try:
-            # Try relative to test_bench_dir first (for tests in data/benchmark/tests/)
-            relative_path = test_file.relative_to(self.test_bench_dir)
-            cache_file = self.cache_dir / relative_path
-        except ValueError:
-            # Test file is not under test_bench_dir (e.g., attack_bench tests)
-            # Use path relative to data/benchmark/ instead
+            # Create cache directory structure
+            # Handle test files that may be outside test_bench_dir (e.g., attack_bench tests)
             try:
-                # Make benchmark_base absolute to handle both absolute and relative test_file paths
-                benchmark_base = Path("data/benchmark").resolve()
-                test_file_resolved = test_file.resolve()
-                relative_path = test_file_resolved.relative_to(benchmark_base)
+                # Try relative to test_bench_dir first (for tests in data/benchmark/tests/)
+                relative_path = test_file.relative_to(self.test_bench_dir)
                 cache_file = self.cache_dir / relative_path
             except ValueError:
-                # Fallback: use string manipulation to extract path after "data/benchmark/"
-                test_file_str = str(test_file)
-                if "data/benchmark/" in test_file_str:
-                    relative_path = Path(test_file_str.split("data/benchmark/")[-1])
-                else:
-                    # Use filename only as last resort
-                    relative_path = Path(test_file.name)
-                cache_file = self.cache_dir / relative_path
-        
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Load original test and update with optimized attacks
-        with open(test_file, 'r', encoding='utf-8') as f:
-            cached_test = json.load(f)
-        
-        # Update the test with optimized attack emails from the result
-        steps = result.get("steps", [])
-        for i, step in enumerate(steps):
-            if "optimization" in step and "optimized_attack_email" in step["optimization"]:
-                optimized_email = step["optimization"]["optimized_attack_email"]
-                # Find the corresponding insert_attack_email step and update it
-                if i < len(cached_test.get("steps", [])):
-                    cached_step = cached_test["steps"][i]
-                    # Look backwards for the insert_attack_email step
-                    for j in range(i, -1, -1):
-                        if j < len(cached_test["steps"]) and cached_test["steps"][j].get("step_type") == "insert_attack_email":
-                            cached_test["steps"][j]["attack_email"] = optimized_email
-                            print(f"💾 Updated attack email in step {j+1} with optimized version")
-                            break
-        
-        # Add optimization metadata
-        cached_test["optimization_metadata"] = {
-            "optimized": True,
-            "optimization_timestamp": datetime(2025, 11, 3, 12, 0, 0).isoformat(),
-            "model_name": self.model_name
-        }
-        
-        # Save cached version
-        with open(cache_file, 'w', encoding='utf-8') as f:
-            json.dump(cached_test, f, indent=2, ensure_ascii=False)
-        
-        print(f"💾 Cached test saved to: {cache_file}")
+                # Test file is not under test_bench_dir (e.g., attack_bench tests)
+                # Use path relative to data/benchmark/ instead
+                try:
+                    # Make benchmark_base absolute to handle both absolute and relative test_file paths
+                    benchmark_base = Path("data/benchmark").resolve()
+                    test_file_resolved = test_file.resolve()
+                    relative_path = test_file_resolved.relative_to(benchmark_base)
+                    cache_file = self.cache_dir / relative_path
+                except ValueError:
+                    # Fallback: use string manipulation to extract path after "data/benchmark/"
+                    test_file_str = str(test_file)
+                    if "data/benchmark/" in test_file_str:
+                        relative_path = Path(test_file_str.split("data/benchmark/")[-1])
+                    else:
+                        # Use filename only as last resort
+                        relative_path = Path(test_file.name)
+                    cache_file = self.cache_dir / relative_path
+            
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Load original test and update with optimized attacks
+            if not test_file.exists():
+                raise FileNotFoundError(f"Test file not found: {test_file}")
+            
+            with open(test_file, 'r', encoding='utf-8') as f:
+                cached_test = json.load(f)
+            
+            # Update the test with optimized attack emails from the result
+            steps = result.get("steps", [])
+            for i, step in enumerate(steps):
+                if "optimization" in step and "optimized_attack_email" in step["optimization"]:
+                    optimized_email = step["optimization"]["optimized_attack_email"]
+                    # Find the corresponding insert_attack_email step and update it
+                    if i < len(cached_test.get("steps", [])):
+                        cached_step = cached_test["steps"][i]
+                        # Look backwards for the insert_attack_email step
+                        for j in range(i, -1, -1):
+                            if j < len(cached_test["steps"]) and cached_test["steps"][j].get("step_type") == "insert_attack_email":
+                                cached_test["steps"][j]["attack_email"] = optimized_email
+                                print(f"💾 Updated attack email in step {j+1} with optimized version")
+                                break
+            
+            # Add optimization metadata
+            cached_test["optimization_metadata"] = {
+                "optimized": True,
+                "optimization_timestamp": datetime.now().isoformat(),
+                "model_name": self.model_name
+            }
+            
+            # Save cached version
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(cached_test, f, indent=2, ensure_ascii=False)
+            
+            print(f"💾 Cached test saved to: {cache_file}")
+        except Exception as e:
+            print(f"⚠️  Error in _cache_successful_attack: {e}")
+            import traceback
+            traceback.print_exc()
+            # Don't re-raise - let the outer handler deal with it gracefully
     
     def discover_test_files(self, test_path: str) -> List[Path]:
         """
