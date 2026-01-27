@@ -404,31 +404,33 @@ def get_context_defense_manager(
 
 
 def get_context_memory_context(text: str, session_id: str, model_name: str, memory_config: dict, memory_backend: str, in_memory_env = None) -> str:
-    """Retrieve context memory context if enabled."""
+    """Retrieve context memory context if active.
+    
+    The backend is considered active if a manager exists in in_memory_env or config.
+    This is set by test_bench when memory_backend="context" is specified.
+    """
     context_memory_config = memory_config.get("context_memory", {})
-    context_memory_enabled = context_memory_config.get("enabled", False) or (memory_backend == "context")
     unified_defense_type = context_memory_config.get("defense_type", "none")
     # Use local mapper function (avoid circular import)
     context_defense_type = map_unified_defense(unified_defense_type)
     
-    if not context_memory_enabled or context_defense_type == "disable_memory":
+    # Check defense type first
+    if context_defense_type == "disable_memory":
         return ""
     
     try:
         # Get manager from in_memory_env (preferred) or from config (backward compatibility)
+        # If a manager exists, the backend is active (set by test_bench based on CLI args)
         context_memory_manager = None
         if in_memory_env:
             context_memory_manager = in_memory_env.context_manager
-        else:
+        if not context_memory_manager:
             context_memory_manager = context_memory_config.get("manager")
         
+        # No manager means context backend is not active - return empty
         if not context_memory_manager:
-            # Fallback: create new manager (memories won't persist across calls)
-            max_context_length = context_memory_config.get("max_context_length")
-            context_memory_manager = get_context_memory_manager(
-                max_context_length=max_context_length,
-                model_name=model_name,
-            )
+            return ""
+        
         context_memory_context = context_memory_manager.get_context(
             text, session_id=session_id, defense_type=context_defense_type
         )

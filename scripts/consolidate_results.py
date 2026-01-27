@@ -862,7 +862,12 @@ def generate_error_summary(
     Returns:
         Path to error summary file, or None if no errors found
     """
-    logs_base_dir = Path("data/benchmark/logs")
+    # Determine if this is attack_bench results (use attack_logs folder)
+    results_base_dir_str = str(results_base_dir)
+    if "attack_results" in results_base_dir_str:
+        logs_base_dir = Path("data/benchmark/attack_logs")
+    else:
+        logs_base_dir = Path("data/benchmark/logs")
     errors_found = []
     
     for memory_backend in MEMORY_BACKENDS:

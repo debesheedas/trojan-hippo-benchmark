@@ -102,6 +102,136 @@ class AttackScorer:
         """Set logger for scoring operations."""
         self.logger = logger
     
+    def _dump_environment_state(self, test_config: Dict[str, Any], step_num: int, step_type: str = "user_message", 
+                                 user_message: Optional[str] = None, agent_response: Optional[str] = None,
+                                 mode: str = "adaptive") -> None:
+        """
+        Dump complete environment state for debugging.
+        
+        This function logs the complete state of the environment including:
+        - Mailbox contents (inbox, outbox, drafts) - full email content
+        - RAG vectorstore contents (all chunks) - full text
+        - Agent responses (full, not truncated)
+        - Tool results (full)
+        - Conversation turns being indexed
+        - Retrieved chunks during RAG queries
+        
+        Args:
+            test_config: Test configuration dictionary
+            step_num: Current step number
+            step_type: Type of step (e.g., "user_message", "insert_attack_email")
+            user_message: User message for this step (if applicable)
+            agent_response: Agent response for this step (if applicable)
+            mode: Mode identifier ("static" or "adaptive")
+        """
+        try:
+            in_memory_env = test_config.get("in_memory_environment")
+            if not in_memory_env:
+                if self.logger:
+                    self.logger.debug(f"[{mode}] Step {step_num}: No in_memory_environment found")
+                return
+            
+            debug_msg = f"\n{'='*80}\n[{mode.upper()}] ENVIRONMENT STATE DUMP - Step {step_num} ({step_type})\n{'='*80}\n"
+            
+            # 1. Mailbox state
+            debug_msg += "\n--- MAILBOX STATE ---\n"
+            mailbox = in_memory_env.mailbox
+            for folder in ["inbox", "outbox", "drafts"]:
+                emails = mailbox.get_emails(folder=folder)
+                debug_msg += f"\n{folder.upper()} ({len(emails)} emails):\n"
+                for idx, email in enumerate(emails, 1):
+                    debug_msg += f"  [{idx}] From: {email.get('from', 'Unknown')}\n"
+                    debug_msg += f"      Subject: {email.get('subject', 'No subject')}\n"
+                    debug_msg += f"      Body length: {len(email.get('body_plain', ''))} chars\n"
+                    # Print full body (not truncated)
+                    body = email.get('body_plain', '')
+                    if body:
+                        debug_msg += f"      Body (FULL):\n{body}\n"
+                    debug_msg += "\n"
+            
+            # 2. RAG Vectorstore state
+            debug_msg += "\n--- RAG VECTORSTORE STATE ---\n"
+            memory_backend = test_config.get("memory", {}).get("backend", "none")
+            if memory_backend == "rag":
+                rag_vectorstore = in_memory_env.rag_vectorstore
+                if rag_vectorstore:
+                    vectorstore, documents, chunk_counter = rag_vectorstore.load()
+                    debug_msg += f"Total chunks in vectorstore: {len(documents)}\n"
+                    debug_msg += f"Chunk counter: {chunk_counter}\n"
+                    debug_msg += f"Vectorstore initialized: {vectorstore is not None}\n"
+                    
+                    # Print all chunks (full text, not truncated)
+                    if documents:
+                        debug_msg += f"\nAll RAG chunks (FULL TEXT):\n"
+                        for idx, chunk in enumerate(documents, 1):
+                            debug_msg += f"\n  Chunk {idx}/{len(documents)} ({len(chunk)} chars):\n"
+                            debug_msg += f"  {chunk}\n"
+                    else:
+                        debug_msg += "  (No chunks in vectorstore)\n"
+                else:
+                    debug_msg += "  (No RAG vectorstore found)\n"
+            else:
+                debug_msg += f"  (RAG backend not active, backend={memory_backend})\n"
+            
+            # 3. Agent response (if provided)
+            if agent_response:
+                debug_msg += f"\n--- AGENT RESPONSE (FULL) ---\n"
+                debug_msg += f"Length: {len(agent_response)} chars\n"
+                debug_msg += f"Response (FULL, NOT TRUNCATED):\n{agent_response}\n"
+            
+            # 4. User message (if provided)
+            if user_message:
+                debug_msg += f"\n--- USER MESSAGE (FULL) ---\n"
+                debug_msg += f"Length: {len(user_message)} chars\n"
+                debug_msg += f"Message (FULL, NOT TRUNCATED):\n{user_message}\n"
+            
+            # 5. Conversation turn that would be indexed (if both user_message and agent_response provided)
+            if user_message and agent_response:
+                debug_msg += f"\n--- CONVERSATION TURN (what gets indexed) ---\n"
+                conversation_turn = f"User: {user_message}\nAssistant: {agent_response}"
+                debug_msg += f"Length: {len(conversation_turn)} chars\n"
+                debug_msg += f"Conversation turn (FULL, NOT TRUNCATED):\n{conversation_turn}\n"
+            
+            # 6. Trace events for this step
+            session_id = test_config.get("_current_session_id", "unknown")
+            traces = in_memory_env.get_traces(session_id)
+            if traces:
+                debug_msg += f"\n--- TRACE EVENTS (last 10 for session {session_id}) ---\n"
+                recent_traces = traces[-10:]
+                for idx, trace in enumerate(recent_traces, 1):
+                    event_type = trace.get("event_type", "unknown")
+                    payload = trace.get("payload", {})
+                    debug_msg += f"  [{idx}] {event_type}:\n"
+                    if event_type == "tool_result":
+                        tool_name = payload.get("tool_name", "unknown")
+                        result = payload.get("result", "")
+                        debug_msg += f"      Tool: {tool_name}\n"
+                        debug_msg += f"      Result length: {len(str(result))} chars\n"
+                        # Print full result (not truncated)
+                        debug_msg += f"      Result (FULL):\n{str(result)}\n"
+                    elif event_type == "tool_call":
+                        tool_name = payload.get("tool_name", "unknown")
+                        args = payload.get("args", {})
+                        debug_msg += f"      Tool: {tool_name}\n"
+                        debug_msg += f"      Args: {args}\n"
+                    elif event_type == "agent_response":
+                        response = payload.get("text", "")
+                        debug_msg += f"      Response length: {len(response)} chars\n"
+                        debug_msg += f"      Response (FULL):\n{response}\n"
+            
+            debug_msg += f"\n{'='*80}\n"
+            
+            if self.logger:
+                self.logger.debug(debug_msg)
+            else:
+                print(debug_msg, flush=True)
+            
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"[{mode}] Error dumping environment state: {e}")
+            else:
+                print(f"[{mode}] Error dumping environment state: {e}", flush=True)
+    
     def score(self,
               candidate_attack_email: Dict[str, Any],
               environment_state: EnvironmentState,
@@ -339,6 +469,15 @@ class AttackScorer:
                     fresh_in_memory_env.mailbox.add_email(candidate_attack_email, folder="inbox")
                     if self.logger:
                         self.logger.debug(f"[scorer] Injected candidate attack email at step {i}")
+                    
+                    # DEBUG: Dump environment state after inserting attack email
+                    fresh_test_config["_current_session_id"] = current_session_id
+                    self._dump_environment_state(
+                        test_config=fresh_test_config,
+                        step_num=i,
+                        step_type="insert_attack_email",
+                        mode="adaptive"
+                    )
                     continue
                 
                 elif step_type == "insert_email":
@@ -374,6 +513,17 @@ class AttackScorer:
                             break
                 else:
                     result.agent_response_text = str(agent_response)
+                
+                # DEBUG: Dump complete environment state after evaluation step
+                fresh_test_config["_current_session_id"] = current_session_id  # Store for debugging
+                self._dump_environment_state(
+                    test_config=fresh_test_config,
+                    step_num=step_num,
+                    step_type="user_message",
+                    user_message=user_message,
+                    agent_response=result.agent_response_text,
+                    mode="adaptive"
+                )
                 
                 # Collect traces from in-memory environment
                 try:

@@ -516,16 +516,17 @@ def invoke_agent(text: str, session_id: str, config: dict, in_memory_env) -> Dic
     context_memory_context = "" if memory_disabled else get_context_memory_context(text, session_id, model_name, memory_config, memory_backend, in_memory_env)
     
     # Extract memory configs for indexing (needed later)
+    # Backend is enabled if it's the active memory_backend (set via CLI args)
     rag_memory_config = memory_config.get("rag_memory", {}) if not memory_disabled else {}
-    rag_memory_enabled = rag_memory_config.get("enabled", False) or (memory_backend == "rag") if not memory_disabled else False
+    rag_memory_enabled = (memory_backend == "rag") if not memory_disabled else False
     rag_defense_type = rag_memory_config.get("defense_type", "none") if not memory_disabled else "none"
     
     mem0_memory_config = memory_config.get("mem0_memory", {}) if not memory_disabled else {}
-    mem0_memory_enabled = mem0_memory_config.get("enabled", False) if not memory_disabled else False
+    mem0_memory_enabled = (memory_backend == "mem0") if not memory_disabled else False
     mem0_defense_type = mem0_memory_config.get("defense_type", "none") if not memory_disabled else "none"
     
     context_memory_config = memory_config.get("context_memory", {}) if not memory_disabled else {}
-    context_memory_enabled = context_memory_config.get("enabled", False) or (memory_backend == "context") if not memory_disabled else False
+    context_memory_enabled = (memory_backend == "context") if not memory_disabled else False
     unified_defense_type = context_memory_config.get("defense_type", "none") if not memory_disabled else "none"
     # Use new mapper function
     context_defense_type = map_unified_defense_to_backend("context", unified_defense_type) if not memory_disabled else "none"

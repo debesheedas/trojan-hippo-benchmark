@@ -314,8 +314,15 @@ def _run_single_combination(
     result = None
     try:
         # Print start message to terminal (not redirected to file)
+        # Determine if this is an attack_bench test (uses attack_logs folder)
+        is_attack_bench = "attack_bench" in str(test_path)
+        logs_folder = "attack_logs" if is_attack_bench else "logs"
+        
         print(f"[PID {process_id}] Starting: {memory_backend} + {unified_defense}")
-        print(f"Individual test logs will be written to: data/benchmark/logs/{target_model_name or 'unknown'}/{memory_backend}/{unified_defense}/{attack_type}/")
+        if is_attack_bench:
+            print(f"Individual test logs will be written to: data/benchmark/{logs_folder}/{target_model_name or 'unknown'}/{memory_backend}/{unified_defense}/")
+        else:
+            print(f"Individual test logs will be written to: data/benchmark/{logs_folder}/{target_model_name or 'unknown'}/{memory_backend}/{unified_defense}/{attack_type}/")
         print(f"{'='*80}\n", flush=True)
         
         result = run_benchmark(
@@ -362,7 +369,10 @@ def _run_single_combination(
             status = "OK"
         else:
             status = "ERROR"
-        print(f"{status} {memory_backend.upper()} + {unified_defense} - See individual test logs in data/benchmark/logs/{target_model_name or 'unknown'}/{memory_backend}/{unified_defense}/{attack_type}/", flush=True)
+        if is_attack_bench:
+            print(f"{status} {memory_backend.upper()} + {unified_defense} - See individual test logs in data/benchmark/{logs_folder}/{target_model_name or 'unknown'}/{memory_backend}/{unified_defense}/", flush=True)
+        else:
+            print(f"{status} {memory_backend.upper()} + {unified_defense} - See individual test logs in data/benchmark/{logs_folder}/{target_model_name or 'unknown'}/{memory_backend}/{unified_defense}/{attack_type}/", flush=True)
     
     # Ensure result is never None
     if result is None:
@@ -753,7 +763,7 @@ def run_all_combinations(
             print(f"   Rate limit errors: {rate_limit_count}")
         if api_error_count > 0:
             print(f"   API/Connection errors: {api_error_count}")
-        print(f"   Check individual log files in data/benchmark/logs/ for details")
+        print(f"   Check individual log files in data/benchmark/logs/ (utility tests) or data/benchmark/attack_logs/ (attack_bench tests) for details")
         print()
     
     # Final status

@@ -1277,34 +1277,31 @@ def get_mem0_memory_manager(
 
 
 def get_mem0_memory_context(text: str, session_id: str, memory_config: dict, in_memory_env = None) -> str:
-    """Retrieve mem0 memory context if enabled (in-memory only)."""
+    """Retrieve mem0 memory context if active (in-memory only).
+    
+    The backend is considered active if a manager exists in in_memory_env or config.
+    This is set by test_bench when memory_backend="mem0" is specified.
+    """
     mem0_memory_config = memory_config.get("mem0_memory", {})
-    mem0_memory_enabled = mem0_memory_config.get("enabled", False)
     mem0_defense_type = mem0_memory_config.get("defense_type", "none")
     
-    if not mem0_memory_enabled or mem0_defense_type == "disable_memory":
+    # Check defense type first
+    if mem0_defense_type == "disable_memory":
         return ""
     
     try:
         # Get manager from in_memory_env (preferred) or from config (backward compatibility)
+        # If a manager exists, the backend is active (set by test_bench based on CLI args)
         mem0_memory_manager = None
         if in_memory_env:
             mem0_memory_manager = in_memory_env.mem0_manager
-        else:
+        if not mem0_memory_manager:
             mem0_memory_manager = mem0_memory_config.get("manager")
         
+        # No manager means mem0 backend is not active - return empty
         if not mem0_memory_manager:
-            # Fallback: create new manager (memories won't persist across calls)
-            mem0_memory_manager = get_mem0_memory_manager(
-                llm_provider=mem0_memory_config.get("llm_provider", "openai"),
-                llm_model=mem0_memory_config.get("llm_model", "gpt-5-mini"),
-                llm_temperature=mem0_memory_config.get("llm_temperature", 0.0),
-                embedding_provider=mem0_memory_config.get("embedding_provider", "openai"),
-                embedding_model=mem0_memory_config.get("embedding_model", "text-embedding-3-small"),
-                vector_store_provider=mem0_memory_config.get("vector_store_provider", "faiss"),
-                top_k=mem0_memory_config.get("top_k", 10),
-                user_id=mem0_memory_config.get("user_id", "default_user"),
-            )
+            return ""
+        
         mem0_context = mem0_memory_manager.get_context(
             text, user_id="vince", session_id=session_id, defense_type=mem0_defense_type
         )

@@ -205,6 +205,8 @@ def get_log_path(
     Path structure: {model_name}/{memory_backend}/{defense_type}/{attack_type}/{test_file}.log
     For attack_bench tests: {model_name}/{memory_backend}/{defense_type}/{test_file}.log (no attack_type folder)
     
+    Note: For attack_bench tests, logs go to attack_logs/ instead of logs/ (similar to attack_results vs results).
+    
     Args:
         memory_backend: Memory backend name ("explicit", "mem0", "rag", or "none" for disable_memory)
         unified_defense: Unified defense name (e.g., "none", "disable_memory")
@@ -225,10 +227,13 @@ def get_log_path(
     )
     
     # Check if test is in attack_bench (skip attack_type folder for attack_bench tests)
+    # Also check if logs_base_dir is attack_logs (never use attack_type folder for attack_logs)
     test_file_str = str(test_file)
+    logs_base_dir_str = str(logs_base_dir)
     is_attack_bench = "attack_bench" in test_file_str
+    is_attack_logs = "attack_logs" in logs_base_dir_str
     
-    if is_attack_bench:
+    if is_attack_bench or is_attack_logs:
         # For attack_bench tests, skip the attack_type folder (all are indirect attacks)
         log_path = (
             logs_base_dir /

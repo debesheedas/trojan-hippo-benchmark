@@ -17,8 +17,10 @@ import random
 import re
 import traceback
 import unicodedata
+import threading
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from .base_optimizer import BaseOptimizer, OptimizationResult
 from benchmark.environment_state import EnvironmentState
 from .scorer import AttackScorer
@@ -309,6 +311,53 @@ class CandidateDatabase:
         return previous_row[-1]
 
 
+class ThreadSafeLogger:
+    """Thread-safe wrapper for logger to prevent interleaved log messages."""
+    
+    def __init__(self, logger):
+        self.logger = logger
+        self.lock = threading.Lock()
+    
+    def info(self, msg):
+        with self.lock:
+            self.logger.info(msg)
+    
+    def debug(self, msg):
+        with self.lock:
+            self.logger.debug(msg)
+    
+    def warning(self, msg):
+        with self.lock:
+            self.logger.warning(msg)
+    
+    def error(self, msg):
+        with self.lock:
+            self.logger.error(msg)
+
+
+class ThreadSafeDatabase:
+    """Thread-safe wrapper for CandidateDatabase to prevent race conditions."""
+    
+    def __init__(self, database):
+        self.database = database
+        self.lock = threading.Lock()
+    
+    def add(self, candidate: AttackCandidate) -> bool:
+        """Thread-safe add operation."""
+        with self.lock:
+            return self.database.add(candidate)
+    
+    def get_best(self):
+        """Thread-safe get_best operation."""
+        with self.lock:
+            return self.database.get_best()
+    
+    def get_statistics(self):
+        """Thread-safe get_statistics operation."""
+        with self.lock:
+            return self.database.get_statistics()
+
+
 class OpenEvolveOptimizer(BaseOptimizer):
     """
     OpenEvolve-style optimizer for attack emails.
@@ -342,6 +391,19 @@ class OpenEvolveOptimizer(BaseOptimizer):
         self.mutator_model = self.openevolve_config.get("mutator_model", "gpt-4o")
         self.mutator_temperature = self.openevolve_config.get("mutator_model_temperature", 0.8)
         
+        # Parallelization configuration
+        self.num_workers = self.openevolve_config.get("num_workers", 1)  # Default to 1 for safety
+        if self.num_workers < 1:
+            self.num_workers = 1
+            self._log_warning(f"num_workers must be >= 1, setting to 1")
+        
+        # Initialize thread-safe components if parallelization is enabled
+        self._thread_safe_logger = None
+        self._thread_safe_database = None
+        if self.num_workers > 1:
+            # Thread-safe components will be initialized when logger is set
+            pass
+        
         # Scorer configuration - use AgentDojo Critic
         # Ensure the scorer can find the config in the right place
         if "benchmark" not in self.config:
@@ -368,7 +430,7 @@ class OpenEvolveOptimizer(BaseOptimizer):
             length_max=self.length_max
         )
         
-        self._log_info(f"Initialized OpenEvolveOptimizer with {self.max_iterations} max iterations")
+        self._log_info(f"Initialized OpenEvolveOptimizer with {self.max_iterations} max iterations, num_workers={self.num_workers}")
     
     def get_strategy_name(self) -> str:
         return self.strategy_name
@@ -378,6 +440,11 @@ class OpenEvolveOptimizer(BaseOptimizer):
         super().set_logger(logger)
         if hasattr(self, 'scorer') and self.scorer:
             self.scorer.set_logger(logger)
+        
+        # Initialize thread-safe components if parallelization is enabled
+        if self.num_workers > 1 and logger:
+            self._thread_safe_logger = ThreadSafeLogger(logger)
+            self._thread_safe_database = ThreadSafeDatabase(self.database)
     
     def optimize_attack(self, 
                        original_attack_email: Dict[str, Any],
@@ -812,12 +879,9 @@ class OpenEvolveOptimizer(BaseOptimizer):
         """
         Score a batch of candidates.
         
-        This method is designed to be easily parallelized. Each candidate scoring is completely
-        independent - it creates a fresh in-memory environment, runs the full test sequence,
-        and computes scores. No shared state between candidates.
-        
-        Currently implemented sequentially, but structured to allow parallel execution
-        when num_workers > 1.
+        This method supports both sequential (num_workers=1) and parallel (num_workers>1) execution.
+        Each candidate scoring is completely independent - it creates a fresh in-memory environment,
+        runs the full test sequence, and computes scores. No shared state between candidates.
         
         Args:
             candidates: List of AttackCandidate objects to score
@@ -832,21 +896,111 @@ class OpenEvolveOptimizer(BaseOptimizer):
         if not candidates:
             return
         
-        # Currently sequential implementation - ready for parallelization
-        for i, candidate in enumerate(candidates, 1):
-            if self.logger:
-                self.logger.debug(f"Scoring candidate {i}/{len(candidates)}: {candidate.id}")
+        # Use sequential execution if num_workers == 1 (simple, no threading overhead)
+        if self.num_workers == 1:
+            for i, candidate in enumerate(candidates, 1):
+                if self.logger:
+                    self.logger.debug(f"Scoring candidate {i}/{len(candidates)}: {candidate.id}")
+                
+                self._score_candidate(
+                    candidate=candidate,
+                    failed_step=failed_step,
+                    step_num=step_num,
+                    session_id=session_id,
+                    test_config=test_config,
+                    environment_state=environment_state,
+                    test_def=test_def,
+                    attack_email_step_num=attack_email_step_num
+                )
+            return
+        
+        # Parallel execution (num_workers > 1)
+        # Use thread-safe logger and database
+        thread_safe_logger = self._thread_safe_logger if self._thread_safe_logger else self.logger
+        thread_safe_database = self._thread_safe_database if self._thread_safe_database else None
+        
+        # Early stopping coordination
+        early_stop_event = threading.Event()
+        early_stop_score = self.openevolve_config.get("early_stop_score", 10)
+        
+        # Track completed candidates
+        completed_count = [0]  # Use list to allow modification in nested function
+        completed_lock = threading.Lock()
+        
+        def _score_candidate_parallel(candidate: AttackCandidate, index: int) -> Optional[AttackCandidate]:
+            """Score a single candidate in parallel - designed for ThreadPoolExecutor."""
+            try:
+                # Check early stop event
+                if early_stop_event.is_set():
+                    return None
+                
+                # Log start
+                if thread_safe_logger:
+                    thread_safe_logger.debug(f"[Worker] Starting candidate {index+1}/{len(candidates)}: {candidate.id}")
+                
+                # Score candidate (creates fresh environment, no shared state)
+                self._score_candidate(
+                    candidate=candidate,
+                    failed_step=failed_step,
+                    step_num=step_num,
+                    session_id=session_id,
+                    test_config=test_config,
+                    environment_state=environment_state,
+                    test_def=test_def,
+                    attack_email_step_num=attack_email_step_num
+                )
+                
+                # Check for early stop
+                if candidate.binary_success or candidate.agentdojo_score >= early_stop_score:
+                    early_stop_event.set()
+                    if thread_safe_logger:
+                        thread_safe_logger.info(f"[Worker] SUCCESS! Candidate {candidate.id} achieved {'binary success' if candidate.binary_success else f'score {candidate.agentdojo_score}/10'}")
+                
+                # Update completed count
+                with completed_lock:
+                    completed_count[0] += 1
+                    if thread_safe_logger:
+                        thread_safe_logger.info(f"[Progress] Completed {completed_count[0]}/{len(candidates)} candidates")
+                
+                return candidate
+                
+            except Exception as e:
+                if thread_safe_logger:
+                    thread_safe_logger.warning(f"[Worker] Failed to score candidate {candidate.id}: {e}")
+                return None
+        
+        # Execute in parallel using ThreadPoolExecutor
+        scored_candidates = []
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            # Submit all scoring tasks
+            future_to_candidate = {
+                executor.submit(_score_candidate_parallel, candidate, i): candidate
+                for i, candidate in enumerate(candidates)
+            }
             
-            self._score_candidate(
-                candidate=candidate,
-                failed_step=failed_step,
-                step_num=step_num,
-                session_id=session_id,
-                test_config=test_config,
-                environment_state=environment_state,
-                test_def=test_def,
-                attack_email_step_num=attack_email_step_num
-            )
+            # Process completed tasks
+            for future in as_completed(future_to_candidate):
+                # Check if early stop was triggered
+                if early_stop_event.is_set():
+                    # Cancel remaining tasks
+                    for f in future_to_candidate:
+                        f.cancel()
+                    break
+                
+                candidate = future_to_candidate[future]
+                try:
+                    scored = future.result()
+                    if scored:
+                        scored_candidates.append(scored)
+                except Exception as e:
+                    if thread_safe_logger:
+                        thread_safe_logger.warning(f"[Worker] Exception scoring candidate {candidate.id}: {e}")
+        
+        # Log final summary
+        if thread_safe_logger:
+            thread_safe_logger.info(f"[Parallel] Completed scoring {len(scored_candidates)}/{len(candidates)} candidates")
+            if early_stop_event.is_set():
+                thread_safe_logger.info(f"[Parallel] Early stop triggered - found successful candidate")
     
     def _log_candidate_result(self, candidate: AttackCandidate, label: str, added: Optional[bool] = None):
         """Helper method to log candidate scoring results consistently."""

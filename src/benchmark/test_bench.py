@@ -313,6 +313,131 @@ class TestBench:
             debug_info("Could not print initial mem0 memories")
             debug_print_exception(e, context="Printing initial mem0 memories", include_traceback=True)
     
+    def _dump_environment_state(self, test_config: Dict[str, Any], step_num: int, step_type: str = "user_message", 
+                                 user_message: Optional[str] = None, agent_response: Optional[str] = None,
+                                 mode: str = "static") -> None:
+        """
+        Dump complete environment state for debugging.
+        
+        This function logs the complete state of the environment including:
+        - Mailbox contents (inbox, outbox, drafts) - full email content
+        - RAG vectorstore contents (all chunks) - full text
+        - Agent responses (full, not truncated)
+        - Tool results (full)
+        - Conversation turns being indexed
+        - Retrieved chunks during RAG queries
+        
+        Args:
+            test_config: Test configuration dictionary
+            step_num: Current step number
+            step_type: Type of step (e.g., "user_message", "insert_attack_email")
+            user_message: User message for this step (if applicable)
+            agent_response: Agent response for this step (if applicable)
+            mode: Mode identifier ("static" or "adaptive")
+        """
+        try:
+            in_memory_env = test_config.get("in_memory_environment")
+            if not in_memory_env:
+                debug_info(f"[{mode}] Step {step_num}: No in_memory_environment found")
+                return
+            
+            print(f"\n{'='*80}")
+            print(f"[{mode.upper()}] ENVIRONMENT STATE DUMP - Step {step_num} ({step_type})")
+            print(f"{'='*80}")
+            
+            # 1. Mailbox state
+            print(f"\n--- MAILBOX STATE ---")
+            mailbox = in_memory_env.mailbox
+            for folder in ["inbox", "outbox", "drafts"]:
+                emails = mailbox.get_emails(folder=folder)
+                print(f"\n{folder.upper()} ({len(emails)} emails):")
+                for idx, email in enumerate(emails, 1):
+                    print(f"  [{idx}] From: {email.get('from', 'Unknown')}")
+                    print(f"      Subject: {email.get('subject', 'No subject')}")
+                    print(f"      Body length: {len(email.get('body_plain', ''))} chars")
+                    # Print full body (not truncated)
+                    body = email.get('body_plain', '')
+                    if body:
+                        print(f"      Body (FULL):\n{body}")
+                    print()
+            
+            # 2. RAG Vectorstore state
+            print(f"\n--- RAG VECTORSTORE STATE ---")
+            memory_backend = test_config.get("memory", {}).get("backend", "none")
+            if memory_backend == "rag":
+                rag_vectorstore = in_memory_env.rag_vectorstore
+                if rag_vectorstore:
+                    vectorstore, documents, chunk_counter = rag_vectorstore.load()
+                    print(f"Total chunks in vectorstore: {len(documents)}")
+                    print(f"Chunk counter: {chunk_counter}")
+                    print(f"Vectorstore initialized: {vectorstore is not None}")
+                    
+                    # Print all chunks (full text, not truncated)
+                    if documents:
+                        print(f"\nAll RAG chunks (FULL TEXT):")
+                        for idx, chunk in enumerate(documents, 1):
+                            print(f"\n  Chunk {idx}/{len(documents)} ({len(chunk)} chars):")
+                            print(f"  {chunk}")
+                    else:
+                        print("  (No chunks in vectorstore)")
+                else:
+                    print("  (No RAG vectorstore found)")
+            else:
+                print(f"  (RAG backend not active, backend={memory_backend})")
+            
+            # 3. Agent response (if provided)
+            if agent_response:
+                print(f"\n--- AGENT RESPONSE (FULL) ---")
+                print(f"Length: {len(agent_response)} chars")
+                print(f"Response (FULL, NOT TRUNCATED):\n{agent_response}")
+            
+            # 4. User message (if provided)
+            if user_message:
+                print(f"\n--- USER MESSAGE (FULL) ---")
+                print(f"Length: {len(user_message)} chars")
+                print(f"Message (FULL, NOT TRUNCATED):\n{user_message}")
+            
+            # 5. Conversation turn that would be indexed (if both user_message and agent_response provided)
+            if user_message and agent_response:
+                print(f"\n--- CONVERSATION TURN (what gets indexed) ---")
+                conversation_turn = f"User: {user_message}\nAssistant: {agent_response}"
+                print(f"Length: {len(conversation_turn)} chars")
+                print(f"Conversation turn (FULL, NOT TRUNCATED):\n{conversation_turn}")
+            
+            # 6. Trace events for this step
+            session_id = test_config.get("_current_session_id", "unknown")
+            traces = in_memory_env.get_traces(session_id)
+            if traces:
+                print(f"\n--- TRACE EVENTS (last 10 for session {session_id}) ---")
+                recent_traces = traces[-10:]
+                for idx, trace in enumerate(recent_traces, 1):
+                    event_type = trace.get("event_type", "unknown")
+                    payload = trace.get("payload", {})
+                    print(f"  [{idx}] {event_type}:")
+                    if event_type == "tool_result":
+                        tool_name = payload.get("tool_name", "unknown")
+                        result = payload.get("result", "")
+                        print(f"      Tool: {tool_name}")
+                        print(f"      Result length: {len(str(result))} chars")
+                        # Print full result (not truncated)
+                        print(f"      Result (FULL):\n{str(result)}")
+                    elif event_type == "tool_call":
+                        tool_name = payload.get("tool_name", "unknown")
+                        args = payload.get("args", {})
+                        print(f"      Tool: {tool_name}")
+                        print(f"      Args: {args}")
+                    elif event_type == "agent_response":
+                        response = payload.get("text", "")
+                        print(f"      Response length: {len(response)} chars")
+                        print(f"      Response (FULL):\n{response}")
+            
+            print(f"\n{'='*80}\n")
+            sys.stdout.flush()
+            
+        except Exception as e:
+            debug_info(f"[{mode}] Error dumping environment state")
+            debug_print_exception(e, context=f"Dumping environment state for step {step_num}", include_traceback=True)
+    
     def _print_mem0_memories(self, test_config: Dict[str, Any], user_message: Optional[str] = None):
         """Print mem0 memory contents and context if mem0_print is enabled."""
         if not (self.mem0_memory_enabled and self.mem0_print_enabled):
@@ -656,6 +781,9 @@ class TestBench:
                 top_k=mem0_config.get("top_k", 10),
                 user_id=mem0_config.get("user_id", "vince"),
             )
+            # Store in both in_memory_env and config for consistency
+            # Retrieval functions check in_memory_env first, indexing uses config
+            in_memory_env.mem0_manager = mem0_manager
             test_config["memory"]["mem0_memory"]["manager"] = mem0_manager
         elif self.memory_backend_name == "context":
             if "context_memory" not in test_config["memory"]:
@@ -668,6 +796,9 @@ class TestBench:
                 max_context_length=context_config.get("max_context_length"),
                 model_name=test_config.get("agent", {}).get("model_name", "gpt-4o-mini"),
             )
+            # Store in both in_memory_env and config for consistency
+            # Retrieval functions check in_memory_env first, indexing uses config
+            in_memory_env.context_manager = context_manager
             test_config["memory"]["context_memory"]["manager"] = context_manager
         elif self.memory_backend_name == "explicit":
             if "explicit_memory" not in test_config["memory"]:
@@ -692,6 +823,26 @@ class TestBench:
             return attack_results_dir
         return self.default_results_base_dir
     
+    def _get_logs_base_dir_for_test(self, test_file: Path) -> Path:
+        """Get the appropriate logs base directory based on test file location."""
+        test_file_str = str(test_file)
+        default_logs_dir = self.logs_base_dir if self.logs_base_dir is not None else Path("data/benchmark/logs")
+        
+        if "attack_bench" in test_file_str:
+            # For attack_bench tests, use attack_logs instead of logs
+            # Replace "logs" with "attack_logs" in the path
+            logs_dir_str = str(default_logs_dir)
+            if "/logs" in logs_dir_str:
+                attack_logs_dir = Path(logs_dir_str.replace("/logs", "/attack_logs"))
+            elif logs_dir_str.endswith("logs"):
+                attack_logs_dir = Path(logs_dir_str[:-4] + "attack_logs")
+            else:
+                # Fallback: construct attack_logs path
+                attack_logs_dir = default_logs_dir.parent / "attack_logs"
+            attack_logs_dir.mkdir(parents=True, exist_ok=True)
+            return attack_logs_dir
+        return default_logs_dir
+    
     def run_test_from_file(self, test_file: Path) -> Dict[str, Any]:
         """Run a single test from a JSON file (adaptive or static based on config)."""
         # DEBUG: Print to original stdout before redirecting (helps diagnose if we get here)
@@ -709,7 +860,8 @@ class TestBench:
         attack_type = determine_attack_type(test_file, test_def)
         
         # Set up individual log file for this test case (matches results folder structure)
-        logs_base_dir = self.logs_base_dir if self.logs_base_dir is not None else Path("data/benchmark/logs")
+        # Use attack_logs for attack_bench tests, logs for utility tests
+        logs_base_dir = self._get_logs_base_dir_for_test(test_file)
         log_path = get_log_path(
             memory_backend=self.memory_backend_name,
             unified_defense=self.unified_defense,
@@ -996,6 +1148,15 @@ class TestBench:
                         
                         print(f"Added attack email: {attack_email.get('subject', 'No subject')} from {attack_email.get('from', 'Unknown sender')}")
                         
+                        # DEBUG: Dump environment state after inserting attack email
+                        test_config["_current_session_id"] = session_id
+                        self._dump_environment_state(
+                            test_config=test_config,
+                            step_num=i,
+                            step_type="insert_attack_email",
+                            mode="static"
+                        )
+                        
                         # Record this step (no success_check, so no "passed" attribute)
                         step_results.append({
                             "step": i,
@@ -1177,6 +1338,17 @@ class TestBench:
                     }), flush=True)
                     print(f"Duration: {duration:.2f}s", flush=True)
                     sys.stdout.flush()  # Ensure all output is flushed before potentially blocking operations
+                    
+                    # DEBUG: Dump complete environment state after each step
+                    test_config["_current_session_id"] = session_id  # Store for debugging
+                    self._dump_environment_state(
+                        test_config=test_config,
+                        step_num=i,
+                        step_type="user_message",
+                        user_message=step['user_message'],
+                        agent_response=response,
+                        mode="static"
+                    )
                     
                     # Print mem0 memories if enabled
                     self._print_mem0_memories(test_config, user_message=step['user_message'])
