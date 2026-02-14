@@ -69,7 +69,7 @@ Unified defense types work consistently across all backends:
 
 - **`limit_memory_length`**: Limit memory entry length
   - Truncates memory entries to prevent long-form attacks
-  - **Backend mapping**: `limit_memory_length` for explicit/mem0, `limit_chunk_size` for RAG
+  - Works identically across all backends
 
 #### Running Test Suites
 
@@ -393,7 +393,7 @@ memory:
   # Mem0 memory configuration
   mem0_memory:
     enabled: false     # Set to true to use mem0 memory
-    defense_type: "none"  # Unified defense type (maps to "no_defense" internally)
+    defense_type: "none"  # Unified defense type
     vectorstore_path: "data/agent/mem0_vectorstore"
     llm_provider: "openai"
     llm_model: "gpt-4o-mini"
@@ -417,18 +417,13 @@ memory:
 **Important Notes**:
 - **Only enable one backend**: Set `enabled: true` for the backend you want to use, and `enabled: false` for others
 - **CLI overrides config**: The `--memory-backend` argument in `run_benchmark.py` automatically enables the specified backend and disables others
-- **Unified defense types**: Use the same defense type names across all backends (e.g., `"none"`, `"user_prompt_only"`). The system automatically maps them to backend-specific implementations
-- **Defense mapping**: 
-  - `"none"` → `"none"` (explicit/rag) or `"no_defense"` (mem0)
-  - `"user_prompt_only"` → `"user_prompt_only"` (explicit) or `"user_prompt_only"` (mem0/rag/context) internally
-  - `"limit_memory_length"` → `"limit_memory_length"` (explicit/mem0) or `"limit_chunk_size"` (rag)
+- **Unified defense types**: Use the same defense type names across all backends: `none`, `user_prompt_only`, `no_untrusted_tools`, `limit_memory_length`, `provable_policy`
 
 ### Benchmark Configuration
 
 ```yaml
 benchmark:
   enable_adaptive_benchmark: false  # Enable adaptive optimization
-  test_dir: "data/benchmark/tests"  # Unified test directory
   results_dir: "data/benchmark/results"  # Unified results directory
   semantic_judge:
     model_name: "gpt-5-mini"
@@ -440,6 +435,8 @@ benchmark:
     enabled: false
     # ... optimizer settings
 ```
+
+Note: Test files are located in `data/benchmark/tests/` (hardcoded, not configurable).
 
 ### Global Settings
 
@@ -775,9 +772,8 @@ The caching key is: `{memory_backend}/{defense_type}/{model_name}/{attack_type}/
 - Ensure test suite directory exists (memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory) for utility tests
 
 **Defense type not working:**
-- Verify defense type is one of: `none`, `disable_memory`, `user_prompt_only`, `no_untrusted_tools`, `limit_memory_length`
-- Check that defense type is correctly mapped for your backend (see Memory Configuration section)
-- For mem0: `none` maps to `no_defense` internally (this is automatic)
+- Verify defense type is one of: `none`, `user_prompt_only`, `no_untrusted_tools`, `limit_memory_length`, `provable_policy`
+- Check that defense type is correctly specified for your backend (see Memory Configuration section)
 
 **Result caching issues:**
 - Results are cached by: `{backend}/{defense}/{model}/{attack_type}/{test_file}`
@@ -817,13 +813,13 @@ python scripts/consolidate_results.py
 
 ### Defense Type Reference
 
-| Defense | Description | Backend Mapping |
-|---------|-------------|-----------------|
-| `none` | No defense (baseline) | `none` (explicit/rag), `no_defense` (mem0) |
-| `disable_memory` | Disable all indexing | `disable_memory` (all) |
-| `user_prompt_only` | Only index user messages | `user_prompt_only` (explicit), `user_prompt_only` (mem0/rag/context) internally |
-| `no_untrusted_tools` | Block after untrusted tools | `no_untrusted_tools` (all) |
-| `limit_memory_length` | Limit entry length | `limit_memory_length` (explicit/mem0), `limit_chunk_size` (rag) |
+| Defense | Description |
+|---------|-------------|
+| `none` | No defense (baseline) |
+| `user_prompt_only` | Only index user messages |
+| `no_untrusted_tools` | Block after untrusted tools |
+| `limit_memory_length` | Limit entry length |
+| `provable_policy` | Cryptographically verifiable memory policy |
 
 ### Test Suite Organization
 

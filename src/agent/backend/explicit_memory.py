@@ -196,33 +196,8 @@ def get_memory_manager() -> MemoryManager:
 
 
 # ============================================================================
-# Defense Mapping and Test Utilities
+# Test Utilities
 # ============================================================================
-
-def map_unified_defense(unified_defense: str) -> str:
-    """
-    Map unified defense name to explicit memory backend-specific defense type.
-    
-    Args:
-        unified_defense: Unified defense name (e.g., "none", "user_prompt_only")
-        
-    Returns:
-        Backend-specific defense type string
-    """
-    # Explicit memory uses the same names as unified defenses
-    # Note: user_prompt_only is NOT a valid combination for explicit backend.
-    # This combination is skipped at the benchmark level (see is_valid_combination in benchmark_utils).
-    # This mapping is kept for completeness but should not be used in practice.
-    DEFENSE_MAP = {
-        "disable_memory": "disable_memory",
-        "none": "none",
-        "user_prompt_only": "user_prompt_only",  # Not valid for explicit backend - skipped at benchmark level
-        "no_untrusted_tools": "no_untrusted_tools",
-        "limit_memory_length": "limit_memory_length",
-        "provable_policy": "provable_policy",
-    }
-    return DEFENSE_MAP.get(unified_defense, unified_defense)
-
 
 def get_memory_state_for_test(test_dir, config: Dict[str, Any]) -> List[str]:  # noqa: ARG001
     """

@@ -442,7 +442,7 @@ class Mem0MemoryManager:
         Args:
             messages: List of message dictionaries with 'role' and 'content'
             metadata: Optional metadata dictionary
-            user_id: Optional user ID (defaults to "vince" - hardcoded)
+            user_id: Optional user ID (defaults to self.user_id from config)
             agent_id: Optional agent ID (defaults to self.agent_id)
             
         Returns:
@@ -452,8 +452,8 @@ class Mem0MemoryManager:
         if not messages:
             return {"results": []}
         
-        # Always use "vince" as user_id (hardcoded) and None for agent_id
-        user_id = "vince"
+        # Use self.user_id from config (passed during initialization)
+        user_id = user_id or self.user_id
         agent_id = None  # Always None for mem0
         
         # Combine metadata
@@ -668,7 +668,7 @@ class Mem0MemoryManager:
         
         Args:
             query: Search query string
-            user_id: Optional user ID (ignored - always uses "vince")
+            user_id: Optional user ID (defaults to self.user_id from config)
             agent_id: Optional agent ID (defaults to self.agent_id)
             limit: Number of results to return (defaults to self.top_k)
             
@@ -679,8 +679,8 @@ class Mem0MemoryManager:
         if not query or not query.strip():
             return []
         
-        # Always use "vince" as user_id (hardcoded)
-        user_id = "vince"
+        # Use self.user_id from config (passed during initialization)
+        user_id = user_id or self.user_id
         # Always use None for agent_id - user memories are stored with agent_id=None
         agent_id = None
         limit = limit or self.top_k
@@ -1023,7 +1023,7 @@ class Mem0MemoryManager:
         
         Args:
             query: The search query
-            user_id: Optional user ID (ignored - always uses "vince")
+            user_id: Optional user ID (defaults to self.user_id from config)
             agent_id: Optional agent ID
             session_id: Optional session ID for provable_policy defense
             defense_type: Optional defense type to check if provable_policy is active
@@ -1031,15 +1031,16 @@ class Mem0MemoryManager:
         Returns:
             Formatted context string with retrieved memories
         """
-        # Always use "vince" as user_id (hardcoded) and None for agent_id
-        memories = self.search(query, user_id="vince", agent_id=None, session_id=session_id, defense_type=defense_type)
+        # Use self.user_id from config (passed during initialization)
+        user_id = user_id or self.user_id
+        memories = self.search(query, user_id=user_id, agent_id=None, session_id=session_id, defense_type=defense_type)
         
         # If we got fewer memories than top_k, try a more aggressive fallback
         # This helps when the query is too specific and doesn't match stored memories well
         if len(memories) < self.top_k:
             try:
                 # Get a sample of all memories as fallback
-                all_memories = self.get_all_memories(user_id="vince", agent_id=None, limit=self.top_k)
+                all_memories = self.get_all_memories(user_id=user_id, agent_id=None, limit=self.top_k)
                 if all_memories:
                     # Use first few memories as fallback context
                     existing_texts = {m.get("memory", "") for m in memories if isinstance(m, dict)}
@@ -1303,7 +1304,7 @@ def get_mem0_memory_context(text: str, session_id: str, memory_config: dict, in_
             return ""
         
         mem0_context = mem0_memory_manager.get_context(
-            text, user_id="vince", session_id=session_id, defense_type=mem0_defense_type
+            text, user_id=mem0_memory_manager.user_id, session_id=session_id, defense_type=mem0_defense_type
         )
         return "\n\n# Relevant Mem0 Memory Context\n" + mem0_context + "\n" if mem0_context else ""
     except Mem0TimeoutError as e:
@@ -1358,7 +1359,7 @@ def index_mem0_memory(text: str, response_text: str, session_id: str, mem0_memor
         result = mem0_memory_manager.add_memory(
             messages=filtered_messages,
             metadata={"session_id": session_id, "type": "conversation", "defense_type": mem0_defense_type},
-            user_id="vince",
+            user_id=mem0_memory_manager.user_id,
             max_memory_length=max_memory_length,
             session_id=session_id,
             defense_type=mem0_defense_type,
@@ -1378,30 +1379,8 @@ def index_mem0_memory(text: str, response_text: str, session_id: str, mem0_memor
 
 
 # ============================================================================
-# Defense Mapping and Test Utilities
+# Test Utilities
 # ============================================================================
-
-def map_unified_defense(unified_defense: str) -> str:
-    """
-    Map unified defense name to mem0 backend-specific defense type.
-    
-    Args:
-        unified_defense: Unified defense name (e.g., "none", "user_prompt_only")
-        
-    Returns:
-        Backend-specific defense type string
-    """
-    # Mem0 uses "no_defense" instead of "none"
-    DEFENSE_MAP = {
-        "disable_memory": "disable_memory",
-        "none": "no_defense",  # Mem0 uses "no_defense" instead of "none"
-        "user_prompt_only": "user_prompt_only",
-        "no_untrusted_tools": "no_untrusted_tools",
-        "limit_memory_length": "limit_memory_length",
-        "provable_policy": "provable_policy",
-    }
-    return DEFENSE_MAP.get(unified_defense, unified_defense)
-
 
 def get_memory_state_for_test(test_dir: Path, config: Dict[str, Any]) -> List[str]:
     """

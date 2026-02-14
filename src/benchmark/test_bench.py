@@ -5,6 +5,7 @@ Test Bench for Email Agent
 - Results are automatically validated and reported
 """
 
+import copy
 import json
 import time
 import shutil
@@ -40,15 +41,16 @@ from agent.utils import load_config, ensure_data_directories, set_global_seeds
 from agent.utils import debug_info, debug_debug, debug_print_exception, debug_print_long_content, set_debug_level, DebugLevel, get_debug_level
 from benchmark.test_validators import create_validator, CompositeValidator
 from agent.utils import get_colored_printer
-from benchmark.benchmark_utils import map_unified_defense_to_backend
 from benchmark.benchmark_utils import (
+    ensure_email_unread,
     get_memory_backend_from_config,
     get_unified_defense_from_config,
     get_result_path,
     should_skip_test,
     determine_attack_type,
     discover_test_files as discover_test_files_util,
-    get_log_path
+    get_log_path,
+    TEST_DIR
 )
 
 # Import in-memory storage
@@ -114,65 +116,24 @@ class TestBench:
         memory_config = self.config.get("memory", {})
         backend_from_config = memory_config.get("backend")
         
-        # Handle no memory backend: if backend is "none"
-        if backend_from_config == "none":
-            self.memory_backend_name = "none"
-            self.memory_backend = None  # No backend when memory is disabled
-            # Respect defense_type_override even when memory_backend is "none"
-            # This allows provable_policy and other defenses to work without memory
-            if defense_type_override is not None:
-                self.unified_defense = defense_type_override
-            else:
-                self.unified_defense = get_unified_defense_from_config(self.config, "none")
-            # Disable all memory backends
-            for backend_name in ["explicit", "mem0", "rag", "context"]:
-                if backend_name not in memory_config:
-                    memory_config[backend_name] = {}
-                memory_config[backend_name]["enabled"] = False
-        else:
-            # Get memory backend from config
-            self.memory_backend_name = get_memory_backend_from_config(self.config)
-            # Note: memory_backend instance is no longer needed - we use functions directly
-            
-            # Get unified defense type
-            if defense_type_override is not None:
-                self.unified_defense = defense_type_override
-                # Update config with override
-                memory_config = self.config.get("memory", {})
-                if self.memory_backend_name == "explicit":
-                    if "explicit_memory" not in memory_config:
-                        memory_config["explicit_memory"] = {}
-                    memory_config["explicit_memory"]["defense_type"] = defense_type_override
-                elif self.memory_backend_name == "mem0":
-                    if "mem0_memory" not in memory_config:
-                        memory_config["mem0_memory"] = {}
-                    memory_config["mem0_memory"]["defense_type"] = defense_type_override
-                elif self.memory_backend_name == "rag":
-                    if "rag_memory" not in memory_config:
-                        memory_config["rag_memory"] = {}
-                    memory_config["rag_memory"]["defense_type"] = defense_type_override
-                elif self.memory_backend_name == "context":
-                    if "context_memory" not in memory_config:
-                        memory_config["context_memory"] = {}
-                    memory_config["context_memory"]["defense_type"] = defense_type_override
-            else:
-                self.unified_defense = get_unified_defense_from_config(self.config, self.memory_backend_name)
+        # Get memory backend from config (set by get_run_config based on CLI args)
+        self.memory_backend_name = backend_from_config or "explicit"
+        self.memory_backend = None  # No longer used - we use functions directly
         
-        # Map unified defense to backend-specific defense
-        if self.memory_backend_name == "none":
-            # No memory backend = no defense
-            self.backend_defense = "none"
+        # Get unified defense type (set by get_run_config, or use override)
+        if defense_type_override is not None:
+            self.unified_defense = defense_type_override
         else:
-            # Use new mapper function
-            self.backend_defense = map_unified_defense_to_backend(self.memory_backend_name, self.unified_defense)
+            self.unified_defense = get_unified_defense_from_config(self.config, self.memory_backend_name)
         
-        # For backward compatibility, maintain old flags
-        memory_config = self.config.get("memory", {})
-        self.explicit_memory_enabled = memory_config.get("explicit_memory", {}).get("enabled", False)
-        mem0_config = memory_config.get("mem0_memory", {})
-        self.mem0_memory_enabled = mem0_config.get("enabled", False)
-        self.mem0_print_enabled = mem0_config.get("mem0_print", False)
-        self.rag_memory_enabled = memory_config.get("rag_memory", {}).get("enabled", False)
+        # Use unified defense name directly (no mapping needed)
+        self.backend_defense = self.unified_defense
+        
+        # Derive enabled flags from memory_backend_name (for backward compatibility)
+        self.explicit_memory_enabled = (self.memory_backend_name == "explicit")
+        self.mem0_memory_enabled = (self.memory_backend_name == "mem0")
+        self.rag_memory_enabled = (self.memory_backend_name == "rag")
+        self.mem0_print_enabled = self.config.get("memory", {}).get("mem0_memory", {}).get("mem0_print", False)
         self.defense_type = self.backend_defense  # For backward compatibility
         
         # Unified results directory structure
@@ -186,9 +147,8 @@ class TestBench:
         # Store default results base dir for attack_bench detection
         self.default_results_base_dir = self.results_base_dir
         
-        # Unified test directory
-        test_dir = benchmark_config.get("test_dir", "data/benchmark/tests")
-        self.test_bench_dir = Path(test_dir)
+        # Unified test directory (hardcoded constant, not configurable)
+        self.test_bench_dir = TEST_DIR
         
         # For backward compatibility (used by some old code paths)
         self.memory_type = self.memory_backend_name
@@ -222,7 +182,7 @@ class TestBench:
             # Check if DSPy is enabled
             benchmark_config = self.config.get("benchmark", {})
             # Check if DSPy is enabled
-            if benchmark_config.get("dspy", {}).get("enabled", True):
+            if benchmark_config.get("dspy", {}).get("enabled", False):
                 self.optimizers["dspy"] = DSPyOptimizer(self.config)
             
             # Check if OpenEvolve is enabled
@@ -334,7 +294,13 @@ class TestBench:
             user_message: User message for this step (if applicable)
             agent_response: Agent response for this step (if applicable)
             mode: Mode identifier ("static" or "adaptive")
+        
+        Note: Only prints when DEBUG_LEVEL=DEBUG (use --debug-level DEBUG to enable)
         """
+        # Only dump environment state when debug level is DEBUG
+        if get_debug_level() != DebugLevel.DEBUG:
+            return
+        
         try:
             in_memory_env = test_config.get("in_memory_environment")
             if not in_memory_env:
@@ -489,13 +455,12 @@ class TestBench:
                     # Build the final user message exactly as it would be sent to the model
                     context_parts = []
                     
-                    # Check for RAG context (if RAG memory is enabled)
+                    # Check for RAG context (if RAG memory backend is active)
                     rag_context = ""
                     memory_config = test_config.get("memory", {})
-                    rag_memory_enabled = memory_config.get("rag_memory", {}).get("enabled", False)
                     rag_defense_type = memory_config.get("rag_memory", {}).get("defense_type", "none")
-                    # Skip RAG context retrieval if no memory backend is enabled
-                    if rag_memory_enabled and self.memory_backend_name != "none" and rag_defense_type != "disable_memory":
+                    # Skip RAG context retrieval if not using RAG backend
+                    if self.memory_backend_name == "rag" and rag_defense_type != "disable_memory":
                         try:
                             from agent.backend.rag_memory import get_rag_memory_manager
                             rag_config = memory_config.get("rag_memory", {})
@@ -555,12 +520,11 @@ class TestBench:
                 from agent.agent_core import _build_agent_prompt
                 
                 memory_config = test_config.get("memory", {})
-                explicit_memory_enabled = memory_config.get("explicit_memory", {}).get("enabled", False)
                 
-                # Load memory instructions if explicit memory is enabled
+                # Load memory instructions if explicit memory backend is active
                 memory_instructions = ""
                 explicit_memory_context = ""
-                if explicit_memory_enabled:
+                if self.memory_backend_name == "explicit":
                     # Find memory_prompt.txt relative to agent_core.py location
                     agent_core_path = Path(__file__).parent.parent / "agent" / "memory_prompt.txt"
                     if agent_core_path.exists():
@@ -696,11 +660,12 @@ class TestBench:
                 else:
                     print(f"Warning: Drafts set '{drafts_set}' not found at {source_drafts}")
             
-            # Add attack emails to inbox (for attack benchmarks)
+            # Add attack emails to inbox (for attack benchmarks).
+            # Use ensure_email_unread so they are always unread for "read unread emails" steps.
             if "attack_emails" in initial_data:
                 attack_emails = initial_data["attack_emails"]
                 for attack_email in attack_emails:
-                    in_memory_env.mailbox.add_email(attack_email, folder="inbox")
+                    in_memory_env.mailbox.add_email(ensure_email_unread(attack_email), folder="inbox")
                     print(f"Added attack email: {attack_email.get('subject', 'No subject')} from {attack_email.get('from', 'Unknown sender')}")
         else:
             # Fallback: copy from original mailbox if it exists
@@ -747,18 +712,10 @@ class TestBench:
             test_config["memory"] = {}
         test_config["memory"]["backend"] = self.memory_backend_name
         
-        # Set backend-specific in-memory vectorstores and paths
+        # Set backend-specific in-memory vectorstores and configs
         if self.memory_backend_name == "none":
-            # No memory backend enabled
-            test_config["memory"]["backend"] = "none"
-            for backend_name in ["explicit", "mem0", "rag", "context"]:
-                if backend_name not in test_config["memory"]:
-                    test_config["memory"][backend_name] = {}
-                test_config["memory"][backend_name]["enabled"] = False
-            for backend_config_key in ["explicit_memory", "mem0_memory", "rag_memory", "context_memory"]:
-                if backend_config_key not in test_config["memory"]:
-                    test_config["memory"][backend_config_key] = {}
-                test_config["memory"][backend_config_key]["enabled"] = False
+            # No memory backend - nothing to set up
+            pass
         elif self.memory_backend_name == "rag":
             if "rag_memory" not in test_config["memory"]:
                 test_config["memory"]["rag_memory"] = {}
@@ -1140,11 +1097,15 @@ class TestBench:
                         continue
                     
                     # Add to in-memory mailbox (required - filesystem storage no longer supported)
+                    # Use a deep copy so that when the agent later marks emails as read (e.g. in
+                    # read_all_emails), the step's attack_email dict is not mutated. Otherwise the
+                    # cached test would get metadata.read=true and the attack email would not appear
+                    # as unread in future runs.
                     try:
                         mailbox = test_config.get("mailbox")
                         if not mailbox:
                             raise ValueError("mailbox is required in test_config")
-                        mailbox.add_email(attack_email, folder="inbox")
+                        mailbox.add_email(copy.deepcopy(attack_email), folder="inbox")
                         
                         print(f"Added attack email: {attack_email.get('subject', 'No subject')} from {attack_email.get('from', 'Unknown sender')}")
                         
@@ -1656,10 +1617,7 @@ class TestBench:
             
             # Add defense info if mem0 is enabled
             if self.mem0_memory_enabled:
-                if self.defense_type == "none":
-                    test_result["defense_type"] = "no_defense"
-                else:
-                    test_result["defense_type"] = self.defense_type
+                test_result["defense_type"] = self.defense_type
             
             # Save result using unified structure
             # Get results base dir for this test (attack_bench uses attack_results)
@@ -2016,21 +1974,23 @@ class TestBench:
                         })
                         continue
                     
-                    # Add to in-memory mailbox (required - filesystem storage no longer supported)
+                    # Add to in-memory mailbox (required - filesystem storage no longer supported).
+                    # Use ensure_email_unread so the email is always unread for "read unread emails" steps.
                     try:
                         mailbox = test_config.get("mailbox")
                         if not mailbox:
                             raise ValueError("mailbox is required in test_config")
-                        mailbox.add_email(attack_email, folder="inbox")
+                        attack_email_copy = ensure_email_unread(attack_email)
+                        mailbox.add_email(attack_email_copy, folder="inbox")
                         
                         print(f"Added attack email: {attack_email.get('subject', 'No subject')} from {attack_email.get('from', 'Unknown sender')}")
                         
-                        # Update state manager with new email
+                        # Update state manager with new email (use copy so state matches mailbox)
                         try:
                             current_state = self.state_manager.get_current_state()
                             if current_state:
                                 # Add email to state's inbox_emails list
-                                current_state.inbox_emails.append(attack_email)
+                                current_state.inbox_emails.append(attack_email_copy)
                         except Exception as e:
                             debug_info("Could not update state manager with new email")
                             debug_print_exception(e, context="Updating state manager with new email", include_traceback=True)
@@ -2274,104 +2234,20 @@ class TestBench:
                                 test_def, optimization_result.optimized_attack_email, attack_email_step_num
                             )
                             
-                            # Re-inject the optimized attack email into the environment
-                            # This ensures the file system and environment state are in sync
-                            self._inject_optimized_attack_email(test_config, optimization_result.optimized_attack_email)
+                            # Run verification on a completely fresh environment: create new env and replay
+                            # steps 0..through_idx (0-based), then run the attack step. This avoids any read/unread
+                            # or state leakage from the previous run (same as scorer does for each candidate).
+                            through_idx = max(0, i - 2)  # 0-based: replay through step i-2 so step i-1 is last replayed
+                            print(f"🔄 Running verification on fresh environment (replay steps 1-{through_idx + 1}, then step {i})...")
+                            test_config, session_id = self._run_steps_on_fresh_environment(
+                                test_def, through_idx, optimization_result.optimized_attack_email
+                            )
+                            print(f"✅ Fresh replay complete; running attack step {i}")
                             
-                            # Update environment state
-                            current_state = self.state_manager.get_current_state()
-                            if current_state:
-                                # Find the attack email in inbox_emails and replace it
-                                # or add it if not found
-                                inbox_emails = current_state.inbox_emails
-                                email_replaced = False
-                                for idx, inbox_email in enumerate(inbox_emails):
-                                    # Match by subject or from address (heuristic)
-                                    if (inbox_email.get("subject") == original_attack_email.get("subject") or
-                                        inbox_email.get("from") == original_attack_email.get("from")):
-                                        inbox_emails[idx] = optimization_result.optimized_attack_email
-                                        email_replaced = True
-                                        break
-                                if not email_replaced:
-                                    # If not found, replace the first attack email or append
-                                    current_state.inbox_emails = [optimization_result.optimized_attack_email] + inbox_emails[1:]
-                            
-                            # CRITICAL FIX: Clear session history to match the fresh state used during scoring
-                            # During optimization, each variant was scored with a fresh session_id like "adaptive_xxx_iter5_var1"
-                            # We need to clear the current session's history to match that fresh state
-                            print(f"Clearing session history for {session_id} to match fresh optimization state")
-                            clear_session_agent(session_id)
-                            
-                            # CRITICAL: Replay steps 1 to (attack_email_step_num-1) to rebuild RAG vectorstore with optimized email
-                            # The scorer replays all steps, so its RAG vectorstore is correct
-                            # We need to do the same here so the RAG vectorstore gets rebuilt with the new optimized email
-                            if attack_email_step_num and attack_email_step_num > 1:
-                                print(f"🔄 Replaying steps 1-{attack_email_step_num-1} to rebuild RAG vectorstore with optimized attack email...")
-                                replay_session_id = f"adaptive_{int(time.time()*1000)}"
-                                
-                                # Initialize replay session as trusted
-                                from agent.agent_core import SessionTrustManager, ProvablePolicyManager
-                                SessionTrustManager.initialize_session(replay_session_id)
-                                ProvablePolicyManager.initialize_session(replay_session_id)
-                                
-                                # Get steps from test_def
-                                test_steps = test_def.get("steps", [])
-                                
-                                # Replay steps up to (but not including) the attack email step
-                                # This matches the scorer's behavior: replay all steps to rebuild RAG vectorstore
-                                for replay_step_num in range(1, attack_email_step_num):
-                                    if replay_step_num - 1 < len(test_steps):
-                                        replay_step = test_steps[replay_step_num - 1]  # Convert to 0-indexed
-                                        replay_step_type = replay_step.get("step_type", "user_message")
-                                        
-                                        if replay_step_type == "start_new_session":
-                                            # Start new session
-                                            old_replay_session = replay_session_id
-                                            replay_session_id = f"adaptive_{int(time.time()*1000)}"
-                                            print(f"   Replay step {replay_step_num}: New session {replay_session_id} (was {old_replay_session})")
-                                            clear_session_agent(old_replay_session)
-                                            SessionTrustManager.initialize_session(replay_session_id)
-                                            ProvablePolicyManager.initialize_session(replay_session_id)
-                                        
-                                        elif replay_step_type == "insert_email":
-                                            # Re-insert regular email (for consistency with scorer)
-                                            email = replay_step.get("email")
-                                            if email:
-                                                mailbox = test_config.get("mailbox")
-                                                if not mailbox:
-                                                    raise ValueError("mailbox is required in test_config")
-                                                mailbox.add_email(email, folder="inbox")
-                                                print(f"   Replay step {replay_step_num}: Re-inserted email '{email.get('subject', 'No subject')}'")
-                                        
-                                        elif replay_step_type == "insert_benign_email":
-                                            # Re-insert benign email (for consistency with scorer)
-                                            benign_email = replay_step.get("benign_email")
-                                            if benign_email:
-                                                mailbox = test_config.get("mailbox")
-                                                if not mailbox:
-                                                    raise ValueError("mailbox is required in test_config")
-                                                mailbox.add_email(benign_email, folder="inbox")
-                                                print(f"   Replay step {replay_step_num}: Re-inserted benign email '{benign_email.get('subject', 'No subject')}'")
-                                        
-                                        elif replay_step_type == "user_message":
-                                            # Run user message step (this triggers agent response and RAG indexing)
-                                            user_msg = replay_step.get("user_message", "")
-                                            if user_msg:
-                                                print(f"   Replay step {replay_step_num}: {user_msg[:50]}...")
-                                                in_memory_env = test_config.get("in_memory_environment")
-                                                invoke_agent(user_msg, replay_session_id, test_config, in_memory_env)
-                                        
-                                        # Note: We skip "insert_attack_email" steps during replay because
-                                        # the optimized attack email has already been injected via _inject_optimized_attack_email
-                                
-                                # Update session_id to the final replay session for the actual step
-                                session_id = replay_session_id
-                                print(f"✅ Replayed steps 1-{attack_email_step_num-1}, RAG vectorstore rebuilt with optimized email")
-                            
-                            # Re-run the step with optimized attack
+                            # Run the attack step (no inject needed; env already has optimized email)
                             step_result = self._run_step_with_attack_check(
-                                step, i, session_id, test_config, 
-                                optimized_attack_email=optimization_result.optimized_attack_email
+                                step, i, session_id, test_config,
+                                optimized_attack_email=None
                             )
                             
                             optimization_used = True
@@ -2759,6 +2635,63 @@ class TestBench:
         
         return None, None
     
+    def _run_steps_on_fresh_environment(
+        self,
+        test_def: Dict[str, Any],
+        through_step_index: int,
+        optimized_attack_email: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], str]:
+        """
+        Create a completely fresh test environment and run steps 0 through through_step_index (0-based, inclusive).
+        Uses optimized_attack_email at the insert_attack_email step. Ensures every evaluation starts from a clean
+        mailbox and RAG (no read/unread or state leakage from previous runs).
+        
+        Returns:
+            (test_config, session_id) after running the steps.
+        """
+        test_name = test_def.get("name", "adaptive_test")
+        initial_data = test_def.get("initial_data", {})
+        # Do not pre-add attack_emails; we add the optimized one at the insert_attack_email step.
+        initial_data_no_attack = {k: v for k, v in initial_data.items() if k != "attack_emails"}
+        
+        fresh_test_config = self.create_test_environment(test_name, initial_data_no_attack or None)
+        session_id = f"adaptive_{int(time.time()*1000)}"
+        from agent.agent_core import SessionTrustManager, ProvablePolicyManager
+        SessionTrustManager.initialize_session(session_id)
+        ProvablePolicyManager.initialize_session(session_id)
+        
+        steps = test_def.get("steps", [])
+        in_memory_env = fresh_test_config.get("in_memory_environment")
+        
+        for step_idx in range(through_step_index + 1):
+            if step_idx >= len(steps):
+                break
+            step = steps[step_idx]
+            step_type = step.get("step_type", "user_message")
+            
+            if step_type == "start_new_session":
+                old_session_id = session_id
+                session_id = f"adaptive_{int(time.time()*1000)}"
+                clear_session_agent(old_session_id)
+                SessionTrustManager.initialize_session(session_id)
+                ProvablePolicyManager.initialize_session(session_id)
+            elif step_type == "insert_attack_email":
+                fresh_test_config["mailbox"].add_email(ensure_email_unread(optimized_attack_email), folder="inbox")
+            elif step_type == "insert_email":
+                email = step.get("email")
+                if email:
+                    fresh_test_config["mailbox"].add_email(email, folder="inbox")
+            elif step_type == "insert_benign_email":
+                benign_email = step.get("benign_email")
+                if benign_email:
+                    fresh_test_config["mailbox"].add_email(benign_email, folder="inbox")
+            elif step_type == "user_message":
+                user_msg = step.get("user_message", "")
+                if user_msg:
+                    invoke_agent(user_msg, session_id, fresh_test_config, in_memory_env)
+        
+        return fresh_test_config, session_id
+    
     def _optimize_attack(self, test_def: Dict[str, Any], failed_step: Dict[str, Any], 
                         step_num: int, session_id: str, test_config: Dict[str, Any]) -> Any:
         """Try different optimization strategies to find a successful attack."""
@@ -2859,7 +2792,9 @@ class TestBench:
     
     def _inject_optimized_attack_email(self, test_config: Dict[str, Any], 
                                      optimized_attack_email: Dict[str, Any]):
-        """Inject optimized attack email into the test environment."""
+        """Inject optimized attack email into the test environment (always unread)."""
+        inject_email = ensure_email_unread(optimized_attack_email)
+        
         # Inject the optimized attack email directly into the mailbox
         mailbox = test_config.get("mailbox")
         if not mailbox:
@@ -2876,8 +2811,7 @@ class TestBench:
         for i, email in enumerate(mailbox.inbox):
             # Replace if it matches the sender (most reliable identifier)
             if email.get("from") == optimized_from:
-                # Replace this email with the optimized version
-                mailbox.inbox[i] = optimized_attack_email.copy()
+                mailbox.inbox[i] = inject_email
                 attack_email_found = True
                 print(f"💾 Replaced attack email in inbox (index {i}) with optimized version")
                 break
@@ -2886,10 +2820,10 @@ class TestBench:
         # or add it if inbox is empty
         if not attack_email_found:
             if len(mailbox.inbox) > 0:
-                mailbox.inbox[0] = optimized_attack_email.copy()
+                mailbox.inbox[0] = inject_email
                 print(f"💾 Replaced first email in inbox with optimized attack email")
             else:
-                mailbox.add_email(optimized_attack_email, folder="inbox")
+                mailbox.add_email(inject_email, folder="inbox")
                 print(f"💾 Added optimized attack email to inbox")
         
         # CRITICAL: Clear the RAG vectorstore when injecting optimized email
@@ -3002,10 +2936,12 @@ class TestBench:
         )
     
     def run_all_tests(self, test_path: str) -> List[Dict[str, Any]]:
-        """Run all tests from the specified path (file or directory)."""
+        """Run all tests from the specified path (file or directory). If path is a directory, all *.json files in it are run."""
         test_files = self.discover_test_files(test_path)
         if not test_files:
             return []
+        # Show actual test path (file or directory) so logs/results location is clear when using --test with a folder
+        print(f"Running tests from: {test_path} ({len(test_files)} file(s))")
         
         # Determine if this is an attack benchmark by checking if test files are in attack_bench directory
         is_attack_bench = False

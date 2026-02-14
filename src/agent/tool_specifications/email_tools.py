@@ -305,7 +305,7 @@ Optional parameters:
 
 Pagination: If the total output would exceed the page size limit, the tool will automatically return a paginated response. You can use offset and limit parameters to read additional pages.
 
-When you read emails using this tool, they are automatically marked as read in the inbox. (NOTE: Currently disabled for testing - emails remain unread)"""
+When you read emails using this tool, unread emails that are returned in the response are automatically marked as read in the inbox."""
     args_schema: type[BaseModel] = ReadAllEmailsInput
     config: Optional[EmailToolsConfig] = None
     
@@ -403,6 +403,9 @@ When you read emails using this tool, they are automatically marked as read in t
                 
                 result = "\n".join(result_lines)
                 
+                # Track which emails will actually be returned (for marking as read)
+                emails_to_mark_read = []
+                
                 # Check if result exceeds page size and needs automatic pagination
                 if limit is None and len(result) > page_size:
                     # Recalculate: how many emails fit in page_size?
@@ -458,6 +461,20 @@ When you read emails using this tool, they are automatically marked as read in t
                         )
                     
                     result = "\n".join(result_lines)
+                    # Track emails that will be returned (for marking as read)
+                    emails_to_mark_read = emails_safe
+                else:
+                    # Normal pagination path - track emails that will be returned
+                    emails_to_mark_read = emails
+                
+                # Mark unread emails as read ONLY for emails that are being returned
+                if emails_to_mark_read and self.config and self.config.mailbox:
+                    for email in emails_to_mark_read:
+                        # Only mark if currently unread
+                        if not email.get("metadata", {}).get("read", False):
+                            email_id = email.get("_email_id")
+                            if email_id:
+                                self.config.mailbox.mark_as_read(email_id, folder="inbox")
             
             # Log tool result
             if self.config and self.config.session_id:

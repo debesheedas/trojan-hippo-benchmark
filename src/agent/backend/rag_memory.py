@@ -8,7 +8,7 @@ Manages defense mechanisms for RAG memory indexing:
 1. disable_memory: Baseline defense that disables all memory indexing
 2. none: No defense (normal RAG execution - all messages indexed)
 3. user_prompt_only: Only index user messages (filter out assistant messages)
-4. limit_chunk_size: Limit chunk sizes to 8 tokens each
+4. limit_memory_length: Limit chunk sizes to 8 tokens each
 5. no_untrusted_tools: Disable RAG indexing for the rest of the session once an
    untrusted tool has been used
 
@@ -57,7 +57,7 @@ class RAGDefenseManager:
                 - "none": No defense (default behavior - all messages indexed)
                 - "disable_memory": Disable all memory indexing
                 - "user_prompt_only": Only index user messages
-                - "limit_chunk_size": Limit chunk sizes to 8 tokens
+                - "limit_memory_length": Limit chunk sizes to configured limit
                 - "no_untrusted_tools": Disable indexing once an untrusted tool
                   has been used in the session
         """
@@ -133,8 +133,8 @@ class RAGDefenseManager:
         Returns:
             Chunk size to use (in characters)
         """
-        # Defense: limit_chunk_size - Limit chunk size to configured limit
-        if self.defense_type == "limit_chunk_size":
+        # Defense: limit_memory_length - Limit chunk size to configured limit
+        if self.defense_type == "limit_memory_length":
             return limit_memory_size
 
         # Other defenses use default chunk size
@@ -432,12 +432,20 @@ def get_rag_memory_manager(
 
 
 def get_rag_memory_context(text: str, session_id: str, memory_config: dict, memory_backend: str, in_memory_env = None) -> str:
-    """Retrieve RAG memory context if enabled."""
+    """Retrieve RAG memory context if RAG backend is active.
+    
+    When in_memory_env is provided, the exact list of retrieved chunk texts is stored in
+    in_memory_env.last_rag_retrieved_chunks (in order) so the benchmark/scorer can use
+    it for RAG chunk analysis feedback instead of simulating chunking.
+    """
+    # RAG is enabled when using the "rag" backend
+    if memory_backend != "rag":
+        return ""
+    
     rag_memory_config = memory_config.get("rag_memory", {})
-    rag_memory_enabled = rag_memory_config.get("enabled", False) or (memory_backend == "rag")
     rag_defense_type = rag_memory_config.get("defense_type", "none")
     
-    if not rag_memory_enabled or rag_defense_type == "disable_memory":
+    if rag_defense_type == "disable_memory":
         return ""
     
     try:
@@ -460,13 +468,19 @@ def get_rag_memory_context(text: str, session_id: str, memory_config: dict, memo
             chunk_size=rag_memory_config.get("chunk_size", 512),
         )
         debug_debug(f"RAG memory manager created with top_k={rag_memory_manager.top_k}", truncate=False)
-        rag_context = rag_memory_manager.get_context(text, session_id=session_id, defense_type=rag_defense_type)
-        if rag_context:
-            debug_debug(f"RAG context retrieved ({len(rag_context)} chars), adding to prompt", truncate=False)
-            return "\n\n# Relevant Memory Context\n" + rag_context + "\n"
-        else:
+        # Retrieve raw chunks so we can store them for exact RAG analysis (and format context ourselves)
+        retrieved_chunks = rag_memory_manager.retrieve(
+            text, top_k=rag_memory_manager.top_k, session_id=session_id, defense_type=rag_defense_type
+        )
+        if in_memory_env is not None and hasattr(in_memory_env, "last_rag_retrieved_chunks"):
+            in_memory_env.last_rag_retrieved_chunks = list(retrieved_chunks) if retrieved_chunks else []
+        if not retrieved_chunks:
             debug_debug("No RAG context retrieved (empty result)", truncate=False)
             return ""
+        context_parts = [f"Memory {i}:\n{chunk}" for i, chunk in enumerate(retrieved_chunks, 1)]
+        rag_context = "\n\n".join(context_parts)
+        debug_debug(f"RAG context retrieved ({len(rag_context)} chars), adding to prompt", truncate=False)
+        return "\n\n# Relevant Memory Context\n" + rag_context + "\n"
     except (OSError, IOError, ValueError, RuntimeError) as e:
         debug_debug(f"Could not retrieve RAG memory context: {e}")
         return ""
@@ -552,30 +566,8 @@ def index_rag_memory(text: str, response_text: str, session_id: str, rag_memory_
 
 
 # ============================================================================
-# Defense Mapping and Test Utilities
+# Test Utilities
 # ============================================================================
-
-def map_unified_defense(unified_defense: str) -> str:
-    """
-    Map unified defense name to RAG backend-specific defense type.
-    
-    Args:
-        unified_defense: Unified defense name (e.g., "none", "user_prompt_only")
-        
-    Returns:
-        Backend-specific defense type string
-    """
-    # RAG uses "limit_chunk_size" instead of "limit_memory_length"
-    DEFENSE_MAP = {
-        "disable_memory": "disable_memory",
-        "none": "none",
-        "user_prompt_only": "user_prompt_only",
-        "no_untrusted_tools": "no_untrusted_tools",
-        "limit_memory_length": "limit_chunk_size",  # RAG uses "limit_chunk_size"
-        "provable_policy": "provable_policy",
-    }
-    return DEFENSE_MAP.get(unified_defense, unified_defense)
-
 
 def get_memory_state_for_test(test_dir, config: Dict[str, Any]) -> List[str]:
     """

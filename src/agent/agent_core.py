@@ -10,16 +10,16 @@ from pydantic import SecretStr
 import tiktoken
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import trim_messages, HumanMessage, AIMessage, SystemMessage
 from agent.tools_registry import create_all_tools, create_email_tools
 from agent.tool_specifications.email_tools import EmailToolsConfig
-from agent.utils import get_timestamp, ensure_data_directories, set_global_seeds, debug_info, debug_debug, debug_print_exception, get_model_context_window
+from agent.utils import get_timestamp, ensure_data_directories, set_global_seeds, debug_info, debug_debug, debug_print_exception, get_model_context_window, get_debug_level, DebugLevel
 from agent.backend.explicit_memory import get_memory_manager, _memory_manager_cache
 from agent.backend.rag_memory import get_rag_memory_context, index_rag_memory
 from agent.backend.mem0_memory import get_mem0_memory_context, index_mem0_memory
 from agent.backend.context_memory import get_context_memory_context, index_context_memory
 from benchmark.benchmark_utils import get_unified_defense_from_config
-from benchmark.benchmark_utils import map_unified_defense_to_backend
 
 load_dotenv()
 _session_store: Dict[str, list] = {}
@@ -368,14 +368,10 @@ def _create_agent_executor(
     memory_config = config.get("memory", {})
     memory_backend = memory_config.get("backend", "explicit")
     
-    if memory_backend == "none":
-        explicit_memory_enabled = False
-        explicit_defense_type = "none"
-        explicit_memory_config = {}
-    else:
-        explicit_memory_config = memory_config.get("explicit_memory", {})
-        explicit_memory_enabled = explicit_memory_config.get("enabled", True)
-        explicit_defense_type = explicit_memory_config.get("defense_type", "none")
+    # Explicit memory is enabled when using the "explicit" backend
+    explicit_memory_enabled = (memory_backend == "explicit")
+    explicit_memory_config = memory_config.get("explicit_memory", {}) if explicit_memory_enabled else {}
+    explicit_defense_type = explicit_memory_config.get("defense_type", "none") if explicit_memory_enabled else "none"
     
     limit_memory_size = config.get("benchmark", {}).get("limit_memory_size_defense", 80)
     
@@ -428,12 +424,37 @@ def _create_agent_executor(
                 print(f"Warning: Model {model_name} does not support temperature. Using minimal config. Error: {e2}")
                 llm = ChatOpenAI(model=model_name, api_key=SecretStr(api_key))
     elif provider == "gemini":
-        raise NotImplementedError(
-            "Gemini models are not yet supported with LangChain integration due to version conflicts. "
-            "Direct API calls via google-genai work (used in adaptive attacks). "
-            "For LangChain agent, please use OpenAI models or install langchain-google-genai manually "
-            "with compatible versions."
-        )
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY is not set")
+        
+        # Build Gemini LLM parameters
+        llm_params = {
+            "model": model_name,
+            "google_api_key": api_key,
+            "temperature": model_config.get("temperature", 0.0),
+        }
+        
+        # Gemini uses max_output_tokens instead of max_tokens
+        max_tokens = model_config.get("max_tokens")
+        if max_tokens is not None:
+            llm_params["max_output_tokens"] = max_tokens
+        
+        # Add top_p if specified
+        top_p = model_config.get("top_p")
+        if top_p is not None:
+            llm_params["top_p"] = top_p
+        
+        try:
+            llm = ChatGoogleGenerativeAI(**llm_params)
+        except (TypeError, ValueError) as e:
+            print(f"Warning: Model {model_name} may not support all parameters. Trying minimal config. Error: {e}")
+            # Try minimal config
+            llm = ChatGoogleGenerativeAI(
+                model=model_name,
+                google_api_key=api_key,
+                temperature=model_config.get("temperature", 0.0),
+            )
     else:
         raise ValueError(f"Unsupported provider: {provider}")
 
@@ -527,9 +548,7 @@ def invoke_agent(text: str, session_id: str, config: dict, in_memory_env) -> Dic
     
     context_memory_config = memory_config.get("context_memory", {}) if not memory_disabled else {}
     context_memory_enabled = (memory_backend == "context") if not memory_disabled else False
-    unified_defense_type = context_memory_config.get("defense_type", "none") if not memory_disabled else "none"
-    # Use new mapper function
-    context_defense_type = map_unified_defense_to_backend("context", unified_defense_type) if not memory_disabled else "none"
+    context_defense_type = context_memory_config.get("defense_type", "none") if not memory_disabled else "none"
     
     session_messages = _get_session_memory(session_id)
     
@@ -541,18 +560,20 @@ def invoke_agent(text: str, session_id: str, config: dict, in_memory_env) -> Dic
     
     is_context_memory_backend = (not memory_disabled and memory_backend == "context")
     
-    # Build user message with context
-    context_parts = [ctx for ctx in [rag_context, mem0_context] if ctx]
+    # Build user message with context (RAG is injected as system message below, not in user message)
+    context_parts = [ctx for ctx in [mem0_context] if ctx]
     if not is_context_memory_backend and context_memory_context:
         context_parts.append(context_memory_context)
     user_message = "".join(context_parts) + text if context_parts else text
     session_messages.append({"role": "user", "content": user_message})
     
     # Build message list for agent
+    # TEMPORARY: RAG context in system message instead of user message (for experimentation)
+    all_messages = session_messages.copy()
+    if rag_context:
+        all_messages = [{"role": "system", "content": rag_context}] + all_messages
     if is_context_memory_backend and context_memory_context:
-        all_messages = [{"role": "system", "content": context_memory_context}] + session_messages.copy()
-    else:
-        all_messages = session_messages.copy()
+        all_messages = [{"role": "system", "content": context_memory_context}] + all_messages
     
     system_prompt_tokens = 5000
     reserved_tokens = system_prompt_tokens + generation_max_length + buffer_tokens
@@ -572,18 +593,56 @@ def invoke_agent(text: str, session_id: str, config: dict, in_memory_env) -> Dic
             original_count = len(all_messages) - 1
         print(f"WARNING: Trimmed messages from {original_count} to {len(messages_for_agent)} messages (max_tokens: {max_tokens_for_all_messages})")
     
+    # DEBUG: Log exact messages sent to the agent (system prompt is set at agent creation, not in this list)
+    if get_debug_level() == DebugLevel.DEBUG:
+        import sys
+        print("\n--- MESSAGES SENT TO AGENT (DEBUG) ---", flush=True)
+        print("Note: System prompt is fixed at agent creation (email assistant guidelines + tools). It is NOT in the list below.", flush=True)
+        for idx, msg in enumerate(messages_for_agent):
+            role = msg.get("role", "?")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = str(content)
+            print(f"\nMessage {idx + 1} [role={role}] (length={len(content)} chars):", flush=True)
+            print(content, flush=True)
+            print("---", flush=True)
+        print("--- END MESSAGES SENT TO AGENT ---\n", flush=True)
+        sys.stdout.flush()
+    
     # Invoke agent and extract response
     result = agent.invoke({"messages": messages_for_agent})
+    
+    # Helper to normalize content that may be a list (Gemini format) or string (OpenAI format)
+    def normalize_content(content):
+        """Extract text from content that may be string or list of content blocks."""
+        if isinstance(content, str):
+            return content
+        elif isinstance(content, list):
+            # Gemini returns list of content blocks like [{'type': 'text', 'text': '...', 'extras': {...}}]
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    # Try 'text' field first (Gemini format with type='text')
+                    if 'text' in block:
+                        text_parts.append(block['text'])
+                    # Fallback to 'content' field if present
+                    elif 'content' in block:
+                        text_parts.append(str(block['content']))
+                elif isinstance(block, str):
+                    text_parts.append(block)
+            return '\n'.join(text_parts) if text_parts else str(content)
+        else:
+            return str(content) if content else ""
     
     # Extract response text from result
     response_text = ""
     if isinstance(result, dict) and "messages" in result:
         for message in reversed(result["messages"]):
             if isinstance(message, dict) and message.get("role") == "assistant":
-                response_text = message.get("content", "")
+                response_text = normalize_content(message.get("content", ""))
                 break
             elif hasattr(message, 'content') and hasattr(message, '__class__') and 'AI' in message.__class__.__name__:
-                response_text = getattr(message, 'content', '')
+                response_text = normalize_content(getattr(message, 'content', ''))
                 break
     else:
         response_text = str(result)

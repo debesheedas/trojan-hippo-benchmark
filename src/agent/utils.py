@@ -215,6 +215,10 @@ def _get_model_context_windows() -> Dict[str, int]:
         "o1-mini": 200000,
         "claude-3-7-sonnet": 200000,
         "gemini-2.0-flash": 1000000,
+        "gemini-3-pro-preview": 1000000,
+        "gemini-2.5-pro": 1000000,
+        "gemini-3-flash": 1000000,
+        "gemini-2.5-flash": 1000000,
     }
 
 
@@ -229,6 +233,8 @@ def _get_api_token_limits() -> Dict[str, int]:
         "o1-mini": 200000,
         "claude-3-7-sonnet": 200000,
         "gemini-2.0-flash": 1000000,
+        "gemini-3-pro-preview": 1000000,
+        "gemini-3-flash": 1000000,
     }
 
 

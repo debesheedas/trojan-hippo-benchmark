@@ -410,9 +410,7 @@ def get_context_memory_context(text: str, session_id: str, model_name: str, memo
     This is set by test_bench when memory_backend="context" is specified.
     """
     context_memory_config = memory_config.get("context_memory", {})
-    unified_defense_type = context_memory_config.get("defense_type", "none")
-    # Use local mapper function (avoid circular import)
-    context_defense_type = map_unified_defense(unified_defense_type)
+    context_defense_type = context_memory_config.get("defense_type", "none")
     
     # Check defense type first
     if context_defense_type == "disable_memory":
@@ -472,33 +470,8 @@ def index_context_memory(text: str, response_text: str, session_id: str, model_n
 
 
 # ============================================================================
-# Defense Mapping and Test Utilities
+# Test Utilities
 # ============================================================================
-
-def map_unified_defense(unified_defense: str) -> str:
-    """
-    Map unified defense name to context backend-specific defense type.
-    
-    Args:
-        unified_defense: Unified defense name (e.g., "none", "user_prompt_only")
-        
-    Returns:
-        Backend-specific defense type string
-        
-    Note:
-        limit_memory_length is NOT applicable for context backend.
-    """
-    # Context uses the same names as unified defenses, except limit_memory_length is not applicable
-    DEFENSE_MAP = {
-        "disable_memory": "disable_memory",
-        "none": "none",
-        "user_prompt_only": "user_prompt_only",
-        "no_untrusted_tools": "no_untrusted_tools",
-        "provable_policy": "provable_policy",
-        # limit_memory_length is NOT included - not applicable for context
-    }
-    return DEFENSE_MAP.get(unified_defense, unified_defense)
-
 
 def get_memory_state_for_test(test_dir, config: Dict[str, Any]) -> List[str]:
     """

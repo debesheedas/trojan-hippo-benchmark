@@ -11,15 +11,11 @@ import shutil
 import copy
 from pathlib import Path
 from typing import Dict, Any, Optional, List
-from agent.utils import load_config
+from agent.utils import load_config, detect_provider
 
-# Import mapping functions from backend files
-from agent.backend.explicit_memory import map_unified_defense as explicit_map_defense
-from agent.backend.mem0_memory import map_unified_defense as mem0_map_defense
-from agent.backend.rag_memory import map_unified_defense as rag_map_defense
-from agent.backend.context_memory import map_unified_defense as context_map_defense
-
-# Old defense_backend.py has been removed - mapping functions are now in backend files
+# Hardcoded test directory (unified test location)
+# This is a project structure constant - not configurable via config files
+TEST_DIR = Path("data/benchmark/tests")
 
 # Unified defense names (used in config and CLI)
 # Note: To disable memory, use memory_backend="none" (no defense type needed)
@@ -59,33 +55,17 @@ def is_valid_combination(memory_backend: str, unified_defense: str) -> bool:
     return True
 
 
-def map_unified_defense_to_backend(memory_backend: str, unified_defense: str) -> str:
+def ensure_email_unread(email: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Map unified defense name to backend-specific defense type.
-    
-    This is a simple mapper that routes to the correct backend's mapping function.
-    
-    Args:
-        memory_backend: Memory backend name ("explicit", "mem0", "rag", "context", or "none")
-        unified_defense: Unified defense name (e.g., "none", "user_prompt_only")
-        
-    Returns:
-        Backend-specific defense type string
+    Return a deep copy of the email with metadata.read = False.
+    Use whenever adding an attack email to the mailbox so that
+    "read unread emails" steps see it regardless of prior state.
     """
-    if memory_backend == "none":
-        # For "none" backend, use unified defense name directly
-        return unified_defense
-    elif memory_backend == "explicit":
-        return explicit_map_defense(unified_defense)
-    elif memory_backend == "mem0":
-        return mem0_map_defense(unified_defense)
-    elif memory_backend == "rag":
-        return rag_map_defense(unified_defense)
-    elif memory_backend == "context":
-        return context_map_defense(unified_defense)
-    else:
-        # Unknown backend - return as-is
-        return unified_defense
+    out = copy.deepcopy(email)
+    if "metadata" not in out:
+        out["metadata"] = {}
+    out["metadata"]["read"] = False
+    return out
 
 
 def _get_result_path_components(
@@ -100,36 +80,41 @@ def _get_result_path_components(
     This is shared logic used by both get_result_path() and get_results_dir().
     
     Args:
-        memory_backend: Memory backend name ("explicit", "mem0", "rag", or "none")
-        unified_defense: Unified defense name (e.g., "none", "disable_memory")
+        memory_backend: Memory backend name ("explicit", "mem0", "rag", "context", or "none")
+        unified_defense: Unified defense name (e.g., "none", "user_prompt_only")
         model_name: Model name (e.g., "gpt-5-mini")
         attack_type: Attack type (utility suite name or attack_type from test_def for attack_bench)
         
     Returns:
         Tuple of (backend_for_path, defense_folder)
     """
-    # Treat "none" memory backend like any other backend - use the actual defense type
-    backend_for_path = memory_backend
-    
-    # Map unified defense to backend-specific defense type
-    # For "none" backend, defenses still work (e.g., provable_policy), so we need to map them
-    # Since "none" backend doesn't have a registered defense backend, we'll use the unified name directly
-    if memory_backend == "none":
-        # For "none" backend, use unified defense name directly (defenses like provable_policy work without memory)
-        defense_folder = unified_defense
-    else:
-        # Use new mapper function
-        backend_defense = map_unified_defense_to_backend(memory_backend, unified_defense)
-        
-        # Normalize defense folder name to unified name for consistency
-        # All backends should use "none" for no defense, regardless of backend-specific name
-        # (mem0 internally uses "no_defense", but folder should be "none" for consistency)
-        if unified_defense == "none" or backend_defense in ["none", "no_defense"]:
-            defense_folder = "none"
-        else:
-            defense_folder = backend_defense
-    
-    return backend_for_path, defense_folder
+    # Use unified defense name directly - no mapping needed
+    return memory_backend, unified_defense
+
+
+# Base segment for attack_bench in paths (used to detect and parse suite subfolder)
+ATTACK_BENCH_SEGMENT = "attack_bench"
+
+
+def get_attack_bench_suite_subfolder(test_file: Path) -> Optional[str]:
+    """
+    If the test file lives under attack_bench/<backend>/<subfolder>/file.json,
+    return <subfolder> (the test case suite name). Otherwise return None.
+
+    Examples:
+      attack_bench/rag/00_exfiltrate.json -> None (flat)
+      attack_bench/rag/persistent_exfiltrate_tax/00_persistent_exfiltrate_tax.json -> "persistent_exfiltrate_tax"
+    """
+    parts = test_file.resolve().parts
+    if ATTACK_BENCH_SEGMENT not in parts:
+        return None
+    idx = parts.index(ATTACK_BENCH_SEGMENT)
+    # After attack_bench: [backend, ...rest]
+    rest = parts[idx + 2:]  # skip "attack_bench" and backend
+    if len(rest) <= 1:
+        return None  # file is directly under backend (flat)
+    # rest is [suite_dir, filename] -> suite = suite_dir
+    return rest[0]
 
 
 def get_result_path(
@@ -169,14 +154,25 @@ def get_result_path(
     is_attack_results = "attack_results" in results_base_dir_str
     
     if is_attack_bench or is_attack_results:
-        # For attack_bench tests or attack_results, skip the attack_type folder (all are indirect attacks)
-        result_path = (
-            results_base_dir /
-            model_name /
-            backend_for_path /
-            defense_folder /
-            test_file.name
-        )
+        # For attack_bench tests or attack_results: add optional suite subfolder when test is under attack_bench/<backend>/<suite>/
+        suite_subfolder = get_attack_bench_suite_subfolder(test_file)
+        if suite_subfolder:
+            result_path = (
+                results_base_dir /
+                model_name /
+                backend_for_path /
+                defense_folder /
+                suite_subfolder /
+                test_file.name
+            )
+        else:
+            result_path = (
+                results_base_dir /
+                model_name /
+                backend_for_path /
+                defense_folder /
+                test_file.name
+            )
     else:
         # Construct path: results/{model_name}/{memory_backend}/{defense_folder}/{attack_type}/{test_file_name}.json
         result_path = (
@@ -234,14 +230,25 @@ def get_log_path(
     is_attack_logs = "attack_logs" in logs_base_dir_str
     
     if is_attack_bench or is_attack_logs:
-        # For attack_bench tests, skip the attack_type folder (all are indirect attacks)
-        log_path = (
-            logs_base_dir /
-            model_name /
-            backend_for_path /
-            defense_folder /
-            test_file.with_suffix('.log').name
-        )
+        # For attack_bench tests: add optional suite subfolder when test is under attack_bench/<backend>/<suite>/
+        suite_subfolder = get_attack_bench_suite_subfolder(test_file)
+        if suite_subfolder:
+            log_path = (
+                logs_base_dir /
+                model_name /
+                backend_for_path /
+                defense_folder /
+                suite_subfolder /
+                test_file.with_suffix('.log').name
+            )
+        else:
+            log_path = (
+                logs_base_dir /
+                model_name /
+                backend_for_path /
+                defense_folder /
+                test_file.with_suffix('.log').name
+            )
     else:
         # Construct path: logs/{model_name}/{memory_backend}/{defense_folder}/{attack_type}/{test_file_name}.log
         # Use "unknown" if attack_type is still None or empty
@@ -400,53 +407,27 @@ def should_skip_test(
 
 def get_memory_backend_from_config(config: Dict[str, Any]) -> str:
     """
-    Determine memory backend from config.
+    Get memory backend from config.
+    
+    The backend is always set by get_run_config() based on CLI --memory-backend arg.
     
     Args:
-        config: Configuration dictionary
+        config: Configuration dictionary (with memory.backend set by get_run_config)
         
     Returns:
-        Memory backend name ("explicit", "mem0", "rag", "context", or "none" if all disabled)
+        Memory backend name ("explicit", "mem0", "rag", "context", or "none")
     """
-    memory_config = config.get("memory", {})
-    
-    # Check for explicit backend setting
-    backend = memory_config.get("backend")
-    if backend:
-        # If backend is explicitly set to "none", return it
-        if backend == "none":
-            return "none"
-        return backend
-    
-    # Fallback: detect from enabled flags
-    if memory_config.get("explicit_memory", {}).get("enabled", False):
-        return "explicit"
-    elif memory_config.get("mem0_memory", {}).get("enabled", False):
-        return "mem0"
-    elif memory_config.get("rag_memory", {}).get("enabled", False):
-        return "rag"
-    elif memory_config.get("context_memory", {}).get("enabled", False):
-        return "context"
-    
-    # Check if all backends are explicitly disabled
-    explicit_disabled = memory_config.get("explicit_memory", {}).get("enabled") is False
-    mem0_disabled = memory_config.get("mem0_memory", {}).get("enabled") is False
-    rag_disabled = memory_config.get("rag_memory", {}).get("enabled") is False
-    context_disabled = memory_config.get("context_memory", {}).get("enabled") is False
-    
-    if explicit_disabled and mem0_disabled and rag_disabled and context_disabled:
-        return "none"
-    
-    # Default to explicit if nothing is explicitly set
-    return "explicit"
+    return config.get("memory", {}).get("backend", "explicit")
 
 
 def get_unified_defense_from_config(config: Dict[str, Any], memory_backend: str) -> str:
     """
     Get unified defense type from config.
     
+    The defense type is always set by get_run_config() based on CLI --defense-type arg.
+    
     Args:
-        config: Configuration dictionary
+        config: Configuration dictionary (with defense_type set by get_run_config)
         memory_backend: Memory backend name
         
     Returns:
@@ -454,38 +435,34 @@ def get_unified_defense_from_config(config: Dict[str, Any], memory_backend: str)
     """
     memory_config = config.get("memory", {})
     
-    # Get defense from backend-specific config
-    if memory_backend == "none":
-        # For "none" backend, defense_type is stored at top level of memory config
-        defense = memory_config.get("defense_type", "none")
-    elif memory_backend == "explicit":
-        defense = memory_config.get("explicit_memory", {}).get("defense_type", "none")
-    elif memory_backend == "mem0":
-        defense = memory_config.get("mem0_memory", {}).get("defense_type", "none")
-    elif memory_backend == "rag":
-        defense = memory_config.get("rag_memory", {}).get("defense_type", "none")
-    elif memory_backend == "context":
-        defense = memory_config.get("context_memory", {}).get("defense_type", "none")
-    else:
-        defense = "none"
+    # Backend-specific config key mapping
+    backend_config_key = {
+        "none": None,  # defense_type stored at top level for "none" backend
+        "explicit": "explicit_memory",
+        "mem0": "mem0_memory",
+        "rag": "rag_memory",
+        "context": "context_memory",
+    }.get(memory_backend)
     
-    # Normalize: mem0 uses "no_defense" but we want unified "none"
-    if memory_backend == "mem0" and defense == "no_defense":
-        return "none"
+    # Get defense from appropriate location
+    if backend_config_key is None:
+        defense = memory_config.get("defense_type", "none")
+    else:
+        defense = memory_config.get(backend_config_key, {}).get("defense_type", "none")
     
     return defense
 
 
 def discover_test_files(
     test_path: str,
-    test_dir: Path,
+    test_dir: Optional[Path] = None,
     verbose: bool = False
 ) -> List[Path]:
     """
     Intelligently discover test files from a path.
     
     Handles:
-    - Suite keywords (memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory) -> maps to test_dir/{suite}/
+    - Suite keywords (memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory) -> maps to TEST_DIR/{suite}/
     - File paths -> returns single file if JSON
     - Directory paths -> finds all JSON files recursively
     
@@ -494,12 +471,14 @@ def discover_test_files(
     
     Args:
         test_path: Path string (file, directory, or suite name)
-        test_dir: Base test directory (e.g., Path("data/benchmark/tests"))
+        test_dir: Base test directory (defaults to TEST_DIR constant)
         verbose: If True, print warnings when paths not found
         
     Returns:
         List of test file paths (sorted)
     """
+    if test_dir is None:
+        test_dir = TEST_DIR
     
     # Handle suite keywords
     suite_keywords = {"memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"}
@@ -657,10 +636,12 @@ def prepare_benchmark_config(
         pass
     
     # Set target model name (command line arg takes precedence over config)
+    # When overriding model, also set provider so the correct API is used (e.g. gpt-4o-mini -> OpenAI, gemini-* -> Gemini)
     if target_model_name:
         if "agent" not in config:
             config["agent"] = {}
         config["agent"]["target_model_name"] = target_model_name
+        config["agent"]["provider"] = detect_provider(target_model_name)
     elif "agent" not in config or "target_model_name" not in config.get("agent", {}):
         # If no agent config was loaded and no target_model_name provided, raise error
         raise ValueError(
@@ -668,64 +649,31 @@ def prepare_benchmark_config(
             "or provide target_model_name argument to specify target_model_name."
         )
     
-    # Handle no memory backend: disable all backends
+    # Set memory backend and defense type in config
+    if "memory" not in config:
+        config["memory"] = {}
+    config["memory"]["backend"] = memory_backend
+    
+    # Set defense type in the appropriate location
     if memory_backend == "none":
-        if "memory" not in config:
-            config["memory"] = {}
-        # Disable all memory backends
-        for backend_name in ["explicit", "mem0", "rag", "context"]:
-            if backend_name not in config["memory"]:
-                config["memory"][backend_name] = {}
-            config["memory"][backend_name]["enabled"] = False
-        # Set backend to "none" in config
-        config["memory"]["backend"] = "none"
         # Store defense_type at top level for "none" backend (needed for provable_policy defense)
-        # This allows defenses to work even when memory is disabled
         config["memory"]["defense_type"] = unified_defense
     else:
-        # Set memory backend in config
-        if "memory" not in config:
-            config["memory"] = {}
-        config["memory"]["backend"] = memory_backend
+        # Map unified defense to backend-specific defense and store in backend config
+        backend_config_key = {
+            "explicit": "explicit_memory",
+            "mem0": "mem0_memory",
+            "rag": "rag_memory",
+            "context": "context_memory",
+        }.get(memory_backend, f"{memory_backend}_memory")
         
-        # Enable the specified backend and disable others
-        for backend_name in ["explicit", "mem0", "rag", "context"]:
-            # Ensure nested structure exists
-            if backend_name not in config["memory"]:
-                config["memory"][backend_name] = {}
-            elif config["memory"][backend_name] is None:
-                config["memory"][backend_name] = {}
-            
-            # Handle backend-specific naming (explicit_memory vs explicit, mem0_memory vs mem0, etc.)
-            backend_config_key = backend_name
-            if backend_name == "explicit":
-                backend_config_key = "explicit_memory"
-            elif backend_name == "mem0":
-                backend_config_key = "mem0_memory"
-            elif backend_name == "rag":
-                backend_config_key = "rag_memory"
-            elif backend_name == "context":
-                backend_config_key = "context_memory"
-            
-            # Ensure backend-specific config exists and is a dict (not None)
-            if backend_config_key not in config["memory"]:
-                config["memory"][backend_config_key] = {}
-            elif config["memory"][backend_config_key] is None:
-                config["memory"][backend_config_key] = {}
-            
-            if backend_name == memory_backend:
-                # Enable both the generic key and the specific key
-                config["memory"][backend_name]["enabled"] = True
-                config["memory"][backend_config_key]["enabled"] = True
-                # Set defense type (map unified to backend-specific)
-                # Use new mapper function
-                backend_defense = map_unified_defense_to_backend(memory_backend, unified_defense)
-                config["memory"][backend_name]["defense_type"] = backend_defense
-                config["memory"][backend_config_key]["defense_type"] = backend_defense
-            else:
-                # Disable both keys
-                config["memory"][backend_name]["enabled"] = False
-                config["memory"][backend_config_key]["enabled"] = False
+        # Ensure backend-specific config exists
+        if backend_config_key not in config["memory"]:
+            config["memory"][backend_config_key] = {}
+        elif config["memory"][backend_config_key] is None:
+            config["memory"][backend_config_key] = {}
+        
+        config["memory"][backend_config_key]["defense_type"] = unified_defense
     
     # Set results directory (command line arg takes precedence, default if not provided)
     if results_base_dir is None:

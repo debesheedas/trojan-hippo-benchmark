@@ -30,7 +30,8 @@ from benchmark.benchmark_utils import (
     determine_attack_type,
     discover_test_files,
     prepare_benchmark_config,
-    UNIFIED_DEFENSE_TYPES
+    UNIFIED_DEFENSE_TYPES,
+    TEST_DIR
 )
 from benchmark.test_bench import TestBench
 
@@ -122,14 +123,9 @@ def run_benchmark(
     # Get results_base_dir from config (in case it was set to default)
     results_base_dir = Path(config["benchmark"]["results_dir"])
     
-    # Set test directory
-    benchmark_config = config.get("benchmark", {})
-    test_dir = Path(benchmark_config.get("test_dir", "data/benchmark/tests"))
-    
-    # Get test files
+    # Get test files (uses TEST_DIR constant by default)
     test_files = discover_test_files(
         test_path=test_path,
-        test_dir=test_dir,
         verbose=False
     )
     if not test_files:
@@ -142,10 +138,19 @@ def run_benchmark(
             "tests_failed": 0
         }
     
+    model_name = config.get("agent", {}).get("target_model_name", "unknown")
+    is_attack_bench = "attack_bench" in str(test_files[0])
+    logs_folder = "attack_logs" if is_attack_bench else "logs"
+    logs_dir = Path("data/benchmark") / logs_folder / model_name / memory_backend / unified_defense
+    test_path_is_dir = Path(test_path).is_dir() if Path(test_path).exists() else (len(test_files) > 1)
+    if test_path_is_dir:
+        print(f"Test path: {test_path} (directory with {len(test_files)} test file(s))")
+    else:
+        print(f"Test path: {test_path} ({len(test_files)} test file(s))")
+    print(f"Logs will be written to: {logs_dir.resolve()}")
     print(f"Found {len(test_files)} test file(s)")
     
     # Check if all results exist
-    model_name = config.get("agent", {}).get("target_model_name", "unknown")
     all_exist, missing = check_results_exist(
         memory_backend,
         unified_defense,
@@ -181,7 +186,8 @@ def run_benchmark(
         total_tests = len(results)
         passed_tests = sum(1 for r in results if r.get("overall_success", False))
         failed_tests = total_tests - passed_tests
-        
+
+        print(f"\nLog files written to: {logs_dir.resolve()}")
         return {
             "success": True,
             "memory_backend": memory_backend,
@@ -294,13 +300,12 @@ def _run_single_combination(
     memory_backend, unified_defense, test_path, config_path, force, results_base_dir, logs_base_dir, target_model_name = args_tuple
     
     # Determine attack type from test_path (needed for result paths)
-    test_dir = Path("data/benchmark/tests")
     if isinstance(test_path, str):
         if test_path in ["memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"]:
             attack_type = test_path
         else:
             # Try to determine from path
-            test_file = test_dir / test_path
+            test_file = TEST_DIR / test_path
             if test_file.exists():
                 attack_type = determine_attack_type(test_file, {})
             else:
@@ -864,7 +869,7 @@ Examples:
     parser.add_argument(
         "--test",
         type=str,
-        help="Path to specific test file"
+        help="Path to a test file or directory. If a directory, all *.json files in it are run (e.g. data/benchmark/attack_bench/rag/persistent_exfiltrate_tax). Logs go to data/benchmark/attack_logs/ for attack_bench or data/benchmark/logs/ for utility tests."
     )
     
     parser.add_argument(
