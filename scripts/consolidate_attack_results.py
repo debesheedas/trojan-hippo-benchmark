@@ -6,8 +6,8 @@ Consolidates results from the attack benchmark (data/benchmark/attack_results)
 into CSV tables and visualizations. Logs are read from data/benchmark/attack_logs
 when available.
 
-Currently supports a single suite: persistent_exfiltrate_tax. The script can be
-extended when more attack suites are added.
+Discovers attack suites from the results directory (model/backend/defense/suite/)
+and only generates CSVs and plots for suites that have result files present.
 
 Usage:
     python scripts/consolidate_attack_results.py
@@ -49,13 +49,6 @@ from benchmark.benchmark_utils import (
 # Constants
 MEMORY_BACKENDS = ["none", "explicit", "mem0", "rag", "context"]
 BACKEND_LABELS = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
-
-# Attack suites (train test case results are skipped via TRAIN_STEM_MARKER)
-ATTACK_SUITES = [
-    "persistent_exfiltrate_tax",
-    "persistent_exfiltrate_health",
-    "persistent_exfiltrate_passport",
-]
 
 # Default paths for attack benchmark
 DEFAULT_RESULTS_DIR = Path("data/benchmark/attack_results")
@@ -252,6 +245,40 @@ def discover_models(results_base_dir: Path) -> List[str]:
         if model_dir.is_dir():
             models.append(model_dir.name)
     return sorted(models)
+
+
+def discover_suites(results_base_dir: Path, model_name: str) -> List[str]:
+    """
+    Discover attack suite names that actually have result files under this model.
+    Scans the results directory structure and returns only suites that have at least
+    one non-train result JSON file. This ensures we only generate CSVs/plots for
+    suites that exist in the results folder.
+    """
+    suites = set()
+    for defense_type in UNIFIED_DEFENSE_TYPES:
+        for backend in MEMORY_BACKENDS:
+            if not is_valid_combination(backend, defense_type):
+                continue
+            results_dir = results_base_dir / model_name / backend / defense_type
+            if not results_dir.exists():
+                continue
+            # New layout: result files in results_dir/suite_name/*.json
+            for subdir in results_dir.iterdir():
+                if subdir.is_dir():
+                    suite_name = subdir.name
+                    for p in subdir.glob("*.json"):
+                        if suite_name in p.stem and TRAIN_STEM_MARKER not in p.stem:
+                            suites.add(suite_name)
+                            break
+            # Legacy layout: result files directly in results_dir/*.json
+            for p in results_dir.glob("*.json"):
+                if TRAIN_STEM_MARKER in p.stem:
+                    continue
+                # Stem e.g. "01_persistent_exfiltrate_tax" -> suite "persistent_exfiltrate_tax"
+                parts = p.stem.split("_", 1)
+                if len(parts) >= 2:
+                    suites.add(parts[1])
+    return sorted(suites)
 
 
 def collect_all_data(
@@ -807,13 +834,11 @@ def main() -> int:
         return 1
 
     models_to_process = [args.model] if args.model else all_models
-    suites_to_process = ATTACK_SUITES  # single suite for now
 
     print(f"\n{'='*80}")
     print("Consolidating Attack Results")
     print(f"{'='*80}")
     print(f"Models: {', '.join(models_to_process)}")
-    print(f"Suites: {', '.join(suites_to_process)}")
     print(f"Results: {results_base_dir}")
     print(f"Logs: {logs_base_dir}")
     print(f"Output: {output_dir}")
@@ -824,6 +849,11 @@ def main() -> int:
     error_summaries = []
 
     for model_name in models_to_process:
+        suites_to_process = discover_suites(results_base_dir, model_name)
+        if not suites_to_process:
+            print(f"Skipping {model_name}: no attack suites found in results")
+            continue
+        print(f"Suites for {model_name}: {', '.join(suites_to_process)}")
         all_suites_data = {}
 
         for suite_name in suites_to_process:

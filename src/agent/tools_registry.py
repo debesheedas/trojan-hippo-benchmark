@@ -3,7 +3,7 @@ Unified tools registry for the memory agent.
 Provides a single entry point for all agent tools (email and memory).
 """
 
-from typing import List, Optional, Set
+from typing import Any, List, Optional, Set
 from langchain.tools import BaseTool
 
 from agent.tool_specifications.email_tools import EmailToolsConfig, create_tools
@@ -114,28 +114,31 @@ def create_all_tools(
     session_id: Optional[str] = None,
     explicit_defense_type: str = "none",
     limit_memory_size: int = 80,
+    explicit_memory_manager: Optional[Any] = None,
 ) -> List[BaseTool]:
     """
     Create and return all available tools for the agent (in-memory only).
-    
+
     Args:
         email_config: EmailToolsConfig instance with in-memory mailbox and trace_store
         session_id: Optional session ID for tracing
         explicit_defense_type: Defense type for explicit memory
         limit_memory_size: Maximum characters for limit_memory_length defense
-    
+        explicit_memory_manager: Optional per-run MemoryManager (benchmark); if None, tools use global
+
     Returns:
         List of all configured tools (email + memory)
     """
     # Create email tools
     email_tools = create_tools(email_config)
-    
+
     # Create memory tools (pass trace_store from email_config for consistency)
     memory_tools = create_memory_tools(
         session_id=session_id,
         trace_store=email_config.trace_store,
         explicit_defense_type=explicit_defense_type,
-        limit_memory_size=limit_memory_size
+        limit_memory_size=limit_memory_size,
+        explicit_memory_manager=explicit_memory_manager,
     )
     
     # Combine all tools

@@ -65,7 +65,7 @@ except ImportError:
 class TestBench:
     """Test bench for email agent."""
     
-    def __init__(self, config_path: Optional[str] = None, config: Optional[Dict[str, Any]] = None, defense_type_override: Optional[str] = None, force: bool = False, logs_base_dir: Optional[Path] = None):
+    def __init__(self, config_path: Optional[str] = None, config: Optional[Dict[str, Any]] = None, defense_type_override: Optional[str] = None, force: bool = False, adaptive: bool = False, logs_base_dir: Optional[Path] = None):
         """
         Initialize TestBench.
         
@@ -74,6 +74,7 @@ class TestBench:
             config: Config dictionary (mutually exclusive with config_path)
             defense_type_override: Override defense type from config
             force: Force overwrite existing results
+            adaptive: Run in adaptive benchmark mode (optimize attacks when static fails)
             logs_base_dir: Base directory for logs (defaults to data/benchmark/logs)
         """
         if config_path is not None and config is not None:
@@ -169,8 +170,8 @@ class TestBench:
         self.cache_dir = Path("data/benchmark/attack_bench_cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
-        # Check if adaptive benchmark is enabled
-        self.adaptive_enabled = self.config.get("benchmark", {}).get("enable_adaptive_benchmark", False)
+        # Adaptive mode is set by --adaptive flag (run_benchmark.py or test_bench.py CLI)
+        self.adaptive_enabled = adaptive
         if self.adaptive_enabled:
             # Import adaptive components only when needed
             from benchmark.adaptive_attacks import DSPyOptimizer, OpenEvolveOptimizer
@@ -530,10 +531,12 @@ class TestBench:
                     if agent_core_path.exists():
                         memory_instructions = agent_core_path.read_text(encoding="utf-8")
                     
-                    # Try to load explicit memory context
+                    # Use per-run manager from config when available (benchmark); else global fallback
                     try:
-                        from agent.backend.explicit_memory import get_memory_manager
-                        memory_manager = get_memory_manager()
+                        memory_manager = (memory_config.get("explicit_memory") or {}).get("manager")
+                        if memory_manager is None:
+                            from agent.backend.explicit_memory import get_memory_manager
+                            memory_manager = get_memory_manager()
                         explicit_memory_context = memory_manager.get_long_term_as_text()
                     except Exception:
                         explicit_memory_context = ""
@@ -761,7 +764,12 @@ class TestBench:
             if "explicit_memory" not in test_config["memory"]:
                 test_config["memory"]["explicit_memory"] = {}
             test_config["memory"]["explicit_memory"]["defense_type"] = self.backend_defense
-        
+            # Per-run explicit memory (like inbox): each run has its own MemoryManager, no global singleton
+            from agent.backend.explicit_memory import MemoryManager
+            explicit_manager = MemoryManager()
+            in_memory_env.explicit_manager = explicit_manager
+            test_config["memory"]["explicit_memory"]["manager"] = explicit_manager
+
         print(f"Created in-memory test environment: {test_name} (completely in-memory, no file I/O)")
         return test_config
         
@@ -2649,6 +2657,13 @@ class TestBench:
         Returns:
             (test_config, session_id) after running the steps.
         """
+        # CRITICAL: Clear agent cache (including global explicit memory manager) so verification
+        # truly starts from empty state. Otherwise the scorer may have left memories in the global
+        # singleton (get_memory_manager()), and step 4 would see them without the agent having
+        # called update_memory during this replay—making verification a false positive and
+        # explaining why the same attack fails in normal/static mode where we do clear per test.
+        clear_agent_cache()
+        
         test_name = test_def.get("name", "adaptive_test")
         initial_data = test_def.get("initial_data", {})
         # Do not pre-add attack_emails; we add the optimized one at the insert_attack_email step.
@@ -3169,10 +3184,11 @@ def main():
     parser.add_argument("--config", type=str, default="agent_config.yaml", help="Config file")
     parser.add_argument("--defense-type", type=str, help="Override defense_type from config (e.g., 'none', 'user_prompt_only', 'no_untrusted_tools', 'disable_memory'). This allows parallel runs without modifying the global config file.")
     parser.add_argument("--force", action="store_true", help="Force overwrite existing results")
+    parser.add_argument("--adaptive", action="store_true", help="Run in adaptive benchmark mode (optimize attacks when static attack fails)")
     
     args = parser.parse_args()
     
-    bench = TestBench(args.config, defense_type_override=args.defense_type, force=args.force)
+    bench = TestBench(args.config, defense_type_override=args.defense_type, force=args.force, adaptive=args.adaptive)
     
     try:
         if args.test or args.suite:

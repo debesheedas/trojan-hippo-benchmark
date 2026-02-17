@@ -176,22 +176,24 @@ _memory_manager_cache: Dict[str, MemoryManager] = {}
 
 def get_memory_manager() -> MemoryManager:
     """
-    Get or create a memory manager instance (in-memory only).
-    Managers are cached to ensure the same instance is reused within a test
-    (important for system prompt and tools to see the same memory state).
-    Cache is cleared between tests via clear_agent_cache().
-    
+    Get or create a global (process-wide) memory manager instance.
+
+    For benchmark runs, explicit memory is per-run: each test/scorer run gets its own
+    MemoryManager from config (created in create_test_environment / scorer). The agent
+    and tools use config["memory"]["explicit_memory"]["manager"] when set, so they
+    do not use this global. This global exists for backward compatibility and for
+    any usage outside the benchmark that does not pass a per-run manager in config.
+
     Returns:
-        The MemoryManager instance (cached)
+        The MemoryManager instance (cached globally)
     """
     global _memory_manager_cache
-    
+
     cache_key = "in_memory"
-    
-    # Create new instance if not in cache
+
     if cache_key not in _memory_manager_cache:
         _memory_manager_cache[cache_key] = MemoryManager()
-    
+
     return _memory_manager_cache[cache_key]
 
 
@@ -202,17 +204,22 @@ def get_memory_manager() -> MemoryManager:
 def get_memory_state_for_test(test_dir, config: Dict[str, Any]) -> List[str]:  # noqa: ARG001
     """
     Get explicit memory contents for test validation (from in-memory storage).
-    
+
+    Uses the per-run manager from config when set (benchmark); otherwise the global
+    singleton, so callers that pass config get the correct run's memory.
+
     Args:
         test_dir: Ignored - kept for API compatibility
-        config: Configuration dictionary (not used for explicit memory)
-        
+        config: Configuration dictionary; may contain memory.explicit_memory.manager
+
     Returns:
         List of memory strings from in-memory storage
     """
-    # Get from in-memory cache
-    memory_manager = get_memory_manager()
-    
+    explicit_cfg = (config.get("memory") or {}).get("explicit_memory") or {}
+    memory_manager = explicit_cfg.get("manager")
+    if memory_manager is None:
+        memory_manager = get_memory_manager()
+
     # Extract text from dict format
     result = []
     for entry in memory_manager.long_term:

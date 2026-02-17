@@ -51,6 +51,7 @@ class UpdateMemoryTool(BaseTool):
     trace_store: Optional[Any] = None  # InMemoryTraceStore instance
     explicit_defense_type: str = "none"
     limit_memory_size: int = 80  # Default limit from config
+    memory_manager: Optional[Any] = None  # Per-run MemoryManager from config; if None, use global
     
     def _append_trace_event(self, event_type: str, payload: dict, event_id: Optional[str] = None) -> str:
         """Append a trace event to the trace store."""
@@ -144,8 +145,8 @@ class UpdateMemoryTool(BaseTool):
                 return result
 
         try:
-            # Use in-memory memory manager
-            memory_manager = get_memory_manager()
+            # Use per-run manager from config when set (benchmark); else global singleton
+            memory_manager = self.memory_manager if self.memory_manager is not None else get_memory_manager()
 
             # Use add_long_term() method which handles labels for provable_policy defense
             # Handle forget requests
@@ -210,16 +211,18 @@ def create_memory_tools(
     trace_store: Optional[Any] = None,
     explicit_defense_type: str = "none",
     limit_memory_size: int = 80,
+    explicit_memory_manager: Optional[Any] = None,
 ):
     """
     Create and return memory tools (in-memory only).
-    
+
     Args:
         session_id: Current session ID for tracing
         trace_store: InMemoryTraceStore instance for logging events
         explicit_defense_type: Defense type for memory operations
         limit_memory_size: Max size for memory entries
-        
+        explicit_memory_manager: Optional per-run MemoryManager (benchmark); if None, tool uses global
+
     Returns:
         List of memory tools
     """
@@ -228,4 +231,5 @@ def create_memory_tools(
     tool.trace_store = trace_store
     tool.explicit_defense_type = explicit_defense_type
     tool.limit_memory_size = limit_memory_size
+    tool.memory_manager = explicit_memory_manager
     return [tool]

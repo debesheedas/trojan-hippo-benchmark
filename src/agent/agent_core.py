@@ -376,11 +376,13 @@ def _create_agent_executor(
     limit_memory_size = config.get("benchmark", {}).get("limit_memory_size_defense", 80)
     
     if explicit_memory_enabled and explicit_defense_type != "disable_memory":
+        explicit_memory_manager = explicit_memory_config.get("manager")
         all_tools = create_all_tools(
             email_config=tools_config,
             session_id=session_id,
             explicit_defense_type=explicit_defense_type,
             limit_memory_size=limit_memory_size,
+            explicit_memory_manager=explicit_memory_manager,
         )
     else:
         all_tools = create_email_tools(tools_config)
@@ -470,8 +472,10 @@ def _create_agent_executor(
         memory_instructions = memory_prompt_file.read_text(encoding="utf-8") if memory_prompt_file.exists() else ""
         
         try:
-            # Get in-memory memory manager
-            memory_manager = get_memory_manager()
+            # Use per-run manager from config when set (benchmark); else global singleton fallback
+            memory_manager = explicit_memory_config.get("manager")
+            if memory_manager is None:
+                memory_manager = get_memory_manager()
             explicit_memory_context = memory_manager.get_long_term_as_text(
                 session_id=session_id,
                 defense_type=explicit_defense_type

@@ -83,6 +83,7 @@ def run_benchmark(
     test_path: str,
     config_path: str = "benchmark_config.yaml",
     force: bool = False,
+    adaptive: bool = False,
     results_base_dir: Optional[Path] = None,
     logs_base_dir: Optional[Path] = None,
     target_model_name: Optional[str] = None
@@ -175,7 +176,7 @@ def run_benchmark(
         print(f"SKIPPED: {len(missing)} test(s) already have results, {len(test_files) - len(missing)} will run")
     
     # Initialize TestBench with config dict directly (no temp file needed)
-    bench = TestBench(config=config, defense_type_override=unified_defense, force=force, logs_base_dir=logs_base_dir)
+    bench = TestBench(config=config, defense_type_override=unified_defense, force=force, adaptive=adaptive, logs_base_dir=logs_base_dir)
     
     try:
         # Run tests - TestBench.run_all_tests expects a path string
@@ -274,7 +275,7 @@ def _check_result_for_errors(
 
 
 def _run_single_combination(
-    args_tuple: Tuple[str, str, str, str, bool, Optional[Path], Optional[Path], Optional[str]]
+    args_tuple: Tuple[str, str, str, str, bool, bool, Optional[Path], Optional[Path], Optional[str]]
 ) -> Tuple[str, str, Dict[str, Any]]:
     """
     Wrapper function to run a single backend+defense combination.
@@ -288,7 +289,7 @@ def _run_single_combination(
     All output is redirected to a log file specific to this combination.
     
     Args:
-        args_tuple: (memory_backend, unified_defense, test_path, config_path, force, results_base_dir, logs_base_dir, target_model_name)
+        args_tuple: (memory_backend, unified_defense, test_path, config_path, force, adaptive, results_base_dir, logs_base_dir, target_model_name)
     
     Returns:
         (memory_backend, unified_defense, result_dict)
@@ -297,7 +298,7 @@ def _run_single_combination(
     
     # Set process name for debugging
     process_id = os.getpid()
-    memory_backend, unified_defense, test_path, config_path, force, results_base_dir, logs_base_dir, target_model_name = args_tuple
+    memory_backend, unified_defense, test_path, config_path, force, adaptive, results_base_dir, logs_base_dir, target_model_name = args_tuple
     
     # Determine attack type from test_path (needed for result paths)
     if isinstance(test_path, str):
@@ -336,6 +337,7 @@ def _run_single_combination(
             test_path=test_path,
             config_path=config_path,
             force=force,
+            adaptive=adaptive,
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
             target_model_name=target_model_name
@@ -432,6 +434,7 @@ def run_all_combinations(
     test_path: str,
     config_path: str = "benchmark_config.yaml",
     force: bool = False,
+    adaptive: bool = False,
     num_workers: int = 1,
     results_base_dir: Optional[Path] = None,
     logs_base_dir: Optional[Path] = None,
@@ -495,7 +498,7 @@ def run_all_combinations(
     
     # Prepare arguments for each combination
     args_list = [
-        (backend, defense, test_path, config_path, force, results_base_dir, logs_base_dir, target_model_name)
+        (backend, defense, test_path, config_path, force, adaptive, results_base_dir, logs_base_dir, target_model_name)
         for backend, defense in combinations
     ]
     
@@ -828,6 +831,9 @@ Examples:
   
   # Force overwrite existing results
   python scripts/run_benchmark.py --suite memory_only --model gpt-5-mini --force --num-workers 16
+  
+  # Run in adaptive mode (optimize attacks when static attack fails)
+  python scripts/run_benchmark.py --memory-backend rag --defense-type none --test data/benchmark/attack_bench/rag/persistent_exfiltrate_tax --adaptive
         """
     )
     
@@ -890,6 +896,12 @@ Examples:
         "--force",
         action="store_true",
         help="Force overwrite existing results"
+    )
+    
+    parser.add_argument(
+        "--adaptive",
+        action="store_true",
+        help="Run in adaptive benchmark mode (optimize attacks when static attack fails). Default: static mode."
     )
     
     parser.add_argument(
@@ -974,6 +986,7 @@ Examples:
     # Debug output: show what will be run
     print(f"\n{'='*80}")
     print(f"Configuration:")
+    print(f"  Mode: {'adaptive' if args.adaptive else 'static'}")
     print(f"  Memory backends: {memory_backends}")
     print(f"  Defense types: {defense_types}")
     print(f"  Total combinations: {len(memory_backends) * len(defense_types)}")
@@ -1009,6 +1022,7 @@ Examples:
             test_path=test_path,
             config_path=args.config,
             force=args.force,
+            adaptive=args.adaptive,
             num_workers=args.num_workers,
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
@@ -1032,6 +1046,7 @@ Examples:
             test_path=test_path,
             config_path=args.config,
             force=args.force,
+            adaptive=args.adaptive,
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
             target_model_name=args.target_model_name

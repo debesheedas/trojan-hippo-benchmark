@@ -190,26 +190,22 @@ Run the adaptive benchmark with attack optimization when static attacks fail:
 # Activate virtual environment (if using one)
 source venv/bin/activate
 
-# 1. Enable adaptive mode in benchmark_config.yaml
-# Set benchmark.enable_adaptive_benchmark: true
-
-# 2. Configure memory backend in agent_config.yaml
+# 1. Configure memory backend in agent_config.yaml
 # Set memory.backend: "explicit" (or "mem0" or "rag")
 # Set memory.{backend}_memory.enabled: true
 
-# 3. Run adaptive benchmark
-python src/benchmark/test_bench.py --suite memory_only --defense-type none
+# 2. Run adaptive benchmark (add --adaptive for adaptive mode)
+python src/benchmark/test_bench.py --suite memory_only --defense-type none --adaptive
 
-# Or use the unified runner (adaptive mode uses test_bench.py internally)
-python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite memory_only
+# Or use the unified runner with --adaptive
+python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite memory_only --adaptive
 ```
 
 **What it does**: When a static attack fails, the system automatically attempts to optimize the attack using configured strategies (OpenEvolve or DSPy) to find a successful variant.
 
-**Configuration**: Configure optimizers in `benchmark_config.yaml`:
+**Configuration**: Use the `--adaptive` flag when running the benchmark. Optimizer settings (OpenEvolve, DSPy) remain in `benchmark_config.yaml`:
 ```yaml
 benchmark:
-  enable_adaptive_benchmark: true
   openevolve:
     enabled: true
     # ... optimizer settings
@@ -423,7 +419,6 @@ memory:
 
 ```yaml
 benchmark:
-  enable_adaptive_benchmark: false  # Enable adaptive optimization
   results_dir: "data/benchmark/results"  # Unified results directory
   semantic_judge:
     model_name: "gpt-5-mini"
@@ -435,6 +430,8 @@ benchmark:
     enabled: false
     # ... optimizer settings
 ```
+
+Use the `--adaptive` flag when running the benchmark to enable adaptive optimization; otherwise static mode is used.
 
 Note: Test files are located in `data/benchmark/tests/` (hardcoded, not configurable).
 
