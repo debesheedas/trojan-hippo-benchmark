@@ -43,6 +43,7 @@ from benchmark.test_validators import create_validator, CompositeValidator
 from agent.utils import get_colored_printer
 from benchmark.benchmark_utils import (
     ATTACK_BENCH_SEGMENT,
+    ATTACK_BENCH_TEST,
     ATTACK_BENCH_TRAIN,
     ensure_email_unread,
     get_memory_backend_from_config,
@@ -931,14 +932,21 @@ class TestBench:
             cached_test = self._get_cached_test(test_file)
             if cached_test:
                 print(f"💾 Found cached test with optimized attack, loading it for static mode")
-                # Load the cached test definition (which has optimized attack emails)
                 with open(cached_test, 'r', encoding='utf-8') as f:
                     test_def = json.load(f)
                 print(f"💾 Using optimized attack email from cache")
             else:
-                # No cache, load original test file
                 with open(test_file, 'r', encoding='utf-8') as f:
                     test_def = json.load(f)
+                # For test cases: overlay best attack from cache(defense) else cache(none)
+                best = self._get_best_attack_email_for_attack_bench_test(test_file)
+                if best:
+                    attack_email, source_label = best
+                    print(f"💾 Using attack from {source_label}")
+                    for step in test_def.get("steps", []):
+                        if step.get("step_type") == "insert_attack_email":
+                            step["attack_email"] = attack_email
+                            break
         else:
             # Not an attack_bench test, load original test file
             with open(test_file, 'r', encoding='utf-8') as f:
@@ -1866,17 +1874,51 @@ class TestBench:
         
         return result
     
-    def _get_attack_bench_cache_path(self, test_file: Path) -> Optional[Path]:
-        """For attack_bench/train/backend/suite/file return train_cache/backend/suite/file. Only train cases are cached."""
+    def _get_attack_bench_cache_path(self, test_file: Path, defense: Optional[str] = None) -> Optional[Path]:
+        """For attack_bench/train/backend/suite/file return train_cache/backend/defense/suite/file. Defense defaults to self.unified_defense (per-defense cache)."""
         parts = test_file.resolve().parts
         if ATTACK_BENCH_SEGMENT not in parts:
             return None
         idx = parts.index(ATTACK_BENCH_SEGMENT)
         rest = parts[idx + 1:]
-        # New layout: attack_bench/train/backend/suite/filename
+        # attack_bench/train/backend/suite/filename -> train_cache/backend/defense/suite/filename
         if len(rest) >= 4 and rest[0] == ATTACK_BENCH_TRAIN:
             backend, suite = rest[1], rest[2]
-            return self.cache_dir / backend / suite / test_file.name
+            d = defense if defense is not None else self.unified_defense
+            return self.cache_dir / backend / d / suite / test_file.name
+        return None
+
+    def _get_cached_train_file_for_suite(self, backend: str, defense: str, suite_name: str) -> Optional[Path]:
+        """Return path to cached train file at train_cache/backend/defense/suite/*_train.json, or None."""
+        cache_suite_dir = self.cache_dir / backend / defense / suite_name
+        if not cache_suite_dir.exists():
+            return None
+        for p in cache_suite_dir.glob("*.json"):
+            if "train" in p.stem:
+                return p
+        return None
+
+    def _get_best_attack_email_for_attack_bench_test(self, test_file: Path) -> Optional[Tuple[dict, str]]:
+        """For attack_bench/test/backend/suite/file: get attack email from cache(defense) else cache(none) else None. Returns (attack_email, source_label) or None (use file as-is)."""
+        parts = test_file.resolve().parts
+        if ATTACK_BENCH_SEGMENT not in parts:
+            return None
+        idx = parts.index(ATTACK_BENCH_SEGMENT)
+        rest = parts[idx + 1:]
+        # attack_bench/test/backend/suite/filename
+        if len(rest) < 4 or rest[0] != ATTACK_BENCH_TEST:
+            return None
+        backend, suite_name = rest[1], rest[2]
+        for defense in (self.unified_defense, "none"):
+            cached = self._get_cached_train_file_for_suite(backend, defense, suite_name)
+            if not cached:
+                continue
+            with open(cached, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for step in data.get("steps", []):
+                if step.get("step_type") == "insert_attack_email" and "attack_email" in step:
+                    label = f"cache {backend}/{defense}/{suite_name}"
+                    return (step["attack_email"], label)
         return None
 
     def _get_cached_test(self, test_file: Path) -> Optional[Path]:

@@ -1,99 +1,83 @@
 #!/usr/bin/env bash
-# Use unbuffered Python so progress appears in terminal (avoids "stuck" appearance after long adaptive runs)
-export PYTHONUNBUFFERED=1
+# Run adaptive benchmark on all train cases only (train phase of attack bench).
+# For each memory backend and each defense type (except those in DEFENSES_TO_SKIP),
+# runs adaptive on attack_bench/train/{backend}/. Successful attacks are cached
+# under train_cache/{backend}/{defense}/{suite}/.
 #
-# Run full experiment pipeline for gemini-3.1-pro-preview only:
-# - For each test suite (health, legal, tax), for each memory backend:
-#   1. Run adaptive benchmark with defense=none on the train test case only.
-#   2. Run propagate_train_attack_to_test_cases.py to copy attack email to test cases.
-#   3. Run non-adaptive benchmark for all defenses and all test cases for that backend.
-# - Finally run consolidate_attack_results.py to generate heatmaps and CSVs.
+# Defenses to skip: add to DEFENSES_TO_SKIP (leave empty to run all).
 #
-# Memory backends: none (baseline), explicit, mem0, rag, context.
-# Defenses: none + user_prompt_only, no_untrusted_tools, limit_memory_length, provable_policy.
+# After this:
+#   - Run tests with run_benchmark.py (attack email is resolved at runtime:
+#     cache(backend, defense) else cache(backend, none) else original).
+#   - Optionally run propagate_train_attack_to_test_cases.py --defense D to bake
+#     a chosen attack into test files before running benchmarks.
 #
 # Usage:
 #   ./scripts/run_full_experiments_gemini_3.1.sh
-#   ./scripts/run_full_experiments_gemini_3.1.sh --no-consolidate   # skip final consolidation
-#
+#   ./scripts/run_full_experiments_gemini_3.1.sh --force
 
 set -euo pipefail
+
+export PYTHONUNBUFFERED=1
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 MODEL="gemini-3.1-pro-preview"
-SUITES=(persistent_exfiltrate_health persistent_exfiltrate_legal persistent_exfiltrate_tax)
 BACKENDS=(none explicit mem0 rag context)
-# All defenses: none + 4 (user_prompt_only, no_untrusted_tools, limit_memory_length, provable_policy)
 DEFENSES=(none user_prompt_only no_untrusted_tools limit_memory_length provable_policy)
+
+# Defenses to skip (e.g. "limit_memory_length" "provable_policy"). Leave empty to run all.
+DEFENSES_TO_SKIP=()
+
 BENCH_DIR="data/benchmark/attack_bench"
-RUN_CONSOLIDATE=true
+TRAIN_BASE="${BENCH_DIR}/train"
+FORCE_FLAG=""
 
 for arg in "$@"; do
   case "$arg" in
-    --no-consolidate) RUN_CONSOLIDATE=false ;;
+    --force) FORCE_FLAG="--force" ;;
     *) echo "Unknown option: $arg"; exit 1 ;;
   esac
 done
 
+RUN_DEFENSES=()
+for d in "${DEFENSES[@]}"; do
+  skip=false
+  for s in "${DEFENSES_TO_SKIP[@]}"; do
+    if [[ "$d" == "$s" ]]; then skip=true; break; fi
+  done
+  if [[ "$skip" == false ]]; then
+    RUN_DEFENSES+=("$d")
+  fi
+done
+
 echo "================================================================================"
-echo "Full experiments: model=$MODEL, suites=${SUITES[*]}, backends=${BACKENDS[*]}"
+echo "Attack bench TRAIN (adaptive): model=$MODEL"
+echo "Backends: ${BACKENDS[*]}"
+echo "Defenses to run: ${RUN_DEFENSES[*]}"
+echo "Defenses skipped: ${DEFENSES_TO_SKIP[*]:-(none)}"
 echo "================================================================================"
 
-for suite in "${SUITES[@]}"; do
-  echo ""
-  echo "========== Suite: $suite =========="
-
-  for backend in "${BACKENDS[@]}"; do
-    suite_dir="${BENCH_DIR}/${backend}/${suite}"
-    train_json="${suite_dir}/00_${suite}_train.json"
-
-    if [[ ! -d "$suite_dir" ]]; then
-      echo "Skip backend $backend suite $suite: directory not found ($suite_dir)"
-      continue
-    fi
-    if [[ ! -f "$train_json" ]]; then
-      echo "Skip backend $backend suite $suite: train file not found ($train_json)"
-      continue
-    fi
-
+for backend in "${BACKENDS[@]}"; do
+  train_dir="${TRAIN_BASE}/${backend}"
+  if [[ ! -d "$train_dir" ]]; then
+    echo "Skip backend $backend: train dir not found ($train_dir)"
+    continue
+  fi
+  for defense in "${RUN_DEFENSES[@]}"; do
     echo ""
-    echo "--- Adaptive (defense=none, train only): $backend / $suite ---"
+    echo "--- Adaptive train: backend=$backend defense=$defense ---"
     python scripts/run_benchmark.py \
       --memory-backend "$backend" \
-      --defense none \
-      --test "$train_json" \
+      --defense-type "$defense" \
+      --test "$train_dir" \
       --model "$MODEL" \
       --adaptive \
-      # --force
-
-    echo ""
-    echo "--- Propagate train attack to test cases ---"
-    python scripts/propagate_train_attack_to_test_cases.py
-
-    echo ""
-    echo "--- Non-adaptive (all defenses, all test cases): $backend / $suite ---"
-    python scripts/run_benchmark.py \
-      --memory-backend "$backend" \
-      --defense-type "${DEFENSES[@]}" \
-      --test "$suite_dir" \
-      --model "$MODEL" \
-      --num-workers 8
-      # --force \
-
+      $FORCE_FLAG
   done
 done
 
-if [[ "$RUN_CONSOLIDATE" == true ]]; then
-  echo ""
-  echo "================================================================================"
-  echo "Consolidating attack results and generating heatmaps/CSVs"
-  echo "================================================================================"
-  python scripts/consolidate_attack_results.py --model "$MODEL"
-  echo "Done. Outputs in data/benchmark/consolidated_attack_results/"
-else
-  echo ""
-  echo "Skipped consolidation (--no-consolidate). Run manually:"
-  echo "  python scripts/consolidate_attack_results.py --model $MODEL"
-fi
+echo ""
+echo "Done. Cache: ${BENCH_DIR}/train_cache/{backend}/{defense}/{suite}/"
+echo "Run tests: python scripts/run_benchmark.py --test ${BENCH_DIR}/test/<backend> --defense-type <D> --model $MODEL ..."

@@ -1,4 +1,4 @@
-# CI Compare Failures – Analysis
+ # CI Compare Failures – Analysis
 
 This document summarizes why the compare step failed for test1, test2, and test3 after running `bash CI-tests/run_ci_tests.sh`, and what to decide before changing code or ground truth.
 

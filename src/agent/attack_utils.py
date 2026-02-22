@@ -87,8 +87,8 @@ def validate_cache_integrity(cache_dir: str = "data/benchmark/attack_bench/train
     """
     Validate the integrity of all cached attack benchmark files.
     
-    Compares files in train_cache/{backend}/{suite}/ with train/{backend}/{suite}/
-    to ensure the caching system is working correctly.
+    Cache layout: train_cache/{backend}/{defense}/{suite}/; original: train/{backend}/{suite}/.
+    Maps cached file to original by dropping the defense segment.
     
     Args:
         cache_dir: Directory containing cached files (default: attack_bench/train_cache)
@@ -121,10 +121,14 @@ def validate_cache_integrity(cache_dir: str = "data/benchmark/attack_bench/train
     invalid_files = 0
     
     for cached_file in cached_files:
-        # Find corresponding original file
         relative_path = cached_file.relative_to(cache_path)
-        original_file = original_path / relative_path
-        
+        # Cache layout: backend/defense/suite/file -> original: backend/suite/file
+        parts = relative_path.parts
+        if len(parts) >= 4:
+            original_file = original_path / parts[0] / parts[2] / parts[3]
+        else:
+            original_file = original_path / relative_path
+
         if not original_file.exists():
             results.append({
                 "cached_file": str(cached_file),
