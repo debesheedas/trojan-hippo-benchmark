@@ -10,8 +10,8 @@ import sys
 from pathlib import Path
 import os
 
-# Ensure src/ is on sys.path for package imports
-BASE_DIR = Path(__file__).resolve().parent
+# Ensure src/ is on sys.path for package imports (repo root = parent of useful_temp)
+BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR / "src"))
 
 from agent.attack_utils import validate_cache_integrity, print_cache_validation_report
@@ -22,10 +22,10 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Validate attack benchmark cache integrity")
-    parser.add_argument("--cache-dir", default="data/benchmark/attack_bench_cache", 
-                       help="Directory containing cached files (default: data/benchmark/attack_bench_cache)")
-    parser.add_argument("--original-dir", default="data/benchmark/attack_bench", 
-                       help="Directory containing original files (default: data/benchmark/attack_bench)")
+    parser.add_argument("--cache-dir", default="data/benchmark/attack_bench/train_cache",
+                       help="Directory containing cached files (default: data/benchmark/attack_bench/train_cache)")
+    parser.add_argument("--original-dir", default="data/benchmark/attack_bench/train",
+                       help="Directory containing original train files (default: data/benchmark/attack_bench/train)")
     parser.add_argument("--quiet", action="store_true", 
                        help="Only show summary, no detailed report")
     

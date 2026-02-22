@@ -2,6 +2,17 @@
 
 This directory contains continuous integration (CI) tests to ensure that refactoring doesn't break the benchmark implementation.
 
+## Model: gpt-5-mini (fixed)
+
+**CI runs and ground truth use the model `gpt-5-mini` only.** This is hardcoded in:
+
+- `run_ci_tests.sh` (benchmark + compare)
+- `compare_results.py` (when results dir is `CI-tests/results`, model defaults to gpt-5-mini)
+- `update_ground_truth_from_results.py` (gold is built from gpt-5-mini results)
+- `.github/workflows/regression_test.yml` (benchmark step uses `--model gpt-5-mini`)
+
+Do not change the model in one place without updating the others. In the future the model may be made configurable; until then it remains fixed for reproducibility.
+
 ## Directory Structure
 
 ```

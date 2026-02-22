@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 import multiprocessing
-import sys
 import signal
 
 # Add src to path
@@ -31,7 +30,8 @@ from benchmark.benchmark_utils import (
     discover_test_files,
     prepare_benchmark_config,
     UNIFIED_DEFENSE_TYPES,
-    TEST_DIR
+    MEMORY_BACKENDS,
+    TEST_DIR,
 )
 from benchmark.test_bench import TestBench
 
@@ -188,7 +188,7 @@ def run_benchmark(
         passed_tests = sum(1 for r in results if r.get("overall_success", False))
         failed_tests = total_tests - passed_tests
 
-        print(f"\nLog files written to: {logs_dir.resolve()}")
+        print(f"\nLog files written to: {logs_dir.resolve()}", flush=True)
         return {
             "success": True,
             "memory_backend": memory_backend,
@@ -832,8 +832,8 @@ Examples:
   # Force overwrite existing results
   python scripts/run_benchmark.py --suite memory_only --model gpt-5-mini --force --num-workers 16
   
-  # Run in adaptive mode (optimize attacks when static attack fails)
-  python scripts/run_benchmark.py --memory-backend rag --defense-type none --test data/benchmark/attack_bench/rag/persistent_exfiltrate_tax --adaptive
+  # Run in adaptive mode (optimize attacks when static attack fails) on train cases
+  python scripts/run_benchmark.py --memory-backend rag --defense-type none --test data/benchmark/attack_bench/train/rag/persistent_exfiltrate_tax --adaptive
         """
     )
     
@@ -866,23 +866,16 @@ Examples:
     )
     
     parser.add_argument(
-        "--all-defenses",
-        action="store_true",
-        help="DEPRECATED: Use --defense-type without arguments or omit it to run all defenses. "
-             "This flag is kept for backward compatibility but has no effect."
-    )
-    
-    parser.add_argument(
         "--test",
         type=str,
-        help="Path to a test file or directory. If a directory, all *.json files in it are run (e.g. data/benchmark/attack_bench/rag/persistent_exfiltrate_tax). Logs go to data/benchmark/attack_logs/ for attack_bench or data/benchmark/logs/ for utility tests."
+        help="Path to a test file or directory. For attack bench: use attack_bench/train/... for adaptive (train) runs, attack_bench/test/... for evaluation. Logs go to data/benchmark/attack_logs/ or data/benchmark/logs/."
     )
     
     parser.add_argument(
         "--suite",
         type=str,
         choices=["memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"],
-        help="Utility test suite to run from data/benchmark/tests/<suite>/ (memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, or long_memory). For attack bench tests, use --test with path to data/benchmark/attack_bench/"
+        help="Utility test suite to run from data/benchmark/tests/<suite>/. For attack bench, use --test with data/benchmark/attack_bench/train/... or attack_bench/test/..."
     )
     
     parser.add_argument(
@@ -920,7 +913,7 @@ Examples:
         "--model",
         type=str,
         dest="target_model_name",
-        help="Target model name (e.g., 'gpt-5-mini', 'gpt-4o-mini', 'gpt-4o'). Overrides config value."
+        help="Target model name (e.g., 'gpt-5-mini', 'gemini-3-pro-preview', 'gemini-3.1-pro-preview', 'gemini-2.5-pro'). Overrides config value."
     )
     
     parser.add_argument(
@@ -974,7 +967,7 @@ Examples:
         memory_backends = args.memory_backend
     else:
         # Default: all backends (including "none" as a regular backend)
-        memory_backends = ["none", "explicit", "mem0", "rag", "context"]
+        memory_backends = MEMORY_BACKENDS
     
     # Determine defense types to use
     if defense_types_specified:
@@ -1074,7 +1067,7 @@ Examples:
     else:
         # Single combination: Check if execution succeeded (not test validation results)
         if result.get("success"):
-            print("\nExiting with code 0 - execution succeeded")
+            print("\nExiting with code 0 - execution succeeded", flush=True)
             print("Note: Test validation results will be checked by compare_results.py step")
             sys.exit(0)
         else:

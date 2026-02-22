@@ -216,6 +216,7 @@ def _get_model_context_windows() -> Dict[str, int]:
         "claude-3-7-sonnet": 200000,
         "gemini-2.0-flash": 1000000,
         "gemini-3-pro-preview": 1000000,
+        "gemini-3.1-pro-preview": 1000000,
         "gemini-2.5-pro": 1000000,
         "gemini-3-flash": 1000000,
         "gemini-2.5-flash": 1000000,
@@ -234,6 +235,7 @@ def _get_api_token_limits() -> Dict[str, int]:
         "claude-3-7-sonnet": 200000,
         "gemini-2.0-flash": 1000000,
         "gemini-3-pro-preview": 1000000,
+        "gemini-3.1-pro-preview": 1000000,
         "gemini-3-flash": 1000000,
     }
 
@@ -487,15 +489,6 @@ def print_validator_result(validator_type: str, validator_name: str, passed: boo
     else:
         # No color fallback
         print(f"  [{validator_type}] {validator_name}: {status_icon} {status_text}" + (f" - {details}" if details else ""))
-
-
-def ensure_data_directories(config: dict) -> None:
-    """No-op: This benchmark operates entirely in-memory.
-    
-    Kept for API compatibility only - no directories are created.
-    """
-    # This benchmark operates entirely in-memory - no directories needed
-    pass
 
 
 # ============================================================================
@@ -803,35 +796,48 @@ def call_gemini_chat_completion(
             
             # Get text from response - handle cases where content might be blocked
             # IMPORTANT: Check candidates/parts FIRST before trying response.text to avoid errors
+            # Thinking/reasoning models (e.g. gemini-3.x) may use different part structure; try all ways.
             try:
-                # First check candidates (safer - doesn't trigger the quick accessor error)
                 if hasattr(gemini_response, "candidates") and gemini_response.candidates:
                     candidate = gemini_response.candidates[0]
-                    # Check if candidate has content with parts
                     if hasattr(candidate, "content"):
                         if hasattr(candidate.content, "parts") and candidate.content.parts:
-                            # Extract text from parts safely
                             parts_text = []
                             for part in candidate.content.parts:
-                                if hasattr(part, "text"):
-                                    parts_text.append(part.text)
+                                # Standard: part.text
+                                t = getattr(part, "text", None)
+                                if isinstance(t, str) and t.strip():
+                                    parts_text.append(t)
+                                # Some thinking models use different attributes (e.g. thought vs text)
+                                if not t and hasattr(part, "__dict__"):
+                                    for attr in ("thought", "content", "inline_data"):
+                                        val = getattr(part, attr, None)
+                                        if isinstance(val, str) and val.strip():
+                                            parts_text.append(val)
+                                            break
                             self.content = "".join(parts_text)
                         else:
-                            # No parts in content - this usually means blocked/empty response
                             self.content = ""
                     else:
-                        # No content attribute - response was likely blocked
-                        self.content = ""
-                # Only try response.text if we didn't get content from candidates
-                elif hasattr(gemini_response, "text"):
-                    # This might throw an error if there are no parts, so wrap in try-except
-                    try:
-                        self.content = gemini_response.text
-                    except Exception:
-                        # If response.text fails, it means no valid parts
                         self.content = ""
                 else:
                     self.content = ""
+                # Fallback 1: response.text (e.g. gemini-3.1 top-level accessor)
+                if not self.content and hasattr(gemini_response, "text"):
+                    try:
+                        self.content = gemini_response.text or ""
+                    except Exception:
+                        pass
+                # Fallback 2: raw string from first candidate (some SDKs expose content differently)
+                if not self.content and hasattr(gemini_response, "candidates") and gemini_response.candidates:
+                    try:
+                        c = gemini_response.candidates[0]
+                        if hasattr(c, "content") and c.content is not None:
+                            raw = getattr(c.content, "raw", None) or getattr(c, "raw", None)
+                            if isinstance(raw, str) and raw.strip():
+                                self.content = raw
+                    except Exception:
+                        pass
             except Exception as e:
                 # If we can't get text, this is an error
                 error_details = f"Finish reason: {finish_reason_name} (code: {finish_reason_code})" if finish_reason_name else "Unknown finish reason"

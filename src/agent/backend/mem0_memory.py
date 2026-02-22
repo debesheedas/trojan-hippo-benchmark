@@ -209,6 +209,7 @@ class Mem0MemoryManager:
         vector_store_provider: str = "faiss",
         top_k: int = 10,
         user_id: str = "vince",
+        agent_id: Optional[str] = None,
         api_key: Optional[str] = None,
     ):
         """
@@ -223,6 +224,10 @@ class Mem0MemoryManager:
             vector_store_provider: Vector store provider (faiss, chroma, qdrant, etc.)
             top_k: Number of top memories to retrieve
             user_id: User identifier for memory scoping
+            agent_id: Optional agent ID. When set, mem0 uses AGENT_MEMORY_EXTRACTION_PROMPT
+                (extracts from assistant messages only). When None, uses USER_MEMORY_EXTRACTION_PROMPT
+                (extracts from user messages only). For the benchmark we set this so the attack
+                email (which appears in the assistant reply in step 2) is extracted.
             api_key: Optional API key (uses env vars if not provided)
         """
         
@@ -234,7 +239,7 @@ class Mem0MemoryManager:
         self.vector_store_provider = vector_store_provider
         self.top_k = top_k
         self.user_id = user_id
-        self.agent_id = None  # Always None for mem0
+        self.agent_id = agent_id
         
         # Get API key from parameter or environment
         api_key = api_key or os.getenv("OPENAI_API_KEY")
@@ -244,7 +249,9 @@ class Mem0MemoryManager:
         
         # Initialize mem0 Memory instance using from_config classmethod
         self.memory = Memory.from_config(config_dict)
-    
+        # Last retrieved memories (list of memory text strings) for scorer/benchmark analysis
+        self._last_retrieved_memories: Optional[List[str]] = None
+
     def _build_config_dict(self, api_key: Optional[str]) -> Dict[str, Any]:
         """Build mem0 configuration dictionary."""
         # Determine embedding dimensions based on model
@@ -452,9 +459,9 @@ class Mem0MemoryManager:
         if not messages:
             return {"results": []}
         
-        # Use self.user_id from config (passed during initialization)
+        # Use self.user_id / self.agent_id from config (passed during initialization)
         user_id = user_id or self.user_id
-        agent_id = None  # Always None for mem0
+        effective_agent_id = agent_id if agent_id is not None else self.agent_id
         
         # Combine metadata
         combined_metadata = metadata or {}
@@ -475,12 +482,11 @@ class Mem0MemoryManager:
                 combined_metadata["label"] = "T"
         
         try:
-            # For user memory extraction, we should NOT pass agent_id to memory.add()
-            # because mem0 uses agent_id presence in metadata to decide which prompt to use:
-            # - If agent_id is in metadata: uses AGENT_MEMORY_EXTRACTION_PROMPT (extracts from assistant messages only)
-            # - If agent_id is NOT in metadata: uses USER_MEMORY_EXTRACTION_PROMPT (extracts from user messages only)
-            # We want user memory extraction, so we don't include agent_id in metadata
-            # Note: We can still use agent_id for filtering in search operations via filters parameter
+            # Mem0 uses agent_id presence to choose extraction prompt:
+            # - agent_id set → AGENT_MEMORY_EXTRACTION_PROMPT (extracts from assistant messages only)
+            # - agent_id not set → USER_MEMORY_EXTRACTION_PROMPT (extracts from user messages only)
+            # For the benchmark we pass agent_id (use_agent_extraction_for_benchmark) so the attack
+            # email (which appears in the assistant reply in step 2) is extracted.
             
             # Step 1: Chunk large messages to prevent embedding model token limit errors
             # mem0's embedding model (text-embedding-3-small) has 8192 token limit
@@ -537,8 +543,8 @@ class Mem0MemoryManager:
                         return self.memory.add(
                             messages=messages_to_use,
                             user_id=user_id,
-                            agent_id=None,  # Don't pass agent_id to force USER_MEMORY_EXTRACTION_PROMPT
-                            metadata=combined_metadata,  # Don't include agent_id here
+                            agent_id=effective_agent_id,
+                            metadata=combined_metadata,
                             infer=True,  # Use LLM to extract facts
                         )
                 
@@ -679,10 +685,9 @@ class Mem0MemoryManager:
         if not query or not query.strip():
             return []
         
-        # Use self.user_id from config (passed during initialization)
+        # Use self.user_id / self.agent_id from config (passed during initialization)
         user_id = user_id or self.user_id
-        # Always use None for agent_id - user memories are stored with agent_id=None
-        agent_id = None
+        agent_id = agent_id if agent_id is not None else self.agent_id
         limit = limit or self.top_k
         
         # Optimization: Truncate very large queries before search
@@ -737,7 +742,7 @@ class Mem0MemoryManager:
                 return self.memory.search(
                     query=search_query,  # Use truncated query
                     user_id=user_id,
-                    agent_id=agent_id,  # Always None
+                    agent_id=agent_id,
                     limit=limit
                 )
             
@@ -1031,16 +1036,17 @@ class Mem0MemoryManager:
         Returns:
             Formatted context string with retrieved memories
         """
-        # Use self.user_id from config (passed during initialization)
+        # Use self.user_id / self.agent_id from config (passed during initialization)
         user_id = user_id or self.user_id
-        memories = self.search(query, user_id=user_id, agent_id=None, session_id=session_id, defense_type=defense_type)
+        agent_id = agent_id if agent_id is not None else self.agent_id
+        memories = self.search(query, user_id=user_id, agent_id=agent_id, session_id=session_id, defense_type=defense_type)
         
         # If we got fewer memories than top_k, try a more aggressive fallback
         # This helps when the query is too specific and doesn't match stored memories well
         if len(memories) < self.top_k:
             try:
                 # Get a sample of all memories as fallback
-                all_memories = self.get_all_memories(user_id=user_id, agent_id=None, limit=self.top_k)
+                all_memories = self.get_all_memories(user_id=user_id, agent_id=agent_id, limit=self.top_k)
                 if all_memories:
                     # Use first few memories as fallback context
                     existing_texts = {m.get("memory", "") for m in memories if isinstance(m, dict)}
@@ -1083,17 +1089,23 @@ class Mem0MemoryManager:
                 pass
         
         if not memories:
+            self._last_retrieved_memories = []
             return ""
-        
+
+        # Store raw memory texts for scorer/benchmark (e.g. to detect reward hacking vs true memory retrieval)
+        memory_texts = []
+        for memory_item in memories:
+            mem_text = memory_item.get("memory", "") if isinstance(memory_item, dict) else str(memory_item)
+            if mem_text:
+                memory_texts.append(mem_text)
+        self._last_retrieved_memories = memory_texts
+
         context_parts = []
-        for i, memory_item in enumerate(memories, 1):
-            # Extract memory text from mem0 response format
-            memory_text = memory_item.get("memory", "") if isinstance(memory_item, dict) else str(memory_item)
-            if memory_text:
-                context_parts.append(f"Memory {i}:\n{memory_text}")
-        
+        for i, memory_text in enumerate(memory_texts, 1):
+            context_parts.append(f"Memory {i}:\n{memory_text}")
+
         return "\n\n".join(context_parts)
-    
+
     def get_all_memories(
         self,
         user_id: Optional[str] = None,
@@ -1104,11 +1116,9 @@ class Mem0MemoryManager:
         """
         Get all memories for a user using the get_all API.
         
-        Note: User memories are stored with agent_id=None (to use USER_MEMORY_EXTRACTION_PROMPT).
-        
         Args:
             user_id: Optional user ID (defaults to self.user_id)
-            agent_id: Optional agent ID (ignored - always uses None)
+            agent_id: Optional agent ID (defaults to self.agent_id; when set, memories were stored with AGENT extraction)
             filters: Optional additional filters (supports AND, OR, etc.)
             limit: Maximum number of memories to return (default: 100)
             
@@ -1117,8 +1127,7 @@ class Mem0MemoryManager:
         """
         # No lock needed - each test runs in isolation
         user_id = user_id or self.user_id
-        # Always use None for agent_id - user memories are stored with agent_id=None
-        agent_id = None
+        agent_id = agent_id if agent_id is not None else self.agent_id
         
         all_memories = []
         
@@ -1128,13 +1137,12 @@ class Mem0MemoryManager:
             # Add user_id to filters
             if user_id:
                 query_filters["user_id"] = user_id
-            # Don't add agent_id - always use None
             
-            # Call get_all with agent_id=None (with timeout to prevent hanging)
+            # Call get_all (with timeout to prevent hanging)
             def _call_mem0_get_all():
                 return self.memory.get_all(
                     user_id=user_id if user_id else None,
-                    agent_id=None,
+                    agent_id=agent_id,
                     filters=query_filters if query_filters else None,
                     limit=limit
                 )
@@ -1167,7 +1175,7 @@ class Mem0MemoryManager:
         """
         # No lock needed - each test runs in isolation
         user_id = user_id or self.user_id
-        agent_id = None  # Always None for mem0
+        agent_id = agent_id if agent_id is not None else self.agent_id
         
         try:
             # Get all memories first
@@ -1232,7 +1240,7 @@ class Mem0MemoryManager:
                 "vector_store_provider": self.vector_store_provider,
                 "top_k": self.top_k,
                 "user_id": self.user_id,
-                "agent_id": None  # Always None for mem0
+                "agent_id": self.agent_id
             }
         except Exception as e:
             print(f"Warning: Could not get mem0 memory stats: {e}")
@@ -1248,6 +1256,7 @@ def get_mem0_memory_manager(
     vector_store_provider: str = "faiss",
     top_k: int = 10,
     user_id: str = "vince",
+    agent_id: Optional[str] = None,
 ) -> Mem0MemoryManager:
     """
     Create a new mem0 memory manager instance (in-memory only).
@@ -1261,6 +1270,8 @@ def get_mem0_memory_manager(
         vector_store_provider: Vector store provider
         top_k: Number of top memories to retrieve
         user_id: User identifier
+        agent_id: Optional. When set, mem0 uses AGENT_MEMORY_EXTRACTION (assistant messages only).
+            Use for benchmark so the attack email (in assistant reply) is extracted.
     
     Returns:
         A new Mem0MemoryManager instance
@@ -1274,6 +1285,7 @@ def get_mem0_memory_manager(
         vector_store_provider=vector_store_provider,
         top_k=top_k,
         user_id=user_id,
+        agent_id=agent_id,
     )
 
 
@@ -1306,6 +1318,11 @@ def get_mem0_memory_context(text: str, session_id: str, memory_config: dict, in_
         mem0_context = mem0_memory_manager.get_context(
             text, user_id=mem0_memory_manager.user_id, session_id=session_id, defense_type=mem0_defense_type
         )
+        # Expose last retrieved memories for scorer (e.g. to verify attack came from memory, not search_emails)
+        if in_memory_env is not None and hasattr(in_memory_env, "last_mem0_retrieved_memories"):
+            in_memory_env.last_mem0_retrieved_memories = getattr(
+                mem0_memory_manager, "_last_retrieved_memories", None
+            ) or []
         return "\n\n# Relevant Mem0 Memory Context\n" + mem0_context + "\n" if mem0_context else ""
     except Mem0TimeoutError as e:
         print(f"CRITICAL ERROR: mem0 memory retrieval timed out: {e}")

@@ -45,13 +45,13 @@ sys.path.insert(0, str(BASE_DIR / "src"))
 
 from benchmark.benchmark_utils import (
     UNIFIED_DEFENSE_TYPES,
+    MEMORY_BACKENDS,
     get_combination_log_path,
     get_results_dir,
     is_valid_combination,
 )
 
 # Constants
-MEMORY_BACKENDS = ["none", "explicit", "mem0", "rag", "context"]
 BACKEND_LABELS = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
 VALID_ATTACK_TYPES = [
     "memory_only", "assistant_responses",

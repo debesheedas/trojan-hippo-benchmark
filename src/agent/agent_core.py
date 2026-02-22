@@ -3,6 +3,8 @@ Core functionality for the email agent.
 """
 import os
 import copy
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
@@ -14,7 +16,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import trim_messages, HumanMessage, AIMessage, SystemMessage
 from agent.tools_registry import create_all_tools, create_email_tools
 from agent.tool_specifications.email_tools import EmailToolsConfig
-from agent.utils import get_timestamp, ensure_data_directories, set_global_seeds, debug_info, debug_debug, debug_print_exception, get_model_context_window, get_debug_level, DebugLevel
+from agent.utils import get_timestamp, set_global_seeds, debug_info, debug_debug, debug_print_exception, get_model_context_window, get_debug_level, DebugLevel
 from agent.backend.explicit_memory import get_memory_manager, _memory_manager_cache
 from agent.backend.rag_memory import get_rag_memory_context, index_rag_memory
 from agent.backend.mem0_memory import get_mem0_memory_context, index_mem0_memory
@@ -22,6 +24,24 @@ from agent.backend.context_memory import get_context_memory_context, index_conte
 from benchmark.benchmark_utils import get_unified_defense_from_config
 
 load_dotenv()
+
+
+def _is_retryable_api_error(exc: BaseException) -> bool:
+    """True if the exception indicates a retryable API error (504, 503, timeout, etc.)."""
+    msg = (getattr(exc, "message", "") or str(exc)).lower()
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if code is not None:
+        try:
+            if int(code) in (504, 503, 429, 500):
+                return True
+        except (TypeError, ValueError):
+            pass
+    for token in ("504", "503", "429", "500", "gateway timeout", "service unavailable", "timeout", "timed out", "deadline exceeded", "too many requests"):
+        if token in msg:
+            return True
+    return False
+
+
 _session_store: Dict[str, list] = {}
 _agent_cache: Dict[str, Any] = {}
 _session_trust: Dict[str, bool] = {}
@@ -338,9 +358,6 @@ def _create_agent_executor(
     # Config should only contain serializable values - no need for deepcopy since no complex objects
     if "seed" in config:
         set_global_seeds(config["seed"])
-    
-    # ensure_data_directories is now a no-op (this benchmark operates entirely in-memory)
-    ensure_data_directories(config)
 
     memory_backend_for_defense = config.get("memory", {}).get("backend", "explicit")
     unified_defense = get_unified_defense_from_config(config, memory_backend_for_defense)
@@ -430,11 +447,17 @@ def _create_agent_executor(
         if not api_key:
             raise ValueError("GEMINI_API_KEY is not set")
         
+        # Request timeout so a stuck Gemini API call returns instead of hanging indefinitely.
+        # The thread-based timeout in invoke_agent() may not fire if the client holds the GIL
+        # while blocked; setting the client timeout ensures the HTTP layer can time out.
+        invoke_timeout_sec = model_config.get("invoke_timeout_seconds", 300)
+        
         # Build Gemini LLM parameters
         llm_params = {
             "model": model_name,
             "google_api_key": api_key,
             "temperature": model_config.get("temperature", 0.0),
+            "timeout": invoke_timeout_sec,
         }
         
         # Gemini uses max_output_tokens instead of max_tokens
@@ -451,12 +474,20 @@ def _create_agent_executor(
             llm = ChatGoogleGenerativeAI(**llm_params)
         except (TypeError, ValueError) as e:
             print(f"Warning: Model {model_name} may not support all parameters. Trying minimal config. Error: {e}")
-            # Try minimal config
-            llm = ChatGoogleGenerativeAI(
-                model=model_name,
-                google_api_key=api_key,
-                temperature=model_config.get("temperature", 0.0),
-            )
+            # Try minimal config (omit timeout/client_options in fallback to avoid unknown kwarg)
+            try:
+                llm = ChatGoogleGenerativeAI(
+                    model=model_name,
+                    google_api_key=api_key,
+                    temperature=model_config.get("temperature", 0.0),
+                    timeout=invoke_timeout_sec,
+                )
+            except (TypeError, ValueError):
+                llm = ChatGoogleGenerativeAI(
+                    model=model_name,
+                    google_api_key=api_key,
+                    temperature=model_config.get("temperature", 0.0),
+                )
     else:
         raise ValueError(f"Unsupported provider: {provider}")
 
@@ -613,9 +644,50 @@ def invoke_agent(text: str, session_id: str, config: dict, in_memory_env) -> Dic
         print("--- END MESSAGES SENT TO AGENT ---\n", flush=True)
         sys.stdout.flush()
     
-    # Invoke agent and extract response
-    result = agent.invoke({"messages": messages_for_agent})
-    
+    # Invoke agent with timeout and retries. 504/503/timeouts from Gemini are retried with backoff (max 3 attempts).
+    invoke_timeout_sec = config.get("agent", {}).get("invoke_timeout_seconds", 300)
+    max_retries = 3
+    backoff_secs = [10, 30]  # after 1st and 2nd failure
+    last_error = None
+    result = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            executor = ThreadPoolExecutor(max_workers=1)
+            try:
+                future = executor.submit(agent.invoke, {"messages": messages_for_agent})
+                result = future.result(timeout=invoke_timeout_sec)
+            finally:
+                executor.shutdown(wait=False)
+            break
+        except FuturesTimeoutError as e:
+            last_error = e
+            err_msg = f"Model API did not return within {invoke_timeout_sec}s (timeout)"
+            if attempt < max_retries:
+                wait = backoff_secs[attempt - 1]
+                print(f"[invoke_agent] {err_msg}. Retrying in {wait}s (attempt {attempt}/{max_retries})...", flush=True)
+                time.sleep(wait)
+            else:
+                print(f"[invoke_agent] {err_msg}. Gave up after {max_retries} attempts.", flush=True)
+                raise RuntimeError(
+                    f"Agent invoke timed out after {invoke_timeout_sec}s (tried {max_retries} times). "
+                    "The model API (e.g. Gemini) may be slow or returning 504 Gateway Timeout. Check your Gemini dashboard for 504/503 errors."
+                ) from e
+        except Exception as e:
+            last_error = e
+            if _is_retryable_api_error(e) and attempt < max_retries:
+                wait = backoff_secs[attempt - 1]
+                print(f"[invoke_agent] API error (likely 504/503/timeout): {e!r}. Retrying in {wait}s (attempt {attempt}/{max_retries})...", flush=True)
+                time.sleep(wait)
+            else:
+                if _is_retryable_api_error(e):
+                    print(f"[invoke_agent] API error (504/503/timeout) after {max_retries} attempts: {e!r}", flush=True)
+                    raise RuntimeError(
+                        f"Model API returned a retryable error (e.g. 504 Gateway Timeout) and failed after {max_retries} attempts: {e}"
+                    ) from e
+                raise
+    if result is None:
+        raise RuntimeError("Agent invoke failed with no result.") from last_error
+
     # Helper to normalize content that may be a list (Gemini format) or string (OpenAI format)
     def normalize_content(content):
         """Extract text from content that may be string or list of content blocks."""

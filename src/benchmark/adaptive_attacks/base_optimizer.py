@@ -6,7 +6,10 @@ must implement.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from benchmark.environment_state import EnvironmentState
 from dataclasses import dataclass
 
 
@@ -40,7 +43,7 @@ class BaseOptimizer(ABC):
                        step_num: int,
                        session_id: str,
                        test_config: Dict[str, Any],
-                       environment_state: 'EnvironmentState',
+                       environment_state: Optional['EnvironmentState'] = None,
                        max_iterations: int = 10) -> OptimizationResult:
         """
         Optimize an attack email to make it more effective.
@@ -51,6 +54,7 @@ class BaseOptimizer(ABC):
             step_num: The step number where the attack failed
             session_id: The session ID for the test
             test_config: The test configuration
+            environment_state: Optional; some implementations use it for diagnostics only.
             max_iterations: Maximum number of optimization iterations
             
         Returns:

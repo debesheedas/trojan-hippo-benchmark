@@ -17,8 +17,8 @@ source venv/bin/activate
 # Run explicit memory with no defense on utility test suite
 python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite memory_only
 
-# Run mem0 with all defense types
-python scripts/run_benchmark.py --memory-backend mem0 --all-defenses --suite memory_only
+# Run mem0 with all defense types (omit --defense-type to run all)
+python scripts/run_benchmark.py --memory-backend mem0 --suite memory_only
 
 # Run a specific test file with RAG memory
 python scripts/run_benchmark.py --memory-backend rag --defense-type user_prompt_only --test data/benchmark/tests/memory_only/memory_only_001.json
@@ -79,8 +79,8 @@ Utility test suites are organized under `data/benchmark/tests/`:
 # Run utility test suites (memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory)
 python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite memory_only
 
-# Run attack bench tests (no suites, all tests directly under data/benchmark/attack_bench/)
-python scripts/run_benchmark.py --memory-backend mem0 --defense-type user_prompt_only --test data/benchmark/attack_bench/rag/00_exfiltrate.json
+# Run attack bench test cases (from attack_bench/test/ or a single file)
+python scripts/run_benchmark.py --memory-backend mem0 --defense-type user_prompt_only --test data/benchmark/attack_bench/test/rag/persistent_exfiltrate_tax
 ```
 
 #### Running Specific Tests
@@ -92,8 +92,9 @@ python scripts/run_benchmark.py --memory-backend explicit --defense-type none --
 # Run all tests in a utility suite directory
 python scripts/run_benchmark.py --memory-backend mem0 --defense-type user_prompt_only --test data/benchmark/tests/memory_only/
 
-# Run attack bench test
-python scripts/run_benchmark.py --memory-backend rag --defense-type none --test data/benchmark/attack_bench/rag/00_exfiltrate.json
+# Run attack bench test folder (evaluation) or train folder (adaptive)
+python scripts/run_benchmark.py --memory-backend rag --defense-type none --test data/benchmark/attack_bench/test/rag/persistent_exfiltrate_tax
+python scripts/run_benchmark.py --memory-backend rag --defense-type none --test data/benchmark/attack_bench/train/rag/persistent_exfiltrate_tax --adaptive
 ```
 
 #### Running All Defenses
@@ -101,10 +102,10 @@ python scripts/run_benchmark.py --memory-backend rag --defense-type none --test 
 Run all defense types for a backend in one command:
 
 ```bash
-# Run all defenses for explicit memory
-python scripts/run_benchmark.py --memory-backend explicit --all-defenses --suite memory_only
+# Run all defenses for explicit memory (omit --defense-type to run all)
+python scripts/run_benchmark.py --memory-backend explicit --suite memory_only
 
-# This runs: disable_memory, none, user_prompt_only, no_untrusted_tools, limit_memory_length
+# This runs: none, user_prompt_only, no_untrusted_tools, limit_memory_length, provable_policy (invalid combinations are skipped)
 ```
 
 #### Result Caching
@@ -157,9 +158,8 @@ python scripts/run_benchmark.py --help
 --suite {memory_only,assistant_responses,untrusted_probe,untrusted_send,disable_send,memory_tools,long_memory}  # Utility test suite to run
 --test TEST                           # Specific test file or directory
 
-# Defense selection (one required):
---defense-type {disable_memory,none,user_prompt_only,no_untrusted_tools,limit_memory_length}
---all-defenses                        # Run all defense types
+# Defense selection (optional):
+--defense-type {none,user_prompt_only,no_untrusted_tools,limit_memory_length,provable_policy}  # If omitted, all defense types are run
 
 # Optional:
 --config CONFIG                       # Benchmark config file (default: benchmark_config.yaml)
@@ -294,7 +294,10 @@ memory-agent-security-benchmark/
 │       │   ├── disable_send/    # Disable send utility tests
 │       │   ├── memory_tools/   # Memory tools utility tests
 │       │   └── long_memory/    # Long memory utility tests
-│       ├── attack_bench/       # Attack bench tests (no suites, direct organization)
+│       ├── attack_bench/       # Attack bench: train/, test/, train_cache/
+│       │   ├── train/          # Train cases (run with --adaptive to optimize attacks)
+│       │   ├── test/           # Test cases (run after propagating attack from cache)
+│       │   └── train_cache/    # Cached optimized train attacks
 │       ├── results/            # Unified results directory
 │       │   ├── explicit/       # Explicit memory results
 │       │   ├── mem0/           # Mem0 memory results
@@ -307,7 +310,6 @@ memory-agent-security-benchmark/
 │       ├── initial_rag_memory/      # RAG memory sets
 │       ├── initial_sessions/ # Initial session states
 │       └── few_shot_examples/ # Few-shot examples for optimizers
-│       └── attack_bench_cache/ # Cached optimized attacks
 ├── html_reports/               # HTML visualization reports
 │   ├── index.html              # Reports index
 │   └── gpt-4o/                 # Model-specific reports
@@ -762,9 +764,8 @@ The caching key is: `{memory_backend}/{defense_type}/{model_name}/{attack_type}/
 - Check that model name is correctly set in `agent_config.yaml` (`agent.target_model_name`)
 
 **Test cases not found:**
-- Check test directory: `data/benchmark/tests/{suite}/` for utility tests or `data/benchmark/attack_bench/` for attack bench tests
-- All utility test cases are in: `data/benchmark/tests/`
-- All attack bench test cases are in: `data/benchmark/attack_bench/`
+- Check test directory: `data/benchmark/tests/{suite}/` for utility tests or `data/benchmark/attack_bench/train/` / `attack_bench/test/` for attack bench
+- All attack bench train cases: `data/benchmark/attack_bench/train/`; test cases: `data/benchmark/attack_bench/test/`
 - Use `--test` with full path if test is in non-standard location
 - Ensure test suite directory exists (memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, long_memory) for utility tests
 
@@ -790,8 +791,8 @@ The caching key is: `{memory_backend}/{defense_type}/{model_name}/{attack_type}/
 # Run explicit memory with no defense
 python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite memory_only
 
-# Run mem0 with all defenses
-python scripts/run_benchmark.py --memory-backend mem0 --all-defenses --suite memory_only
+# Run mem0 with all defenses (omit --defense-type to run all)
+python scripts/run_benchmark.py --memory-backend mem0 --suite memory_only
 
 # Run specific test with force overwrite
 python scripts/run_benchmark.py --memory-backend rag --defense-type user_prompt_only --test data/benchmark/tests/memory_only/memory_only_001.json --force
@@ -832,11 +833,15 @@ data/benchmark/tests/
   long_memory/         # Long memory utility tests
 ```
 
-**Attack Bench Tests** (no suites):
+**Attack Bench Tests** (train / test / train_cache):
 ```
 data/benchmark/attack_bench/
-  {backend}/           # Backend-specific attack tests (e.g., rag/)
-    {test_file}.json   # Individual attack test files
+  train/               # Train cases (run with --adaptive)
+    {backend}/{suite}/ # e.g. rag/persistent_exfiltrate_tax/
+  test/                # Test cases (run after propagate_train_attack_to_test_cases)
+    {backend}/{suite}/
+  train_cache/         # Cached optimized train attacks
+    {backend}/{suite}/
 ```
 
 ### Result Structure

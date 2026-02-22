@@ -37,11 +37,13 @@ sys.path.insert(0, str(BASE_DIR / "src"))
 load_dotenv()
 
 from agent.agent_core import invoke_agent, clear_session_agent, clear_agent_cache
-from agent.utils import load_config, ensure_data_directories, set_global_seeds
+from agent.utils import load_config, set_global_seeds
 from agent.utils import debug_info, debug_debug, debug_print_exception, debug_print_long_content, set_debug_level, DebugLevel, get_debug_level
 from benchmark.test_validators import create_validator, CompositeValidator
 from agent.utils import get_colored_printer
 from benchmark.benchmark_utils import (
+    ATTACK_BENCH_SEGMENT,
+    ATTACK_BENCH_TRAIN,
     ensure_email_unread,
     get_memory_backend_from_config,
     get_unified_defense_from_config,
@@ -165,9 +167,9 @@ class TestBench:
         from benchmark.environment_state import StateManager
         self.state_manager = StateManager()
         
-        # Cache directory for successful attacks (needed for both static and adaptive modes)
-        # Static mode needs this to check for cached optimized attacks
-        self.cache_dir = Path("data/benchmark/attack_bench_cache")
+        # Cache directory for successful train attacks (under attack_bench/train_cache/)
+        # Static mode needs this to check for cached optimized attacks when running test cases
+        self.cache_dir = Path("data/benchmark/attack_bench/train_cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
         # Adaptive mode is set by --adaptive flag (run_benchmark.py or test_bench.py CLI)
@@ -731,6 +733,9 @@ class TestBench:
             # Create and store a shared mem0 manager instance to persist memories across invocations
             from agent.backend.mem0_memory import get_mem0_memory_manager
             mem0_config = test_config["memory"]["mem0_memory"]
+            # Use AGENT extraction for benchmark so the attack email (in assistant reply in step 2) is extracted
+            use_agent = mem0_config.get("use_agent_extraction_for_benchmark", True)
+            agent_id = mem0_config.get("agent_id", "benchmark_agent") if use_agent else None
             mem0_manager = get_mem0_memory_manager(
                 llm_provider=mem0_config.get("llm_provider", "openai"),
                 llm_model=mem0_config.get("llm_model", "gpt-5-mini"),
@@ -740,6 +745,7 @@ class TestBench:
                 vector_store_provider=mem0_config.get("vector_store_provider", "faiss"),
                 top_k=mem0_config.get("top_k", 10),
                 user_id=mem0_config.get("user_id", "vince"),
+                agent_id=agent_id,
             )
             # Store in both in_memory_env and config for consistency
             # Retrieval functions check in_memory_env first, indexing uses config
@@ -1384,6 +1390,8 @@ class TestBench:
                             try:
                                 attack_goal_check = step["attack_goal"]["success_check"]
                                 if isinstance(attack_goal_check, dict):
+                                    # So validators (e.g. FileSystemValidator exfiltration semantic fallback) can use current user message
+                                    test_config["_current_user_message"] = step.get("user_message", "")
                                     in_memory_env = test_config.get("in_memory_environment")
                                     validator = create_validator(attack_goal_check, test_config, in_memory_env)
                                     # Use validate_with_print if it's a composite validator
@@ -1396,18 +1404,21 @@ class TestBench:
                                         from agent.utils import print_validator_result
                                         validator_type = attack_goal_check.get("type", "validator")
                                         print_validator_result(validator_type, "Attack goal", attack_goal_passed)
-                                        # Log to trace
+                                        # Log to trace (include string_match / semantic_judge detail when available)
                                         try:
                                             in_memory_env = test_config.get("in_memory_environment")
                                             if in_memory_env:
+                                                payload = {
+                                                    "type": validator_type,
+                                                    "name": "Attack goal",
+                                                    "passed": attack_goal_passed,
+                                                }
+                                                if hasattr(validator, "get_last_validation_detail") and validator.get_last_validation_detail():
+                                                    payload.update(validator.get_last_validation_detail())
                                                 in_memory_env.log_event(
                                                     session_id,
                                                     "validator_results",
-                                                    {
-                                                        "type": validator_type,
-                                                        "name": "Attack goal",
-                                                        "passed": attack_goal_passed
-                                                    }
+                                                    payload,
                                                 )
                                         except Exception as e:
                                             debug_debug("Could not add user goal validator result to trace")
@@ -1726,6 +1737,36 @@ class TestBench:
             print(f"Non-attack-bench test, running in static mode")
             return self._run_static_test_from_file(test_file)
         
+        # Check if result already exists (per-test skip when force is disabled)
+        results_base_dir_for_test = self._get_results_base_dir_for_test(test_file)
+        backend_for_skip = self.memory_backend_name if self.memory_backend_name != "none" else "none"
+        if should_skip_test(
+            backend_for_skip,
+            self.unified_defense,
+            self.model_name,
+            attack_type,
+            test_file,
+            self.force,
+            results_base_dir_for_test
+        ):
+            result_path = get_result_path(
+                backend_for_skip,
+                self.unified_defense,
+                self.model_name,
+                attack_type,
+                test_file,
+                results_base_dir_for_test
+            )
+            print(f"Skipping {test_file.name} - result already exists at {result_path}")
+            print(f"   Use --force to overwrite")
+            try:
+                with open(result_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                debug_info("Could not load existing result (will run test anyway)")
+                debug_print_exception(e, context="Loading existing adaptive test result", include_traceback=True)
+                # Continue to run the test
+        
         # Check for cached version first
         cached_test = self._get_cached_test(test_file)
         if cached_test:
@@ -1825,32 +1866,44 @@ class TestBench:
         
         return result
     
+    def _get_attack_bench_cache_path(self, test_file: Path) -> Optional[Path]:
+        """For attack_bench/train/backend/suite/file return train_cache/backend/suite/file. Only train cases are cached."""
+        parts = test_file.resolve().parts
+        if ATTACK_BENCH_SEGMENT not in parts:
+            return None
+        idx = parts.index(ATTACK_BENCH_SEGMENT)
+        rest = parts[idx + 1:]
+        # New layout: attack_bench/train/backend/suite/filename
+        if len(rest) >= 4 and rest[0] == ATTACK_BENCH_TRAIN:
+            backend, suite = rest[1], rest[2]
+            return self.cache_dir / backend / suite / test_file.name
+        return None
+
     def _get_cached_test(self, test_file: Path) -> Optional[Path]:
         """Check if there's a cached version of the test with successful attacks."""
-        # Handle test files that may be outside test_bench_dir (e.g., attack_bench tests)
+        test_file_str = str(test_file)
+        if ATTACK_BENCH_SEGMENT in test_file_str:
+            # attack_bench: cache only for train cases at attack_bench/train_cache/backend/suite/filename
+            cache_file = self._get_attack_bench_cache_path(test_file)
+            if cache_file and cache_file.exists():
+                return cache_file
+            return None
+        # Handle test files under test_bench_dir (data/benchmark/tests/)
         try:
-            # Try relative to test_bench_dir first (for tests in data/benchmark/tests/)
             relative_path = test_file.relative_to(self.test_bench_dir)
             cache_file = self.cache_dir / relative_path
         except ValueError:
-            # Test file is not under test_bench_dir (e.g., attack_bench tests)
-            # Use path relative to data/benchmark/ instead
             try:
-                # Make benchmark_base absolute to handle both absolute and relative test_file paths
                 benchmark_base = Path("data/benchmark").resolve()
                 test_file_resolved = test_file.resolve()
                 relative_path = test_file_resolved.relative_to(benchmark_base)
                 cache_file = self.cache_dir / relative_path
             except ValueError:
-                # Fallback: use string manipulation to extract path after "data/benchmark/"
-                test_file_str = str(test_file)
                 if "data/benchmark/" in test_file_str:
                     relative_path = Path(test_file_str.split("data/benchmark/")[-1])
                 else:
-                    # Use filename only as last resort
                     relative_path = Path(test_file.name)
                 cache_file = self.cache_dir / relative_path
-        
         if cache_file.exists():
             return cache_file
         return None
@@ -2215,8 +2268,8 @@ class TestBench:
                                 initial_state = self.state_manager.get_initial_state()
                                 if initial_state:
                                     self.state_manager.curr_state = initial_state.copy()
-                                    # TODO: Replay steps 1 to attack_email_step_num if needed
-                                    # For simplicity, we'll rely on the environment being restored correctly
+                                    # Note: Replay of steps 1..attack_email_step_num is not implemented.
+                                    # Restore uses initial state only; full replay would require re-running those steps.
                                     restore_success = True
                                     print(f"Restored to initial state, will replay steps up to {attack_email_step_num}")
                                 else:
@@ -2247,10 +2300,21 @@ class TestBench:
                             # or state leakage from the previous run (same as scorer does for each candidate).
                             through_idx = max(0, i - 2)  # 0-based: replay through step i-2 so step i-1 is last replayed
                             print(f"🔄 Running verification on fresh environment (replay steps 1-{through_idx + 1}, then step {i})...")
-                            test_config, session_id = self._run_steps_on_fresh_environment(
+                            test_config, session_id, replayed_step_data = self._run_steps_on_fresh_environment(
                                 test_def, through_idx, optimization_result.optimized_attack_email
                             )
                             print(f"✅ Fresh replay complete; running attack step {i}")
+                            # Update step_results and session_history with verification-run traces so result file
+                            # shows e.g. update_memory in step 2 (not the initial run's traces).
+                            for j in range(through_idx + 1):
+                                if j < len(step_results) and replayed_step_data and j < len(replayed_step_data) and replayed_step_data[j]:
+                                    if "step_traces" in replayed_step_data[j]:
+                                        step_results[j]["step_traces"] = replayed_step_data[j]["step_traces"]
+                                    if "agent_response" in replayed_step_data[j]:
+                                        step_results[j]["agent_response"] = replayed_step_data[j]["agent_response"]
+                            # session_history[0] is steps 1-2; set its traces from the replayed step that has them (step index 1 = step 2)
+                            if session_history and replayed_step_data and len(replayed_step_data) > 1 and replayed_step_data[1].get("step_traces"):
+                                session_history[0]["traces"] = replayed_step_data[1]["step_traces"]
                             
                             # Run the attack step (no inject needed; env already has optimized email)
                             step_result = self._run_step_with_attack_check(
@@ -2452,9 +2516,24 @@ class TestBench:
                 try:
                     attack_goal_check = step["attack_goal"]["success_check"]
                     if isinstance(attack_goal_check, dict):
+                        test_config["_current_user_message"] = step.get("user_message", "")
                         in_memory_env = test_config.get("in_memory_environment")
                         validator = create_validator(attack_goal_check, test_config, in_memory_env)
                         attack_goal_passed = validator.validate(response, session_id, step_traces)
+                        # Log validator_results to trace (include string_match / semantic_judge detail when available)
+                        try:
+                            if in_memory_env:
+                                payload = {
+                                    "type": attack_goal_check.get("type", "validator"),
+                                    "name": "Attack goal",
+                                    "passed": attack_goal_passed,
+                                }
+                                if hasattr(validator, "get_last_validation_detail") and validator.get_last_validation_detail():
+                                    payload.update(validator.get_last_validation_detail())
+                                in_memory_env.log_event(session_id, "validator_results", payload)
+                        except Exception as e:
+                            debug_debug("Could not add attack goal validator result to trace")
+                            debug_print_exception(e, context="Adding attack goal validator result to trace", include_traceback=True)
                         try:
                             partial_attack_score = float(validator.score(response, session_id, step_traces))
                         except Exception as e:
@@ -2648,14 +2727,16 @@ class TestBench:
         test_def: Dict[str, Any],
         through_step_index: int,
         optimized_attack_email: Dict[str, Any],
-    ) -> Tuple[Dict[str, Any], str]:
+    ) -> Tuple[Dict[str, Any], str, List[Dict[str, Any]]]:
         """
         Create a completely fresh test environment and run steps 0 through through_step_index (0-based, inclusive).
         Uses optimized_attack_email at the insert_attack_email step. Ensures every evaluation starts from a clean
         mailbox and RAG (no read/unread or state leakage from previous runs).
-        
+
         Returns:
-            (test_config, session_id) after running the steps.
+            (test_config, session_id, replayed_step_data) where replayed_step_data[step_idx] is
+            {"step_traces": [...], "agent_response": "..."} for each step that ran the agent (user_message),
+            so the caller can update the result file with verification-run traces (e.g. update_memory in step 2).
         """
         # CRITICAL: Clear agent cache (including global explicit memory manager) so verification
         # truly starts from empty state. Otherwise the scorer may have left memories in the global
@@ -2663,27 +2744,28 @@ class TestBench:
         # called update_memory during this replay—making verification a false positive and
         # explaining why the same attack fails in normal/static mode where we do clear per test.
         clear_agent_cache()
-        
+
         test_name = test_def.get("name", "adaptive_test")
         initial_data = test_def.get("initial_data", {})
         # Do not pre-add attack_emails; we add the optimized one at the insert_attack_email step.
         initial_data_no_attack = {k: v for k, v in initial_data.items() if k != "attack_emails"}
-        
+
         fresh_test_config = self.create_test_environment(test_name, initial_data_no_attack or None)
         session_id = f"adaptive_{int(time.time()*1000)}"
         from agent.agent_core import SessionTrustManager, ProvablePolicyManager
         SessionTrustManager.initialize_session(session_id)
         ProvablePolicyManager.initialize_session(session_id)
-        
+
         steps = test_def.get("steps", [])
         in_memory_env = fresh_test_config.get("in_memory_environment")
-        
+        replayed_step_data: List[Dict[str, Any]] = [{} for _ in range(through_step_index + 1)]
+
         for step_idx in range(through_step_index + 1):
             if step_idx >= len(steps):
                 break
             step = steps[step_idx]
             step_type = step.get("step_type", "user_message")
-            
+
             if step_type == "start_new_session":
                 old_session_id = session_id
                 session_id = f"adaptive_{int(time.time()*1000)}"
@@ -2704,8 +2786,17 @@ class TestBench:
                 user_msg = step.get("user_message", "")
                 if user_msg:
                     invoke_agent(user_msg, session_id, fresh_test_config, in_memory_env)
-        
-        return fresh_test_config, session_id
+                    # Capture traces and agent response for this step so result file shows verification run
+                    if in_memory_env and step_idx < len(replayed_step_data):
+                        step_traces = in_memory_env.get_traces(session_id) or []
+                        replayed_step_data[step_idx]["step_traces"] = step_traces
+                        for ev in reversed(step_traces):
+                            if ev.get("event_type") == "agent_response":
+                                text = ev.get("text") or ev.get("payload", {}).get("text") or ""
+                                replayed_step_data[step_idx]["agent_response"] = text
+                                break
+
+        return fresh_test_config, session_id, replayed_step_data
     
     def _optimize_attack(self, test_def: Dict[str, Any], failed_step: Dict[str, Any], 
                         step_num: int, session_id: str, test_config: Dict[str, Any]) -> Any:
@@ -2868,30 +2959,27 @@ class TestBench:
         print(f"💾 Caching successful attack for {test_file.name}")
         
         try:
-            # Create cache directory structure
-            # Handle test files that may be outside test_bench_dir (e.g., attack_bench tests)
-            try:
-                # Try relative to test_bench_dir first (for tests in data/benchmark/tests/)
-                relative_path = test_file.relative_to(self.test_bench_dir)
-                cache_file = self.cache_dir / relative_path
-            except ValueError:
-                # Test file is not under test_bench_dir (e.g., attack_bench tests)
-                # Use path relative to data/benchmark/ instead
+            test_file_str = str(test_file)
+            if ATTACK_BENCH_SEGMENT in test_file_str:
+                cache_file = self._get_attack_bench_cache_path(test_file)
+                if not cache_file:
+                    return
+            else:
                 try:
-                    # Make benchmark_base absolute to handle both absolute and relative test_file paths
-                    benchmark_base = Path("data/benchmark").resolve()
-                    test_file_resolved = test_file.resolve()
-                    relative_path = test_file_resolved.relative_to(benchmark_base)
+                    relative_path = test_file.relative_to(self.test_bench_dir)
                     cache_file = self.cache_dir / relative_path
                 except ValueError:
-                    # Fallback: use string manipulation to extract path after "data/benchmark/"
-                    test_file_str = str(test_file)
-                    if "data/benchmark/" in test_file_str:
-                        relative_path = Path(test_file_str.split("data/benchmark/")[-1])
-                    else:
-                        # Use filename only as last resort
-                        relative_path = Path(test_file.name)
-                    cache_file = self.cache_dir / relative_path
+                    try:
+                        benchmark_base = Path("data/benchmark").resolve()
+                        test_file_resolved = test_file.resolve()
+                        relative_path = test_file_resolved.relative_to(benchmark_base)
+                        cache_file = self.cache_dir / relative_path
+                    except ValueError:
+                        if "data/benchmark/" in test_file_str:
+                            relative_path = Path(test_file_str.split("data/benchmark/")[-1])
+                        else:
+                            relative_path = Path(test_file.name)
+                        cache_file = self.cache_dir / relative_path
             
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             
@@ -2928,7 +3016,7 @@ class TestBench:
             with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(cached_test, f, indent=2, ensure_ascii=False)
             
-            print(f"💾 Cached test saved to: {cache_file}")
+            print(f"💾 Cached test saved to: {cache_file}", flush=True)
         except Exception as e:
             print(f"⚠️  Error in _cache_successful_attack: {e}")
             import traceback

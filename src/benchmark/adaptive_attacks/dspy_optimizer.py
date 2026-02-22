@@ -6,7 +6,7 @@ and prompt optimization capabilities for generating effective prompt injection a
 """
 
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import dspy
 from .base_optimizer import BaseOptimizer, OptimizationResult
 from .scorer import AttackScorer
@@ -454,7 +454,7 @@ class DSPyOptimizer(BaseOptimizer):
                        step_num: int,
                        session_id: str,
                        test_config: Dict[str, Any],
-                       environment_state: 'EnvironmentState',
+                       environment_state: Optional['EnvironmentState'] = None,
                        max_iterations: int | None = None) -> OptimizationResult:
         """
         Optimize attack using DSPy-style few-shot learning with real agent testing.

@@ -28,6 +28,9 @@ UNIFIED_DEFENSE_TYPES = [
     "provable_policy",
 ]
 
+# Memory backends (used by benchmark runner, CI, and consolidation scripts)
+MEMORY_BACKENDS = ["none", "explicit", "mem0", "rag", "context"]
+
 
 def is_valid_combination(memory_backend: str, unified_defense: str) -> bool:
     """
@@ -94,27 +97,34 @@ def _get_result_path_components(
 
 # Base segment for attack_bench in paths (used to detect and parse suite subfolder)
 ATTACK_BENCH_SEGMENT = "attack_bench"
+# Subfolders under attack_bench: train (train cases), test (test cases), train_cache (cached optimized train)
+ATTACK_BENCH_TRAIN = "train"
+ATTACK_BENCH_TEST = "test"
+ATTACK_BENCH_TRAIN_CACHE = "train_cache"
 
 
 def get_attack_bench_suite_subfolder(test_file: Path) -> Optional[str]:
     """
-    If the test file lives under attack_bench/<backend>/<subfolder>/file.json,
-    return <subfolder> (the test case suite name). Otherwise return None.
-
-    Examples:
-      attack_bench/rag/00_exfiltrate.json -> None (flat)
-      attack_bench/rag/persistent_exfiltrate_tax/00_persistent_exfiltrate_tax.json -> "persistent_exfiltrate_tax"
+    If the test file lives under attack_bench/.../<suite>/file.json, return <suite> (the test case suite name).
+    Supports:
+      - attack_bench/<backend>/<suite>/file.json (legacy flat)
+      - attack_bench/<train|test>/<backend>/<suite>/file.json (new layout)
+    Returns None if path is flat (file directly under backend).
     """
     parts = test_file.resolve().parts
     if ATTACK_BENCH_SEGMENT not in parts:
         return None
     idx = parts.index(ATTACK_BENCH_SEGMENT)
-    # After attack_bench: [backend, ...rest]
-    rest = parts[idx + 2:]  # skip "attack_bench" and backend
+    rest = parts[idx + 1:]  # after "attack_bench": [train|test|backend, ...]
     if len(rest) <= 1:
-        return None  # file is directly under backend (flat)
-    # rest is [suite_dir, filename] -> suite = suite_dir
-    return rest[0]
+        return None  # file directly under backend (flat)
+    # New layout: attack_bench/train|test/backend/suite/file -> rest[0]=train|test, rest[2]=suite
+    if rest[0] in (ATTACK_BENCH_TRAIN, ATTACK_BENCH_TEST) and len(rest) >= 4:
+        return rest[2]  # suite name
+    # Legacy: attack_bench/backend/suite/file -> rest = [backend, suite, filename]
+    if len(rest) >= 2:
+        return rest[1]  # suite name
+    return None
 
 
 def get_result_path(
@@ -545,7 +555,7 @@ def determine_attack_type(test_file: Path, test_def: Optional[Dict[str, Any]] = 
     if "long_memory" in test_file_str or test_file.name.startswith("long_memory_"):
         return "long_memory"
     
-    # Valid utility suite types (not obsolete "benign", "direct", "indirect")
+    # Valid utility suite types (used for path construction and validation)
     valid_utility_suites = {"memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"}
     
     # Check if this is an attack_bench test (no suite structure)
@@ -565,11 +575,9 @@ def determine_attack_type(test_file: Path, test_def: Optional[Dict[str, Any]] = 
     # Otherwise, use attack_type from test definition if available
     if test_def:
         attack_type = test_def.get("attack_type")
-        # Only return valid utility suite types, not obsolete "benign", "direct", "indirect"
         if attack_type in valid_utility_suites:
             return attack_type
-        # If attack_type is obsolete or not found, return "unknown" as default
-        # This ensures we always return a valid string for path construction
+        # Invalid or missing attack_type: return "unknown" for path construction
         return "unknown"
     
     # Fallback: try to read from file

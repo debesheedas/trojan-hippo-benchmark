@@ -4,6 +4,11 @@ Compare benchmark results against ground truth.
 
 This script reads the results from a benchmark run and compares them
 against the expected results in ground_truth.json.
+
+CI MODEL: When comparing CI results (results dir under CI-tests/results),
+the model is fixed to CI_MODEL = "gpt-5-mini". Ground truth files are
+meant for this model. Do not change without updating run_ci_tests.sh,
+update_ground_truth_from_results.py, and the regression workflow.
 """
 
 import json
@@ -14,13 +19,22 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR / "src"))
 
-from benchmark.benchmark_utils import get_result_path, determine_attack_type
+from benchmark.benchmark_utils import (
+    get_result_path,
+    determine_attack_type,
+    MEMORY_BACKENDS,
+    UNIFIED_DEFENSE_TYPES,
+    is_valid_combination,
+)
 from agent.utils import load_config
+
+# CI and ground truth are fixed to this model (see CI-tests/README.md).
+CI_MODEL = "gpt-5-mini"
 
 
 def load_ground_truth(ground_truth_path: Path) -> dict:
     """Load ground truth from JSON file."""
-    with open(ground_truth_path, 'r') as f:
+    with open(ground_truth_path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 
@@ -38,7 +52,7 @@ def get_actual_result(
         True if test passed, False otherwise
     """
     # Determine attack type
-    with open(test_file, 'r') as f:
+    with open(test_file, 'r', encoding='utf-8') as f:
         test_def = json.load(f)
     attack_type = determine_attack_type(test_file, test_def)
     
@@ -57,7 +71,7 @@ def get_actual_result(
         print(f"  WARNING: Result file not found: {result_path}")
         return False
     
-    with open(result_path, 'r') as f:
+    with open(result_path, 'r', encoding='utf-8') as f:
         result = json.load(f)
     
     return result.get("overall_success", False)
@@ -76,20 +90,12 @@ def compare_results(
         (all_match, failures) where failures is a list of mismatches
     """
     ground_truth = load_ground_truth(ground_truth_path)
-    
-    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
-    defense_types = ["none", "user_prompt_only", "no_untrusted_tools", "limit_memory_length", "provable_policy"]
-    
     failures = []
-    
-    for memory_backend in memory_backends:
-        for defense_type in defense_types:
-            # Skip invalid combinations
-            if memory_backend == "context" and defense_type == "limit_memory_length":
+
+    for memory_backend in MEMORY_BACKENDS:
+        for defense_type in UNIFIED_DEFENSE_TYPES:
+            if not is_valid_combination(memory_backend, defense_type):
                 continue
-            if memory_backend == "explicit" and defense_type == "user_prompt_only":
-                continue
-            
             # Get expected result
             expected = ground_truth[memory_backend][defense_type]
             
@@ -159,13 +165,17 @@ def main():
         # Ground truth files are in CI-tests/ground_truth/{test_name}.json
         args.ground_truth = BASE_DIR / "CI-tests" / "ground_truth" / f"{test_name}.json"
     
-    # Get model name from config if not provided
+    # CI results and ground truth use gpt-5-mini only.
     if args.model is None:
-        try:
-            agent_config = load_config("agent_config.yaml")
-            args.model = agent_config.get("agent", {}).get("target_model_name", "gpt-4o-mini")
-        except Exception:
-            args.model = "gpt-4o-mini"  # Fallback default
+        results_dir_str = str(args.results_dir.resolve())
+        if "CI-tests" in results_dir_str and "results" in results_dir_str:
+            args.model = CI_MODEL
+        else:
+            try:
+                agent_config = load_config("agent_config.yaml")
+                args.model = agent_config.get("agent", {}).get("target_model_name", "gpt-4o-mini")
+            except Exception:
+                args.model = "gpt-4o-mini"  # Fallback default
     
     # Verify ground truth file exists
     if not args.ground_truth.exists():

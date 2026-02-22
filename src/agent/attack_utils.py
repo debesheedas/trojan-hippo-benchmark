@@ -82,17 +82,17 @@ def compare_attack_bench_files(original_file: Path, cached_file: Path) -> Dict[s
         }
 
 
-def validate_cache_integrity(cache_dir: str = "data/benchmark/attack_bench_cache", 
-                           original_dir: str = "data/benchmark/attack_bench") -> Dict[str, Any]:
+def validate_cache_integrity(cache_dir: str = "data/benchmark/attack_bench/train_cache",
+                           original_dir: str = "data/benchmark/attack_bench/train") -> Dict[str, Any]:
     """
     Validate the integrity of all cached attack benchmark files.
     
-    This function compares all cached files with their original counterparts
+    Compares files in train_cache/{backend}/{suite}/ with train/{backend}/{suite}/
     to ensure the caching system is working correctly.
     
     Args:
-        cache_dir: Directory containing cached files
-        original_dir: Directory containing original files
+        cache_dir: Directory containing cached files (default: attack_bench/train_cache)
+        original_dir: Directory containing original train files (default: attack_bench/train)
     
     Returns:
         Dictionary with validation results:

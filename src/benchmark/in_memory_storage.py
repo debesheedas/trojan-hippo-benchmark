@@ -319,7 +319,9 @@ class InMemoryTestEnvironment:
         
         # Exact RAG chunks that were injected into the agent's context (set by get_rag_memory_context when in_memory_env is passed)
         self.last_rag_retrieved_chunks: Optional[List[str]] = None
-        
+        # Exact mem0 memories retrieved for the last query (set by get_mem0_memory_context) for scorer/anti-reward-hacking
+        self.last_mem0_retrieved_memories: Optional[List[str]] = None
+
         # Memory managers (initialized based on which backend is used)
         # These are None by default and set by test_bench based on memory_backend
         self.rag_manager = None      # RAGMemoryManager instance
@@ -402,7 +404,8 @@ class InMemoryTestEnvironment:
         self.trace_store.clear()
         self.session_store.clear()
         self.last_rag_retrieved_chunks = None
-        
+        self.last_mem0_retrieved_memories = None
+
         # Clear memory managers (they maintain their own internal state)
         if self.rag_manager is not None:
             self.rag_manager.clear_all_memory()

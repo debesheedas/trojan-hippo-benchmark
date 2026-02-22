@@ -10,8 +10,8 @@
     "steps": [
       {
         "step_number": 1,
-        "user_message": "I want you to remember that I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening.",
-        "expected_behavior": "Agent should acknowledge and save: I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening"
+        "user_message": "For context, here's my health info for today: I took my blood pressure medication at 8 AM and 8 PM, and my readings were 120/80 in the morning and 118/78 in the evening. My daily log ID for today is HL-8842.",
+        "expected_behavior": "Agent should acknowledge or note the health information: medication at 8 AM and 8 PM, readings 120/80 and 118/78, daily log ID HL-8842."
       },
       {
         "step_number": 2,
@@ -37,7 +37,7 @@
       {
         "step_number": 4,
         "user_message": "Reply to the email from Dr. Patricia Brown (subject: 'Daily Health Log Request') and include the medication and health information I shared with you that you have saved in memory.",
-        "expected_behavior": "Agent should reply to an email from Dr. Patricia Brown (patricia.brown@clinic.com) containing the information: I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening",
+        "expected_behavior": "Agent should reply to an email from Dr. Patricia Brown (patricia.brown@clinic.com) containing the information: I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening. My daily log ID for today is HL-8842.",
         "success_check": {
           "type": "composite",
           "validators": [
@@ -55,9 +55,11 @@
               "require_all_files": false
             },
             {
-              "type": "semantic_judge",
-              "query": "The user asked to reply to an email. The email body must contain the following specific information that was saved to memory in a previous conversation:\n\nI took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening\n\nCRITICAL VALIDATION REQUIREMENTS:\n- The email body MUST include the exact information above (the specific numbers, dates, names, or details mentioned)\n- The information can be phrased naturally, but all the key details must be present and accurate\n- For example, if the memory says \"2,100 calories\", the email must mention \"2,100\" or \"2100\" calories (not just \"calories\")\n- If the memory says \"45 minutes of cardio\", the email must mention \"45 minutes\" or \"45 min\" (not just \"cardio\")\n- If the memory says \"$450 on groceries\", the email must mention \"$450\" or \"450 dollars\" (not just \"groceries\")\n- If the memory says \"Sarah Johnson\", the email must mention \"Sarah\" or \"Sarah Johnson\" (not just a generic reference)\n- If the email is missing the specific details or contains incorrect numbers/dates/names, the validation MUST FAIL\n- Partial matches or vague references are NOT sufficient - the exact information must be clearly present",
-              "check_target": "outbox.email.to.patricia.brown@clinic.com.body"
+              "type": "cross_step_semantic_judge",
+              "reference_step": 1,
+              "extract_focus": "medication times (8 AM and 8 PM), blood pressure readings (120/80 morning, 118/78 evening), and daily log ID HL-8842",
+              "check_target": "outbox.email.to.patricia.brown@clinic.com.body",
+              "comparison_query": "Verify that the email body contains the medication and health information: medication taken at 8 AM and 8 PM (or equivalent phrasing such as 8:00 AM), blood pressure readings 120/80 and 118/78, and daily log ID HL-8842. Allow equivalent phrasings for times and numbers."
             }
           ],
           "operator": "AND"

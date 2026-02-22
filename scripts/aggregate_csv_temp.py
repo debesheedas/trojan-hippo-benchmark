@@ -34,7 +34,7 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR / "src"))
 
-from benchmark.benchmark_utils import UNIFIED_DEFENSE_TYPES
+from benchmark.benchmark_utils import UNIFIED_DEFENSE_TYPES, MEMORY_BACKENDS
 
 
 def parse_csv_file(csv_file: Path) -> Optional[Dict]:
@@ -50,7 +50,6 @@ def parse_csv_file(csv_file: Path) -> Optional[Dict]:
             reader = csv.DictReader(f)
             
             data = {}
-            memory_backends = ["none", "explicit", "mem0", "rag", "context"]
             backend_mapping = {
                 "No Memory (%)": "none",
                 "Explicit (%)": "explicit",
@@ -145,7 +144,7 @@ def collect_all_data_from_csvs(
     
     if not csv_file.exists():
         # Return empty data structure
-        memory_backends = ["none", "explicit", "mem0", "rag", "context"]
+        memory_backends = MEMORY_BACKENDS
         defense_types = UNIFIED_DEFENSE_TYPES
         data = {}
         for defense_type in defense_types:
@@ -157,7 +156,7 @@ def collect_all_data_from_csvs(
     parsed_data = parse_csv_file(csv_file)
     if parsed_data is None:
         # Return empty data structure
-        memory_backends = ["none", "explicit", "mem0", "rag", "context"]
+        memory_backends = MEMORY_BACKENDS
         defense_types = UNIFIED_DEFENSE_TYPES
         data = {}
         for defense_type in defense_types:
@@ -167,7 +166,7 @@ def collect_all_data_from_csvs(
         return data
     
     # Ensure all defense types and backends are present
-    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
+    memory_backends = MEMORY_BACKENDS
     defense_types = UNIFIED_DEFENSE_TYPES
     
     # Fill in missing entries
@@ -193,7 +192,7 @@ def generate_combined_heatmaps_subplot(
     if not PLOTTING_AVAILABLE:
         raise ImportError("matplotlib and seaborn are required for plotting. Install with: pip install matplotlib seaborn")
     
-    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
+    memory_backends = MEMORY_BACKENDS
     backend_labels = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
     defense_types = UNIFIED_DEFENSE_TYPES
     defense_labels = [dt.replace("_", " ").title() for dt in defense_types]
@@ -297,7 +296,7 @@ def generate_average_heatmap(
     if not PLOTTING_AVAILABLE:
         raise ImportError("matplotlib and seaborn are required for plotting. Install with: pip install matplotlib seaborn")
     
-    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
+    memory_backends = MEMORY_BACKENDS
     backend_labels = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
     defense_types = UNIFIED_DEFENSE_TYPES
     defense_labels = [dt.replace("_", " ").title() for dt in defense_types]
@@ -396,7 +395,7 @@ def generate_combined_csv(
     """
     output_file = output_dir / f"{model_name}_all_suites_combined.csv"
     
-    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
+    memory_backends = MEMORY_BACKENDS
     defense_types = UNIFIED_DEFENSE_TYPES
     
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
@@ -446,7 +445,7 @@ def generate_average_summary_csv(
     """
     output_file = output_dir / f"{model_name}_average_summary.csv"
     
-    memory_backends = ["none", "explicit", "mem0", "rag", "context"]
+    memory_backends = MEMORY_BACKENDS
     defense_types = UNIFIED_DEFENSE_TYPES
     
     with open(output_file, 'w', newline='', encoding='utf-8') as f:

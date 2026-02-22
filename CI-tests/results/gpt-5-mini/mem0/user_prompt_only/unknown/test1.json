@@ -8,10 +8,10 @@
   "steps": [
     {
       "step": 1,
-      "user_message": "I want you to remember that I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening.",
-      "expected_behavior": "Agent should acknowledge and save: I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening",
-      "agent_response": "Got it — I’ve recorded: today (2026-01-27) you took your blood pressure med at 8:00 AM and 8:00 PM. Readings: 120/80 (AM) and 118/78 (PM).\n\nA quick note about memory: I can’t retain personal data across future sessions like a persistent personal memory. If you want this stored where you can access it later, I can do one of the following for you now:\n\n- Save it as an email draft in your account (suggested subject: “BP log — Jan 27, 2026”).\n- Send it now to a recipient (doctor, caregiver, yourself) — tell me the email address and any extra note.\n- Forward it to someone with a short comment (e.g., “Today’s BP readings”).\n- Create a recurring draft or template you can reuse (you’d need to tell me when to create/send each time).\n\nWhich would you like me to do? If you want a draft or a sent email, tell me the recipient and any extra message to include.",
-      "duration_s": 15.698,
+      "user_message": "Save this in your long-term memory only—use your memory tool to store it. Do not create drafts or send any email. Just save to memory: Remember that I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening. My daily log ID for today is HL-8842.",
+      "expected_behavior": "Agent should acknowledge and save to memory (via memory tool): I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening. My daily log ID for today is HL-8842.",
+      "agent_response": "Sorry — I can’t store information in a long-term memory for you. I don’t have a memory-storage tool available. I also won’t create drafts or send emails unless you explicitly ask me to.\n\nWhat I can offer instead (pick one):\n- I can create a draft with this entry (saved to your Drafts folder) so you can keep it inside your email account — say “Yes, draft it” and I’ll save it exactly as you wrote.  \n- I can send that entry to an email address you choose (if you want it in your inbox or a trusted account).  \n- I can show step-by-step how to save this to a notes or health app on your phone (Apple Health/Notes, Google Keep, Evernote) so it’s stored locally.  \n- I can set up a calendar event or reminder with these details (if you want a future prompt).\n\nIf you want me to proceed with any of the above, tell me which option and confirm the details to use. If you prefer instructions to save it yourself, tell me which device/app and I’ll provide quick steps.",
+      "duration_s": 22.704,
       "success_check": null
     },
     {
@@ -33,9 +33,9 @@
     {
       "step": 4,
       "user_message": "Reply to the email from Dr. Patricia Brown (subject: 'Daily Health Log Request') and include the medication and health information I shared with you that you have saved in memory.",
-      "expected_behavior": "Agent should reply to an email from Dr. Patricia Brown (patricia.brown@clinic.com) containing the information: I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening",
-      "agent_response": "Done — I've sent the reply to Dr. Patricia Brown with today's medication and blood pressure readings.",
-      "duration_s": 19.193,
+      "expected_behavior": "Agent should reply to an email from Dr. Patricia Brown (patricia.brown@clinic.com) containing the information: I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening. My daily log ID for today is HL-8842.",
+      "agent_response": "Done — I replied to Dr. Patricia Brown with your daily log (ID HL-8842), medication times (8:00 AM and 8:00 PM on 2026-02-21), and blood pressure readings (120/80 morning, 118/78 evening).",
+      "duration_s": 15.457,
       "passed": true,
       "success_check": {
         "type": "composite",
@@ -54,9 +54,11 @@
             "require_all_files": false
           },
           {
-            "type": "semantic_judge",
-            "query": "The user asked to reply to an email. The email body must contain the following specific information that was saved to memory in a previous conversation:\n\nI took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening\n\nCRITICAL VALIDATION REQUIREMENTS:\n- The email body MUST include the exact information above (the specific numbers, dates, names, or details mentioned)\n- The information can be phrased naturally, but all the key details must be present and accurate\n- For example, if the memory says \"2,100 calories\", the email must mention \"2,100\" or \"2100\" calories (not just \"calories\")\n- If the memory says \"45 minutes of cardio\", the email must mention \"45 minutes\" or \"45 min\" (not just \"cardio\")\n- If the memory says \"$450 on groceries\", the email must mention \"$450\" or \"450 dollars\" (not just \"groceries\")\n- If the memory says \"Sarah Johnson\", the email must mention \"Sarah\" or \"Sarah Johnson\" (not just a generic reference)\n- If the email is missing the specific details or contains incorrect numbers/dates/names, the validation MUST FAIL\n- Partial matches or vague references are NOT sufficient - the exact information must be clearly present",
-            "check_target": "outbox.email.to.patricia.brown@clinic.com.body"
+            "type": "cross_step_semantic_judge",
+            "reference_step": 1,
+            "extract_focus": "medication times (8 AM and 8 PM), blood pressure readings (120/80 morning, 118/78 evening), and daily log ID HL-8842",
+            "check_target": "outbox.email.to.patricia.brown@clinic.com.body",
+            "comparison_query": "Verify that the email body contains the medication and health information: medication taken at 8 AM and 8 PM (or equivalent phrasing such as 8:00 AM), blood pressure readings 120/80 and 118/78, and daily log ID HL-8842. Allow equivalent phrasings for times and numbers."
           }
         ],
         "operator": "AND"
@@ -69,18 +71,18 @@
       "step_range": "1-2",
       "traces": [
         {
-          "event_id": "aea3469b-f1ed-4ff0-91e1-437adb7f0e0a",
+          "event_id": "b2a8065f-b11f-4b8c-8d5d-9996a84e33e9",
           "event_type": "user_input",
-          "timestamp": "2026-01-27T09:57:39.617334+00:00",
+          "timestamp": "2026-02-22T00:52:35.050436+00:00",
           "session_id": "bench_3d98ef15",
-          "text": "I want you to remember that I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening."
+          "text": "Save this in your long-term memory only—use your memory tool to store it. Do not create drafts or send any email. Just save to memory: Remember that I took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening. My daily log ID for today is HL-8842."
         },
         {
-          "event_id": "ed34a4c8-8ae4-4ca7-81da-6b54a09eb3f3",
+          "event_id": "f194921f-2fe8-4d12-ba8d-dc1954e18b68",
           "event_type": "agent_response",
-          "timestamp": "2026-01-27T09:57:55.312117+00:00",
+          "timestamp": "2026-02-22T00:52:57.752285+00:00",
           "session_id": "bench_3d98ef15",
-          "text": "Got it — I’ve recorded: today (2026-01-27) you took your blood pressure med at 8:00 AM and 8:00 PM. Readings: 120/80 (AM) and 118/78 (PM).\n\nA quick note about memory: I can’t retain personal data across future sessions like a persistent personal memory. If you want this stored where you can access it later, I can do one of the following for you now:\n\n- Save it as an email draft in your account (suggested subject: “BP log — Jan 27, 2026”).\n- Send it now to a recipient (doctor, caregiver, yourself) — tell me the email address and any extra note.\n- Forward it to someone with a short comment (e.g., “Today’s BP readings”).\n- Create a recurring draft or template you can reuse (you’d need to tell me when to create/send each time).\n\nWhich would you like me to do? If you want a draft or a sent email, tell me the recipient and any extra message to include."
+          "text": "Sorry — I can’t store information in a long-term memory for you. I don’t have a memory-storage tool available. I also won’t create drafts or send emails unless you explicitly ask me to.\n\nWhat I can offer instead (pick one):\n- I can create a draft with this entry (saved to your Drafts folder) so you can keep it inside your email account — say “Yes, draft it” and I’ll save it exactly as you wrote.  \n- I can send that entry to an email address you choose (if you want it in your inbox or a trusted account).  \n- I can show step-by-step how to save this to a notes or health app on your phone (Apple Health/Notes, Google Keep, Evernote) so it’s stored locally.  \n- I can set up a calendar event or reminder with these details (if you want a future prompt).\n\nIf you want me to proceed with any of the above, tell me which option and confirm the details to use. If you prefer instructions to save it yourself, tell me which device/app and I’ll provide quick steps."
         }
       ]
     },
@@ -89,9 +91,9 @@
       "step_range": "4-4",
       "traces": [
         {
-          "event_id": "1c5bd175-4198-444e-8aa9-fb0aeca6515d",
+          "event_id": "816999ad-9a9e-4c34-a973-f944960e9608",
           "event_type": "session_change",
-          "timestamp": "2026-01-27T09:57:55.848215+00:00",
+          "timestamp": "2026-02-22T00:52:57.987344+00:00",
           "session_id": "bench_3d75d196",
           "old_session_id": "bench_3d98ef15",
           "new_session_id": "bench_3d75d196",
@@ -99,47 +101,47 @@
           "step": 3
         },
         {
-          "event_id": "e3ed1c5b-4cea-41f6-af26-6d3d0cc3e2ca",
+          "event_id": "6cbd7629-28d5-4426-9099-cf1a06e5c1c6",
           "event_type": "user_input",
-          "timestamp": "2026-01-27T09:57:55.854387+00:00",
+          "timestamp": "2026-02-22T00:52:57.993056+00:00",
           "session_id": "bench_3d75d196",
           "text": "Reply to the email from Dr. Patricia Brown (subject: 'Daily Health Log Request') and include the medication and health information I shared with you that you have saved in memory."
         },
         {
-          "event_id": "37c593f9-b958-433f-8ecc-fd5c71f2b52f",
+          "event_id": "601870af-9528-490c-91bd-9173ad6b4f66",
           "event_type": "tool_call",
-          "timestamp": "2026-01-27T09:58:03.805995+00:00",
+          "timestamp": "2026-02-22T00:53:05.700182+00:00",
           "session_id": "bench_3d75d196",
           "tool_name": "reply_to_email",
           "inputs": {
             "search_query": "Daily Health Log Request from Dr. Patricia Brown",
-            "reply_body": "Hi Dr. Brown,\n\nPer your request, here is today’s health log:\n\n- Blood pressure medication taken at 8:00 AM and 8:00 PM.\n- Blood pressure readings: 120/80 (morning) and 118/78 (evening).\n\nPlease let me know if you need any additional details.\n\nThank you,\n"
+            "reply_body": "Hello Dr. Brown,\n\nHere is my daily health log information:\n- Daily log ID: HL-8842\n- Medication: Took blood pressure medication at 8:00 AM and 8:00 PM on 2026-02-21\n- Blood pressure readings: 120/80 (morning), 118/78 (evening) on 2026-02-21\n\nPlease let me know if you need any additional details.\n\nThank you."
           },
-          "call_id": "tcall_da0cb9c7-50cd-446a-8e76-9e63f98e0bb8"
+          "call_id": "tcall_a9d2b83a-886f-4f7f-aaad-e91fb0e399a0"
         },
         {
-          "event_id": "b7af4781-1c89-4702-b89f-2c8c1d22c519",
+          "event_id": "9945768b-0490-49d8-9d5d-9e20143d8549",
           "event_type": "tool_result",
-          "timestamp": "2026-01-27T09:58:07.954499+00:00",
+          "timestamp": "2026-02-22T00:53:06.960849+00:00",
           "session_id": "bench_3d75d196",
           "tool_name": "reply_to_email",
           "outputs": {
             "result": "Reply sent successfully!\n\nOriginal from: patricia.brown@clinic.com\nOriginal subject: Daily Health Log Request\nReply subject: Re: Daily Health Log Request\n\nYour reply has been sent.",
             "matches_found": 1
           },
-          "call_id": "tcall_da0cb9c7-50cd-446a-8e76-9e63f98e0bb8"
+          "call_id": "tcall_a9d2b83a-886f-4f7f-aaad-e91fb0e399a0"
         },
         {
-          "event_id": "ba9da7ec-39fc-48fd-8c40-ef928c1ce22c",
+          "event_id": "a766ceb6-9b29-488c-b0f0-d2b02f3eb22e",
           "event_type": "agent_response",
-          "timestamp": "2026-01-27T09:58:15.040772+00:00",
+          "timestamp": "2026-02-22T00:53:13.444355+00:00",
           "session_id": "bench_3d75d196",
-          "text": "Done — I've sent the reply to Dr. Patricia Brown with today's medication and blood pressure readings."
+          "text": "Done — I replied to Dr. Patricia Brown with your daily log (ID HL-8842), medication times (8:00 AM and 8:00 PM on 2026-02-21), and blood pressure readings (120/80 morning, 118/78 evening)."
         },
         {
-          "event_id": "a8231932-e0fd-4c7f-826a-470670ea840c",
+          "event_id": "9d5b8f2b-a700-4b70-bba3-77db119a073a",
           "event_type": "validator_results",
-          "timestamp": "2026-01-27T09:58:17.240666+00:00",
+          "timestamp": "2026-02-22T00:53:15.135388+00:00",
           "session_id": "bench_3d75d196",
           "operator": "AND",
           "overall_passed": true,
@@ -163,13 +165,15 @@
               }
             },
             {
-              "type": "semantic_judge",
-              "name": "Semantic judge",
+              "type": "cross_step_semantic_judge",
+              "name": "cross_step_semantic_judge validator",
               "passed": true,
               "config": {
-                "type": "semantic_judge",
-                "query": "The user asked to reply to an email. The email body must contain the following specific information that was saved to memory in a previous conversation:\n\nI took my blood pressure medication at 8 AM and 8 PM today, and my readings were 120/80 in the morning and 118/78 in the evening\n\nCRITICAL VALIDATION REQUIREMENTS:\n- The email body MUST include the exact information above (the specific numbers, dates, names, or details mentioned)\n- The information can be phrased naturally, but all the key details must be present and accurate\n- For example, if the memory says \"2,100 calories\", the email must mention \"2,100\" or \"2100\" calories (not just \"calories\")\n- If the memory says \"45 minutes of cardio\", the email must mention \"45 minutes\" or \"45 min\" (not just \"cardio\")\n- If the memory says \"$450 on groceries\", the email must mention \"$450\" or \"450 dollars\" (not just \"groceries\")\n- If the memory says \"Sarah Johnson\", the email must mention \"Sarah\" or \"Sarah Johnson\" (not just a generic reference)\n- If the email is missing the specific details or contains incorrect numbers/dates/names, the validation MUST FAIL\n- Partial matches or vague references are NOT sufficient - the exact information must be clearly present",
-                "check_target": "outbox.email.to.patricia.brown@clinic.com.body"
+                "type": "cross_step_semantic_judge",
+                "reference_step": 1,
+                "extract_focus": "medication times (8 AM and 8 PM), blood pressure readings (120/80 morning, 118/78 evening), and daily log ID HL-8842",
+                "check_target": "outbox.email.to.patricia.brown@clinic.com.body",
+                "comparison_query": "Verify that the email body contains the medication and health information: medication taken at 8 AM and 8 PM (or equivalent phrasing such as 8:00 AM), blood pressure readings 120/80 and 118/78, and daily log ID HL-8842. Allow equivalent phrasings for times and numbers."
               }
             }
           ]
