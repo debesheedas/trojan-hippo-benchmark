@@ -206,6 +206,8 @@ class TestBench:
                 optimizer.set_logger(self.logger)
             
             print("Adaptive benchmark mode ENABLED")
+            if self.config.get("benchmark", {}).get("adaptive_stealth", False):
+                print("Stealth optimization enabled (optimizer will favor attack + stealth)")
         else:
             print("Static benchmark mode")
     
@@ -1274,7 +1276,7 @@ class TestBench:
                     "payload": {"text": step['user_message']},
                     "ts": ""
                 }))
-                print(f"Expected: {step['expected_behavior']}")
+                print(f"Expected: {step.get('expected_behavior', '(not specified)')}")
                 
                 print(f"Calling invoke_agent...", flush=True)
                 sys.stdout.flush()
@@ -1337,12 +1339,13 @@ class TestBench:
                     self._print_mem0_memories(test_config, user_message=step['user_message'])
                     sys.stdout.flush()  # Flush after mem0 memories in case it blocks
                     
-                    # Run dual evaluation system (user_goal and attack_goal)
+                    # Run dual evaluation system (user_goal, attack_goal, stealth_goal)
                     user_goal_passed = None
                     attack_goal_passed = None
                     partial_attack_score = None
+                    stealth_goal_passed = None
                     
-                    if is_attack_bench and ("user_goal" in step or "attack_goal" in step):
+                    if is_attack_bench and ("user_goal" in step or "attack_goal" in step or "stealth_goal" in step):
                         # Dual evaluation system for attack benchmarks
                         # Store step results and current step number in test_config for cross-step validators
                         test_config["_step_results"] = step_results
@@ -1454,6 +1457,27 @@ class TestBench:
                                 attack_goal_passed = False
                                 partial_attack_score = 0.0
                         
+                        if "stealth_goal" in step and step["stealth_goal"]:
+                            try:
+                                stealth_goal_check = step["stealth_goal"]["success_check"]
+                                if isinstance(stealth_goal_check, dict):
+                                    in_memory_env = test_config.get("in_memory_environment")
+                                    validator = create_validator(stealth_goal_check, test_config, in_memory_env)
+                                    if isinstance(validator, CompositeValidator):
+                                        print("\nStealth Goal Validator Results:")
+                                        stealth_goal_passed = validator.validate_with_print(response, session_id, step_traces)
+                                    else:
+                                        stealth_goal_passed = validator.validate(response, session_id, step_traces)
+                                        from agent.utils import print_validator_result
+                                        validator_type = stealth_goal_check.get("type", "validator")
+                                        print_validator_result(validator_type, "Stealth goal", stealth_goal_passed)
+                                else:
+                                    stealth_goal_passed = None
+                            except Exception as e:
+                                debug_info("Stealth Goal Check Error")
+                                debug_print_exception(e, context="Executing stealth goal check", include_traceback=True)
+                                stealth_goal_passed = False
+                        
                         # Print results for dual evaluation
                         if user_goal_passed is not None:
                             status = "✓ PASSED" if user_goal_passed else "✗ FAILED"
@@ -1462,6 +1486,9 @@ class TestBench:
                             status = "✓ PASSED" if attack_goal_passed else "✗ FAILED"
                             suffix = f" (partial={partial_attack_score:.2f})" if partial_attack_score is not None else ""
                             print(f"Attack Goal Result: {status}{suffix}")
+                        if stealth_goal_passed is not None:
+                            status = "✓ PASSED" if stealth_goal_passed else "✗ FAILED"
+                            print(f"Stealth Goal Result: {status}")
                         
                         # For overall test success, we consider user goal success (attack goal failure is good)
                         step_passed = user_goal_passed if user_goal_passed is not None else True
@@ -1527,7 +1554,7 @@ class TestBench:
                     step_result = {
                         "step": i,
                         "user_message": step['user_message'],
-                        "expected_behavior": step['expected_behavior'],
+                        "expected_behavior": step.get('expected_behavior', ''),
                         "agent_response": response,
                         "duration_s": round(duration, 3)
                     }
@@ -1535,13 +1562,13 @@ class TestBench:
                     # Only include "passed" if this step has a success_check
                     has_success_check = (
                         ("success_check" in step and step["success_check"]) or
-                        (is_attack_bench and ("user_goal" in step or "attack_goal" in step))
+                        (is_attack_bench and ("user_goal" in step or "attack_goal" in step or "stealth_goal" in step))
                     )
                     if has_success_check:
                         step_result["passed"] = step_passed
                     
                     # Add dual evaluation results if available
-                    if is_attack_bench and ("user_goal" in step or "attack_goal" in step):
+                    if is_attack_bench and ("user_goal" in step or "attack_goal" in step or "stealth_goal" in step):
                         step_result["user_goal"] = {
                             "description": step.get("user_goal", {}).get("description", ""),
                             "passed": user_goal_passed
@@ -1551,6 +1578,11 @@ class TestBench:
                             "passed": attack_goal_passed,
                             "partial_attack_score": partial_attack_score
                         }
+                        if "stealth_goal" in step and step.get("stealth_goal"):
+                            step_result["stealth_goal"] = {
+                                "description": step["stealth_goal"].get("description", ""),
+                                "passed": stealth_goal_passed,
+                            }
                     else:
                         # Legacy single evaluation
                         step_result["success_check"] = step.get("success_check")
@@ -1572,16 +1604,16 @@ class TestBench:
                     step_result = {
                         "step": i,
                         "user_message": step['user_message'],
-                        "expected_behavior": step['expected_behavior'],
+                        "expected_behavior": step.get('expected_behavior', ''),
                         "error": str(e)
                     }
                     has_success_check = (
                         ("success_check" in step and step.get("success_check")) or
-                        (is_attack_bench and ("user_goal" in step or "attack_goal" in step))
+                        (is_attack_bench and ("user_goal" in step or "attack_goal" in step or "stealth_goal" in step))
                     )
                     if has_success_check:
                         step_result["passed"] = False
-                        # Copy success_check/user_goal/attack_goal so the step is counted correctly
+                        # Copy success_check/user_goal/attack_goal/stealth_goal so the step is counted correctly
                         if "success_check" in step and step.get("success_check"):
                             step_result["success_check"] = step["success_check"]
                         if is_attack_bench:
@@ -1595,6 +1627,11 @@ class TestBench:
                                     "description": step["attack_goal"].get("description", ""),
                                     "passed": False,
                                     "partial_attack_score": 0.0
+                                }
+                            if "stealth_goal" in step and step.get("stealth_goal"):
+                                step_result["stealth_goal"] = {
+                                    "description": step["stealth_goal"].get("description", ""),
+                                    "passed": False,
                                 }
                     step_results.append(step_result)
         
@@ -1677,7 +1714,8 @@ class TestBench:
                 has_success_check = (
                     step_result.get("success_check") is not None or
                     step_result.get("user_goal") is not None or
-                    step_result.get("attack_goal") is not None
+                    step_result.get("attack_goal") is not None or
+                    step_result.get("stealth_goal") is not None
                 )
                 
                 if has_success_check:
@@ -1832,7 +1870,8 @@ class TestBench:
                     has_success_check = (
                         step_result.get("success_check") is not None or
                         step_result.get("user_goal") is not None or
-                        step_result.get("attack_goal") is not None
+                        step_result.get("attack_goal") is not None or
+                        step_result.get("stealth_goal") is not None
                     )
                     
                     if has_success_check:
@@ -2458,7 +2497,8 @@ class TestBench:
                 has_success_check = (
                     step_result.get("success_check") is not None or
                     step_result.get("user_goal") is not None or
-                    step_result.get("attack_goal") is not None
+                    step_result.get("attack_goal") is not None or
+                    step_result.get("stealth_goal") is not None
                 )
                 
                 if has_success_check:
@@ -2537,9 +2577,10 @@ class TestBench:
                 debug_print_exception(e, context="Reading traces", include_traceback=True)
                 step_traces = []
             
-            # Evaluate both user and attack goals
+            # Evaluate user, attack, and stealth goals
             user_goal_passed = None
             attack_goal_passed = None
+            stealth_goal_passed = None
             partial_attack_score = 0.0  # Initialize default value
             
             if "user_goal" in step and step["user_goal"]:
@@ -2590,13 +2631,25 @@ class TestBench:
                     attack_goal_passed = False
                     partial_attack_score = 0.0
             
+            if "stealth_goal" in step and step["stealth_goal"]:
+                try:
+                    stealth_goal_check = step["stealth_goal"]["success_check"]
+                    if isinstance(stealth_goal_check, dict):
+                        in_memory_env = test_config.get("in_memory_environment")
+                        validator = create_validator(stealth_goal_check, test_config, in_memory_env)
+                        stealth_goal_passed = validator.validate(response, session_id, step_traces)
+                    print(f"Stealth Goal Result: {'✓ PASSED' if stealth_goal_passed else '✗ FAILED'}")
+                except Exception as e:
+                    print(f"Stealth Goal Check Error: {e}")
+                    stealth_goal_passed = False
+            
             # Overall step success (user goal success, attack goal failure is good)
             step_passed = user_goal_passed if user_goal_passed is not None else True
             
             result = {
                 "step": step_num,
                 "user_message": step['user_message'],
-                "expected_behavior": step['expected_behavior'],
+                "expected_behavior": step.get('expected_behavior', ''),
                 "agent_response": response,
                 "duration_s": round(duration, 3),
                 "step_traces": step_traces,  # Include traces in result for state update
@@ -2610,9 +2663,18 @@ class TestBench:
                     "partial_attack_score": partial_attack_score
                 }
             }
+            if "stealth_goal" in step and step.get("stealth_goal"):
+                result["stealth_goal"] = {
+                    "description": step["stealth_goal"].get("description", ""),
+                    "passed": stealth_goal_passed,
+                }
             
-            # Only include "passed" if this step has a success_check (user_goal or attack_goal)
-            has_success_check = ("user_goal" in step and step["user_goal"]) or ("attack_goal" in step and step["attack_goal"])
+            # Only include "passed" if this step has a success_check (user_goal, attack_goal, or stealth_goal)
+            has_success_check = (
+                ("user_goal" in step and step["user_goal"]) or
+                ("attack_goal" in step and step["attack_goal"]) or
+                ("stealth_goal" in step and step.get("stealth_goal"))
+            )
             if has_success_check:
                 result["passed"] = step_passed
             
@@ -2632,7 +2694,7 @@ class TestBench:
                 "step_traces": []  # Empty traces on error
             }
             
-            # Include user_goal and attack_goal structures even on error
+            # Include user_goal, attack_goal, and stealth_goal structures even on error
             # This ensures the result structure is consistent
             if "user_goal" in step and step.get("user_goal"):
                 result["user_goal"] = {
@@ -2647,8 +2709,18 @@ class TestBench:
                     "partial_attack_score": 0.0
                 }
             
+            if "stealth_goal" in step and step.get("stealth_goal"):
+                result["stealth_goal"] = {
+                    "description": step["stealth_goal"].get("description", ""),
+                    "passed": False,
+                }
+            
             # Only include "passed" if this step has a success_check
-            has_success_check = ("user_goal" in step and step.get("user_goal")) or ("attack_goal" in step and step.get("attack_goal"))
+            has_success_check = (
+                ("user_goal" in step and step.get("user_goal")) or
+                ("attack_goal" in step and step.get("attack_goal")) or
+                ("stealth_goal" in step and step.get("stealth_goal"))
+            )
             if has_success_check:
                 result["passed"] = False
             
@@ -2689,7 +2761,7 @@ class TestBench:
             result = {
                 "step": step_num,
                 "user_message": step['user_message'],
-                "expected_behavior": step['expected_behavior'],
+                "expected_behavior": step.get('expected_behavior', ''),
                 "agent_response": response,
                 "duration_s": round(duration, 3),
                 "step_traces": step_traces  # Include traces in result for state update
@@ -2722,7 +2794,7 @@ class TestBench:
             result = {
                 "step": step_num,
                 "user_message": step['user_message'],
-                "expected_behavior": step['expected_behavior'],
+                "expected_behavior": step.get('expected_behavior', ''),
                 "error": str(e)
             }
             # Only include "passed" if this step has a success_check
@@ -3054,11 +3126,25 @@ class TestBench:
                 "model_name": self.model_name
             }
             
-            # Save cached version
+            # Save cached version (attack success; always when this method is called)
             with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(cached_test, f, indent=2, ensure_ascii=False)
             
             print(f"💾 Cached test saved to: {cache_file}", flush=True)
+            
+            # When adaptive_stealth is on and any step also passed stealth_goal, save a second cache file with _stealth
+            if self.config.get("benchmark", {}).get("adaptive_stealth", False):
+                stealth_succeeded = False
+                for step in result.get("steps", []):
+                    sg = step.get("stealth_goal")
+                    if isinstance(sg, dict) and sg.get("passed") is True:
+                        stealth_succeeded = True
+                        break
+                if stealth_succeeded:
+                    stealth_cache_file = cache_file.parent / (cache_file.stem + "_stealth" + cache_file.suffix)
+                    with open(stealth_cache_file, 'w', encoding='utf-8') as f:
+                        json.dump(cached_test, f, indent=2, ensure_ascii=False)
+                    print(f"💾 Cached stealth test saved to: {stealth_cache_file}", flush=True)
         except Exception as e:
             print(f"⚠️  Error in _cache_successful_attack: {e}")
             import traceback

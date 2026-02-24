@@ -4,6 +4,7 @@ Benchmark Utilities
 Helper functions for result path generation, caching, and test isolation.
 """
 
+import json
 import os
 import time
 import hashlib
@@ -103,6 +104,20 @@ ATTACK_BENCH_TEST = "test"
 ATTACK_BENCH_TRAIN_CACHE = "train_cache"
 
 
+def get_attack_bench_train_or_test(test_file: Path) -> str:
+    """
+    Return "train" or "test" based on whether the test file is under attack_bench/train/ or attack_bench/test/.
+    Used to place results and logs under attack_results/train|test/ and attack_logs/train|test/.
+    Defaults to "test" if path does not contain train (e.g. legacy or unknown).
+    """
+    path_str = str(test_file.resolve())
+    if "/attack_bench/train/" in path_str or "\\attack_bench\\train\\" in path_str:
+        return "train"
+    if "/attack_bench/test/" in path_str or "\\attack_bench\\test\\" in path_str:
+        return "test"
+    return "test"
+
+
 def get_attack_bench_suite_subfolder(test_file: Path) -> Optional[str]:
     """
     If the test file lives under attack_bench/.../<suite>/file.json, return <suite> (the test case suite name).
@@ -164,11 +179,13 @@ def get_result_path(
     is_attack_results = "attack_results" in results_base_dir_str
     
     if is_attack_bench or is_attack_results:
-        # For attack_bench tests or attack_results: add optional suite subfolder when test is under attack_bench/<backend>/<suite>/
+        # For attack_bench: place under attack_results/<train|test>/<model>/...
+        train_or_test = get_attack_bench_train_or_test(test_file)
         suite_subfolder = get_attack_bench_suite_subfolder(test_file)
         if suite_subfolder:
             result_path = (
                 results_base_dir /
+                train_or_test /
                 model_name /
                 backend_for_path /
                 defense_folder /
@@ -178,6 +195,7 @@ def get_result_path(
         else:
             result_path = (
                 results_base_dir /
+                train_or_test /
                 model_name /
                 backend_for_path /
                 defense_folder /
@@ -240,11 +258,13 @@ def get_log_path(
     is_attack_logs = "attack_logs" in logs_base_dir_str
     
     if is_attack_bench or is_attack_logs:
-        # For attack_bench tests: add optional suite subfolder when test is under attack_bench/<backend>/<suite>/
+        # For attack_bench: place under attack_logs/<train|test>/<model>/...
+        train_or_test = get_attack_bench_train_or_test(test_file)
         suite_subfolder = get_attack_bench_suite_subfolder(test_file)
         if suite_subfolder:
             log_path = (
                 logs_base_dir /
+                train_or_test /
                 model_name /
                 backend_for_path /
                 defense_folder /
@@ -254,6 +274,7 @@ def get_log_path(
         else:
             log_path = (
                 logs_base_dir /
+                train_or_test /
                 model_name /
                 backend_for_path /
                 defense_folder /
@@ -389,6 +410,8 @@ def should_skip_test(
 ) -> bool:
     """
     Determine if a test should be skipped (result already exists and force=False).
+    Tests with existing results that have execution_success=False are not skipped,
+    so they will be retried even without --force.
     
     Args:
         memory_backend: Memory backend name
@@ -405,7 +428,7 @@ def should_skip_test(
     if force:
         return False
     
-    return check_result_exists(
+    result_path = get_result_path(
         memory_backend,
         unified_defense,
         model_name,
@@ -413,6 +436,20 @@ def should_skip_test(
         test_file,
         results_base_dir
     )
+    if not result_path.exists():
+        return False
+    
+    # Rerun if the existing result had an execution error (execution_success=False)
+    try:
+        with open(result_path, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+        if existing.get("execution_success", True) is False:
+            return False
+    except (json.JSONDecodeError, OSError):
+        # Corrupt or unreadable result: do not skip so the test is rerun
+        return False
+    
+    return True
 
 
 def get_memory_backend_from_config(config: Dict[str, Any]) -> str:

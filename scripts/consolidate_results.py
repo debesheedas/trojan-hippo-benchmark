@@ -53,6 +53,7 @@ from benchmark.benchmark_utils import (
 
 # Constants
 BACKEND_LABELS = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
+SUCCESS_TITLE_NOTE = "Success = Benign Utility (Utility of the Agent when NOT under Attack)"
 VALID_ATTACK_TYPES = [
     "memory_only", "assistant_responses",
     "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory"
@@ -79,7 +80,8 @@ def parse_result_file(result_file: Path) -> Optional[Dict]:
                 if (step.get("step_type") not in excluded_types
                     and (step.get("success_check") is not None 
                          or step.get("user_goal") is not None
-                         or step.get("attack_goal") is not None))
+                         or step.get("attack_goal") is not None
+                         or step.get("stealth_goal") is not None))
             ]
             total_steps = len(test_steps)
             passed_steps = sum(1 for step in test_steps if step.get("passed") is True)
@@ -247,8 +249,9 @@ def generate_csv(
     Structure:
     - Rows: Defense types
     - Columns: Memory backends with success percentage (or "ERR" if execution errors occurred)
+    output_dir is the model subfolder (output_base/model_name).
     """
-    output_file = output_dir / f"{model_name}_{attack_type}_consolidated.csv"
+    output_file = output_dir / f"{attack_type}_consolidated.csv"
     
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -354,13 +357,15 @@ def generate_heatmap(
     
     ax.set_xlabel('Memory Backend', fontsize=12, fontweight='bold')
     ax.set_ylabel('Defense Type', fontsize=12, fontweight='bold')
-    ax.set_title(f'{model_name.upper()} - {attack_type.replace("_", " ").title()} Suite\nSuccess Rate Heatmap', 
-                 fontsize=14, fontweight='bold', pad=20)
+    ax.set_title(
+        f'{model_name.upper()} - {attack_type.replace("_", " ").title()} Suite\nSuccess Rate Heatmap\n{SUCCESS_TITLE_NOTE}',
+        fontsize=14, fontweight='bold', pad=20
+    )
     
     plt.tight_layout()
     
     # Save figure
-    output_file = output_dir / f"{model_name}_{attack_type}_heatmap.png"
+    output_file = output_dir / f"{attack_type}_heatmap.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     plt.close()
     
@@ -446,13 +451,15 @@ def generate_combined_heatmaps_subplot(
         axes[idx].axis('off')
     
     # Main title
-    fig.suptitle(f'{model_name.upper()} - All Test Suites\nSuccess Rate Heatmaps', 
-                 fontsize=16, fontweight='bold', y=0.995)
+    fig.suptitle(
+        f'{model_name.upper()} - All Test Suites\nSuccess Rate Heatmaps\n{SUCCESS_TITLE_NOTE}',
+        fontsize=16, fontweight='bold', y=0.995
+    )
     
     plt.tight_layout(rect=[0, 0, 1, 0.99])
     
     # Save figure
-    output_file = output_dir / f"{model_name}_all_suites_combined_heatmap.png"
+    output_file = output_dir / "all_suites_combined_heatmap.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     plt.close()
     
@@ -557,13 +564,15 @@ def generate_average_heatmap(
     
     ax.set_xlabel('Memory Backend', fontsize=12, fontweight='bold')
     ax.set_ylabel('Defense Type', fontsize=12, fontweight='bold')
-    ax.set_title(f'{model_name.upper()} - Average Across All Test Suites\nSuccess Rate Heatmap', 
-                 fontsize=14, fontweight='bold', pad=20)
+    ax.set_title(
+        f'{model_name.upper()} - Average Across All Test Suites\nSuccess Rate Heatmap\n{SUCCESS_TITLE_NOTE}',
+        fontsize=14, fontweight='bold', pad=20
+    )
     
     plt.tight_layout()
     
     # Save figure
-    output_file = output_dir / f"{model_name}_average_heatmap.png"
+    output_file = output_dir / "average_heatmap.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     plt.close()
     
@@ -644,6 +653,8 @@ def main():
     error_summaries = []
     
     for model_name in models_to_process:
+        model_output_dir = output_dir / model_name
+        model_output_dir.mkdir(parents=True, exist_ok=True)
         all_suites_data = {}
         
         for attack_type in attack_types_to_process:
@@ -654,12 +665,12 @@ def main():
             all_suites_data[attack_type] = data
             
             # Generate CSV
-            csv_file = generate_csv(model_name, attack_type, data, output_dir)
+            csv_file = generate_csv(model_name, attack_type, data, model_output_dir)
             csv_files.append(csv_file)
             print(f"  OK: CSV: {csv_file.name}")
             
             # Generate error summary
-            error_summary = generate_error_summary(model_name, attack_type, results_base_dir, output_dir)
+            error_summary = generate_error_summary(model_name, attack_type, results_base_dir, model_output_dir)
             if error_summary:
                 error_summaries.append(error_summary)
                 print(f"  WARNING: Error Summary: {error_summary.name}")
@@ -674,7 +685,7 @@ def main():
                     print(f"     Install with: pip install matplotlib seaborn")
                 else:
                     try:
-                        heatmap_file = generate_heatmap(model_name, attack_type, data, output_dir)
+                        heatmap_file = generate_heatmap(model_name, attack_type, data, model_output_dir)
                         plot_files.append(heatmap_file)
                         print(f"  OK: Heatmap: {heatmap_file.name}")
                     except Exception as e:
@@ -687,7 +698,7 @@ def main():
                 try:
                     # Combined heatmaps subplot
                     combined_heatmap_file = generate_combined_heatmaps_subplot(
-                        model_name, all_suites_data, output_dir
+                        model_name, all_suites_data, model_output_dir
                     )
                     plot_files.append(combined_heatmap_file)
                     print(f"  OK: Combined Heatmaps: {combined_heatmap_file.name}")
@@ -699,12 +710,12 @@ def main():
             print(f"\nGenerating combined CSV files for {model_name}...")
             try:
                 # Combined CSV with all suites
-                combined_csv_file = generate_combined_csv(model_name, all_suites_data, output_dir)
+                combined_csv_file = generate_combined_csv(model_name, all_suites_data, model_output_dir)
                 csv_files.append(combined_csv_file)
                 print(f"  OK: Combined CSV: {combined_csv_file.name}")
                 
                 # Average summary CSV
-                avg_csv_file = generate_average_summary_csv(model_name, all_suites_data, output_dir)
+                avg_csv_file = generate_average_summary_csv(model_name, all_suites_data, model_output_dir)
                 csv_files.append(avg_csv_file)
                 print(f"  OK: Average Summary CSV: {avg_csv_file.name}")
                 
@@ -713,7 +724,7 @@ def main():
                     if PLOTTING_AVAILABLE:
                         try:
                             avg_heatmap_file = generate_average_heatmap(
-                                model_name, all_suites_data, output_dir
+                                model_name, all_suites_data, model_output_dir
                             )
                             plot_files.append(avg_heatmap_file)
                             print(f"  OK: Average Heatmap: {avg_heatmap_file.name}")
@@ -754,7 +765,7 @@ def generate_combined_csv(
         all_data: Dictionary {attack_type: {defense_type: {memory_backend: (passed, total, rate, has_errors)}}}
         output_dir: Output directory
     """
-    output_file = output_dir / f"{model_name}_all_suites_combined.csv"
+    output_file = output_dir / "all_suites_combined.csv"
     
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -809,7 +820,7 @@ def generate_average_summary_csv(
         all_data: Dictionary {attack_type: {defense_type: {memory_backend: (passed, total, rate, has_errors)}}}
         output_dir: Output directory
     """
-    output_file = output_dir / f"{model_name}_average_summary.csv"
+    output_file = output_dir / "average_summary.csv"
     
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -911,7 +922,7 @@ def generate_error_summary(
         return None
     
     # Generate error summary file
-    summary_file = output_dir / f"{model_name}_{attack_type}_execution_errors.txt"
+    summary_file = output_dir / f"{attack_type}_execution_errors.txt"
     with open(summary_file, 'w', encoding='utf-8') as f:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         f.write(f"{'='*80}\n")

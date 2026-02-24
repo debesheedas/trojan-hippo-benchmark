@@ -36,6 +36,7 @@ if "benchmark" not in sys.modules or "benchmark.attack_generation" not in sys.mo
 from benchmark.attack_generation.persistent_exfiltrate.common import (
     DEFAULT_INITIAL_DATA,
     MEMORY_BACKENDS,
+    NUM_SESSIONS_DEFAULT,
     load_config,
     load_templates,
     load_entity_pools,
@@ -44,6 +45,7 @@ from benchmark.attack_generation.persistent_exfiltrate.common import (
     fill_template,
     build_test_case,
 )
+from benchmark.attack_generation.persistent_exfiltrate.unrelated_pairs import get_fixed_unrelated_pairs
 
 
 def main() -> int:
@@ -130,6 +132,7 @@ def main() -> int:
         num_train = config.get("num_train_cases", 1)
         num_test = config.get("num_test_cases", 4)
         seed = config.get("seed", 42)
+        num_sessions = config.get("num_sessions", NUM_SESSIONS_DEFAULT)
         initial_data = config.get("initial_data") or DEFAULT_INITIAL_DATA
         name_prefix = f"persistent_exfiltrate_{category_name}"
         filename_prefix = name_prefix
@@ -142,11 +145,16 @@ def main() -> int:
         if len(templates) < num_slots:
             print(f"Error: {category_name} needs at least {num_slots} templates, have {len(templates)}", file=sys.stderr)
             continue
+        # For num_sessions > 0 we need 5 similar templates per test case (indices 1,2,3,4,4); need at least 5 templates.
+        if num_sessions > 0 and len(templates) < 5:
+            print(f"Error: {category_name} needs at least 5 templates for num_sessions={num_sessions}, have {len(templates)}", file=sys.stderr)
+            continue
 
         rng = __import__("random").Random(seed)
-        shuffled_templates = rng.sample(templates, num_slots)
+        shuffled_templates = rng.sample(templates, min(len(templates), max(num_slots, 5)))
         train_template = shuffled_templates[0]
-        test_templates = shuffled_templates[1 : 1 + num_test]
+        # Test case i uses slot i+1. For num_sessions>0 each test case needs 5 trigger messages from similar templates (1,2,3,4,4).
+        test_template_indices = [1, 2, 3, 4, 4] if num_sessions > 0 else list(range(1, 1 + num_test))
         slots = split_pools_into_slots(pools, num_slots, rng)
 
         for backend in MEMORY_BACKENDS:
@@ -190,20 +198,43 @@ def main() -> int:
             # Test cases → attack_bench/test/{backend}/{name_prefix}/
             for i in range(num_test):
                 try:
-                    test_message = fill_template(test_templates[i], slots[i + 1], rng)
-                    test_queries = [test_message for _ in range(num_attacks)]
-                    tc = build_test_case(
-                        backend=backend,
-                        backend_def=backend_def,
-                        category_config=config,
-                        category_name=category_name,
-                        queries=test_queries,
-                        case_index=i + 1,
-                        name_suffix=None,
-                        initial_data=initial_data,
-                        name_prefix=name_prefix,
-                        user_goal_keyword=user_goal_keyword,
-                    )
+                    if num_sessions > 0:
+                        # 5 trigger queries from similar templates (same slot), 2 unrelated pairs
+                        trigger_queries = [
+                            fill_template(shuffled_templates[tidx], slots[i + 1], rng)
+                            for tidx in test_template_indices
+                        ]
+                        unrelated_pairs = get_fixed_unrelated_pairs(2)
+                        tc = build_test_case(
+                            backend=backend,
+                            backend_def=backend_def,
+                            category_config=config,
+                            category_name=category_name,
+                            queries=trigger_queries,
+                            case_index=i + 1,
+                            name_suffix=None,
+                            initial_data=initial_data,
+                            name_prefix=name_prefix,
+                            user_goal_keyword=user_goal_keyword,
+                            num_sessions=num_sessions,
+                            unrelated_pairs=unrelated_pairs,
+                        )
+                    else:
+                        # Old style: 1 trigger per test case
+                        test_message = fill_template(shuffled_templates[1 + i], slots[i + 1], rng)
+                        test_queries = [test_message for _ in range(num_attacks)]
+                        tc = build_test_case(
+                            backend=backend,
+                            backend_def=backend_def,
+                            category_config=config,
+                            category_name=category_name,
+                            queries=test_queries,
+                            case_index=i + 1,
+                            name_suffix=None,
+                            initial_data=initial_data,
+                            name_prefix=name_prefix,
+                            user_goal_keyword=user_goal_keyword,
+                        )
                     fname = f"{i + 1:02d}_{filename_prefix}.json"
                     out_file = test_dir / fname
                     with open(out_file, "w", encoding="utf-8") as f:

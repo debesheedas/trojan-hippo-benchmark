@@ -738,6 +738,9 @@ class OpenEvolveOptimizer(BaseOptimizer):
             user_message = failed_step.get("user_message", "")
             
             self._log_info(f"\nMutating to generate {self.candidates_per_iteration} new variants...")
+            new_variants = None
+            fallback_model = self.openevolve_config.get("mutator_fallback_model", "gemini-3-pro-preview")
+            fallback_retries = 3
             try:
                 new_variants = self._mutate(
                     parent_candidates=parents,
@@ -749,9 +752,49 @@ class OpenEvolveOptimizer(BaseOptimizer):
                     test_config=test_config
                 )
             except RuntimeError as e:
-                # Model refused to generate mutations - terminate optimization
-                self._log_error(f"ERROR: Optimization terminated: {e}")
-                raise
+                # If mutator refused after 5 attempts, retry up to 3 times with fallback model
+                if "refused" not in str(e).lower():
+                    self._log_error(f"ERROR: Optimization terminated: {e}")
+                    raise
+                self._log_warning(
+                    f"Primary mutator refused. Retrying up to {fallback_retries} times with fallback model: {fallback_model}"
+                )
+                original_mutator = self.mutator_model
+                self.mutator_model = fallback_model
+                try:
+                    for attempt in range(fallback_retries):
+                        try:
+                            new_variants = self._mutate(
+                                parent_candidates=parents,
+                                original_attack_email=original_attack_email,
+                                attack_goal=attack_goal_dict,
+                                user_message=user_message,
+                                num_variants=self.candidates_per_iteration,
+                                memory_backend=memory_backend,
+                                test_config=test_config
+                            )
+                            self._log_info(f"Fallback mutator ({fallback_model}) succeeded on attempt {attempt + 1}")
+                            break
+                        except RuntimeError as e2:
+                            if "refused" not in str(e2).lower():
+                                self._log_error(f"ERROR: Optimization terminated: {e2}")
+                                raise
+                            self._log_warning(
+                                f"Fallback mutator refused (attempt {attempt + 1}/{fallback_retries}). Response: {str(e2)[:200]}"
+                            )
+                            if attempt == fallback_retries - 1:
+                                self._log_warning(
+                                    f"Mutator and fallback ({fallback_model}) refused after {fallback_retries} attempts. "
+                                    "Skipping this iteration and continuing optimization."
+                                )
+                                new_variants = []
+                finally:
+                    self.mutator_model = original_mutator
+                if new_variants is None:
+                    new_variants = []
+                    self._log_warning(
+                        "Mutator and fallback mutator refused; no variants this iteration. Continuing optimization."
+                    )
             
             if not new_variants:
                 self._log_warning(

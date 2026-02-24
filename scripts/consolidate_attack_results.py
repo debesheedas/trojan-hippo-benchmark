@@ -2,12 +2,12 @@
 """
 Attack Results Consolidation Script with CSV and Plots
 
-Consolidates results from the attack benchmark (data/benchmark/attack_results)
-into CSV tables and visualizations. Logs are read from data/benchmark/attack_logs
-when available.
+Consolidates TEST results from the attack benchmark. Reads from
+data/benchmark/attack_results/test/ and data/benchmark/attack_logs/test/ by default
+(train/test layout matches attack_bench). Generates CSV tables and visualizations.
 
-Discovers attack suites from the results directory (model/backend/defense/suite/)
-and only generates CSVs and plots for suites that have result files present.
+Discovers suites from the results directory (model/backend/defense/suite/) and only
+generates CSVs and plots for suites that have result files present.
 
 Usage:
     python scripts/consolidate_attack_results.py
@@ -50,13 +50,19 @@ from benchmark.benchmark_utils import (
 # Constants
 BACKEND_LABELS = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
 
-# Default paths for attack benchmark
-DEFAULT_RESULTS_DIR = Path("data/benchmark/attack_results")
-DEFAULT_LOGS_DIR = Path("data/benchmark/attack_logs")
+# Default paths for attack benchmark (test results live under attack_results/test/)
+DEFAULT_RESULTS_DIR = Path("data/benchmark/attack_results/test")
+DEFAULT_TRAIN_RESULTS_DIR = Path("data/benchmark/attack_results/train")
+DEFAULT_LOGS_DIR = Path("data/benchmark/attack_logs/test")
 DEFAULT_OUTPUT_DIR = Path("data/benchmark/consolidated_attack_results")
 
-# Data tuple: (user_passed, user_total, user_rate, attack_passed, attack_total, attack_rate, has_execution_errors)
-MetricTuple = Tuple[int, int, float, int, int, float, bool]
+# Data tuple: (user_passed, user_total, user_rate, attack_passed, attack_total, attack_rate,
+#              max_attack_passed, max_attack_total, has_execution_errors)
+# max_attack_*: count of test cases with >=1 attack success / count of test cases with attack steps
+MetricTuple = Tuple[int, int, float, int, int, float, int, int, bool]
+
+# Per-session (trigger 1..5): list of (passed_count, total_count) for session 1..5
+SessionDataTuple = List[Tuple[int, int]]
 
 
 def get_attack_results_dir(
@@ -81,22 +87,32 @@ def get_attack_results_dir(
 TRAIN_STEM_MARKER = "train"
 
 
-def _iter_result_files_for_suite(results_dir: Path, suite_name: str):
+def _iter_result_files_for_suite(
+    results_dir: Path,
+    suite_name: str,
+    train_only: bool = False,
+):
     """
     Iterate over result JSON files for a suite, supporting both:
     - Legacy: result files directly in results_dir (model/backend/defense/*.json)
     - New: result files in results_dir/suite_name/*.json
-    Skips any file whose stem contains TRAIN_STEM_MARKER (train test cases).
+    When train_only=False: skips files whose stem contains TRAIN_STEM_MARKER (test only).
+    When train_only=True: only yields files whose stem contains TRAIN_STEM_MARKER (train only).
     """
+    want_train = train_only
     # New layout: defense/suite_name/*.json
     suite_dir = results_dir / suite_name
     if suite_dir.is_dir():
         for p in suite_dir.glob("*.json"):
-            if suite_name in p.stem and TRAIN_STEM_MARKER not in p.stem:
+            if suite_name not in p.stem:
+                continue
+            if (TRAIN_STEM_MARKER in p.stem) == want_train:
                 yield p
     # Legacy: defense/*.json (filter by suite in stem)
     for p in results_dir.glob("*.json"):
-        if suite_name in p.stem and TRAIN_STEM_MARKER not in p.stem:
+        if suite_name not in p.stem:
+            continue
+        if (TRAIN_STEM_MARKER in p.stem) == want_train:
             yield p
 
 
@@ -128,7 +144,7 @@ def parse_result_file(result_file: Path) -> Optional[Dict]:
                 if s.get("user_goal", {}).get("passed") is True or s.get("passed") is True
             )
 
-        # Attack goal: steps that have attack_goal with passed not None
+        # Attack goal: steps that have attack_goal with passed not None (order preserved for session index)
         attack_steps = [
             s for s in steps
             if s.get("step_type") not in excluded_types
@@ -141,9 +157,33 @@ def parse_result_file(result_file: Path) -> Optional[Dict]:
             1 for s in attack_steps
             if s["attack_goal"].get("passed") is True
         )
+        # Per-session (trigger index): list of bools, one per attack step in order
+        attack_step_passed = [
+            s["attack_goal"].get("passed") is True
+            for s in attack_steps
+        ]
+
+        # Stealth goal: steps that have stealth_goal with passed not None (same steps as attack_goal in persistent_exfiltrate)
+        stealth_steps = [
+            s for s in steps
+            if s.get("step_type") not in excluded_types
+            and s.get("stealth_goal") is not None
+            and isinstance(s.get("stealth_goal"), dict)
+            and s["stealth_goal"].get("passed") is not None
+        ]
+        stealth_total = len(stealth_steps)
+        stealth_passed = sum(
+            1 for s in stealth_steps
+            if s["stealth_goal"].get("passed") is True
+        )
+        stealth_step_passed = [
+            s["stealth_goal"].get("passed") is True
+            for s in stealth_steps
+        ]
 
         user_rate = (user_passed / user_total * 100) if user_total > 0 else 0.0
         attack_rate = (attack_passed / attack_total * 100) if attack_total > 0 else 0.0
+        stealth_rate = (stealth_passed / stealth_total * 100) if stealth_total > 0 else 0.0
         execution_success = result.get("execution_success", True)
         execution_errors = result.get("execution_errors", [])
 
@@ -155,6 +195,11 @@ def parse_result_file(result_file: Path) -> Optional[Dict]:
             "attack_passed": attack_passed,
             "attack_total": attack_total,
             "attack_rate": attack_rate,
+            "attack_step_passed": attack_step_passed,
+            "stealth_passed": stealth_passed,
+            "stealth_total": stealth_total,
+            "stealth_rate": stealth_rate,
+            "stealth_step_passed": stealth_step_passed,
             "execution_success": execution_success,
             "execution_errors": execution_errors if execution_errors else []
         }
@@ -201,25 +246,34 @@ def collect_results_for_combination(
     model_name: str,
     suite_name: str,
     results_base_dir: Path,
-) -> MetricTuple:
+    train_only: bool = False,
+) -> Tuple[MetricTuple, SessionDataTuple]:
     """
     Collect user (utility) and attack goal statistics for a specific combination.
     Only JSON files whose name contains the suite name are included.
 
     Returns:
-        (user_passed, user_total, user_rate, attack_passed, attack_total, attack_rate, has_execution_errors)
+        (MetricTuple, SessionDataTuple)
+        MetricTuple: (user_passed, user_total, user_rate, attack_passed, attack_total, attack_rate,
+                     max_attack_passed, max_attack_total, has_execution_errors)
+        SessionDataTuple: [(passed_1, total_1), ..., (passed_5, total_5)] for trigger sessions 1..5
     """
     results_dir = get_attack_results_dir(
         model_name, memory_backend, unified_defense, results_base_dir
     )
 
+    default_session = [(0, 0)] * 5
     if not results_dir.exists():
-        return (0, 0, 0.0, 0, 0, 0.0, False)
+        return ((0, 0, 0.0, 0, 0, 0.0, 0, 0, False), default_session, (0, 0, 0.0))
 
-    result_files = list(_iter_result_files_for_suite(results_dir, suite_name))
+    result_files = list(_iter_result_files_for_suite(results_dir, suite_name, train_only=train_only))
 
     user_passed = user_total = attack_passed = attack_total = 0
+    max_attack_passed = max_attack_total = 0
+    stealth_passed = stealth_total = 0
     has_execution_errors = False
+    session_passed = [0] * 5
+    session_total = [0] * 5
 
     for result_file in result_files:
         result = parse_result_file(result_file)
@@ -228,12 +282,33 @@ def collect_results_for_combination(
             user_total += result["user_total"]
             attack_passed += result["attack_passed"]
             attack_total += result["attack_total"]
+            stealth_passed += result.get("stealth_passed", 0)
+            stealth_total += result.get("stealth_total", 0)
             if not result.get("execution_success", True):
                 has_execution_errors = True
+            # Max attack: one test case counts as 100% if any of its attack steps passed
+            if result["attack_total"] > 0:
+                max_attack_total += 1
+                if result["attack_passed"] >= 1:
+                    max_attack_passed += 1
+            # Per-session (trigger 1..5)
+            step_passed = result.get("attack_step_passed", [])
+            for s in range(min(5, len(step_passed))):
+                session_total[s] += 1
+                if step_passed[s]:
+                    session_passed[s] += 1
 
     user_rate = (user_passed / user_total * 100) if user_total > 0 else 0.0
     attack_rate = (attack_passed / attack_total * 100) if attack_total > 0 else 0.0
-    return (user_passed, user_total, user_rate, attack_passed, attack_total, attack_rate, has_execution_errors)
+    stealth_rate = (stealth_passed / stealth_total * 100) if stealth_total > 0 else 0.0
+    metric_tuple = (
+        user_passed, user_total, user_rate,
+        attack_passed, attack_total, attack_rate,
+        max_attack_passed, max_attack_total, has_execution_errors,
+    )
+    session_data: SessionDataTuple = [(session_passed[s], session_total[s]) for s in range(5)]
+    stealth_tuple = (stealth_passed, stealth_total, stealth_rate)
+    return (metric_tuple, session_data, stealth_tuple)
 
 
 def discover_models(results_base_dir: Path) -> List[str]:
@@ -281,29 +356,74 @@ def discover_suites(results_base_dir: Path, model_name: str) -> List[str]:
     return sorted(suites)
 
 
+def discover_suites_for_train(results_base_dir: Path, model_name: str) -> List[str]:
+    """
+    Discover suite names that have train result files under this model.
+    Same layout as discover_suites but only includes files whose stem contains TRAIN_STEM_MARKER.
+    """
+    suites = set()
+    for defense_type in UNIFIED_DEFENSE_TYPES:
+        for backend in MEMORY_BACKENDS:
+            if not is_valid_combination(backend, defense_type):
+                continue
+            results_dir = results_base_dir / model_name / backend / defense_type
+            if not results_dir.exists():
+                continue
+            for subdir in results_dir.iterdir():
+                if subdir.is_dir():
+                    suite_name = subdir.name
+                    for p in subdir.glob("*.json"):
+                        if suite_name in p.stem and TRAIN_STEM_MARKER in p.stem:
+                            suites.add(suite_name)
+                            break
+            for p in results_dir.glob("*.json"):
+                if TRAIN_STEM_MARKER not in p.stem:
+                    continue
+                parts = p.stem.split("_", 1)
+                if len(parts) >= 2:
+                    suites.add(parts[1])
+    return sorted(suites)
+
+
+# Stealth tuple: (stealth_passed, stealth_total, stealth_rate)
+StealthTuple = Tuple[int, int, float]
+
+
 def collect_all_data(
     model_name: str,
     suite_name: str,
     results_base_dir: Path,
-) -> Dict[str, Dict[str, MetricTuple]]:
+    train_only: bool = False,
+) -> Tuple[Dict[str, Dict[str, MetricTuple]], Dict[str, Dict[str, SessionDataTuple]], Dict[str, Dict[str, StealthTuple]]]:
     """
     Collect all data for a model and suite.
-    Returns: {defense_type: {memory_backend: MetricTuple}}
+    Returns: (data, session_data, data_stealth)
+        data: {defense_type: {memory_backend: MetricTuple}}
+        session_data: {defense_type: {memory_backend: SessionDataTuple}}
+        data_stealth: {defense_type: {memory_backend: (stealth_passed, stealth_total, stealth_rate)}}
     """
-    data = {}
+    data: Dict[str, Dict[str, MetricTuple]] = {}
+    session_data: Dict[str, Dict[str, SessionDataTuple]] = {}
+    data_stealth: Dict[str, Dict[str, StealthTuple]] = {}
     for defense_type in UNIFIED_DEFENSE_TYPES:
         data[defense_type] = {}
+        session_data[defense_type] = {}
+        data_stealth[defense_type] = {}
         for backend in MEMORY_BACKENDS:
             if not is_valid_combination(backend, defense_type):
                 continue
-            data[defense_type][backend] = collect_results_for_combination(
-                backend, defense_type, model_name, suite_name, results_base_dir
+            metric_tuple, sess, stealth_tuple = collect_results_for_combination(
+                backend, defense_type, model_name, suite_name, results_base_dir,
+                train_only=train_only,
             )
-    return data
+            data[defense_type][backend] = metric_tuple
+            session_data[defense_type][backend] = sess
+            data_stealth[defense_type][backend] = stealth_tuple
+    return (data, session_data, data_stealth)
 
 
 def _default_metric_tuple() -> MetricTuple:
-    return (0, 0, 0.0, 0, 0, 0.0, False)
+    return (0, 0, 0.0, 0, 0, 0.0, 0, 0, False)
 
 
 def generate_csv(
@@ -311,9 +431,10 @@ def generate_csv(
     suite_name: str,
     data: Dict[str, Dict[str, MetricTuple]],
     output_dir: Path,
+    data_stealth: Optional[Dict[str, Dict[str, StealthTuple]]] = None,
 ) -> Path:
-    """Generate CSV file for a model and suite with Utility and Attack success rates."""
-    output_file = output_dir / f"{model_name}_{suite_name}_consolidated.csv"
+    """Generate CSV file for a model and suite with Utility, Attack, and Stealth success rates. output_dir is the model subfolder (output_base/model_name)."""
+    output_file = output_dir / f"{suite_name}_consolidated.csv"
 
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -326,8 +447,9 @@ def generate_csv(
         for defense_type in UNIFIED_DEFENSE_TYPES:
             dt_label = defense_type.replace("_", " ").title()
             for metric_name, rate_idx, total_idx in [
-                ("Utility", 2, 1),   # user_rate, user_total
-                ("Attack", 5, 4),    # attack_rate, attack_total
+                ("Utility", 2, 1),           # user_rate, user_total
+                ("Attack (Total)", 5, 4),    # attack_rate, attack_total
+                ("Max Attack", 6, 7),        # max: rate = passed/total*100 (indices 6,7; rate computed)
             ]:
                 row = [dt_label, metric_name]
                 for backend in MEMORY_BACKENDS:
@@ -335,13 +457,30 @@ def generate_csv(
                         row.append("-")
                         continue
                     t = data[defense_type].get(backend, _default_metric_tuple())
-                    has_errors = t[6]
+                    has_errors = t[8]
                     total = t[total_idx]
-                    rate = t[rate_idx]
+                    if metric_name == "Max Attack":
+                        rate = (t[6] / t[7] * 100) if t[7] > 0 else 0.0
+                    else:
+                        rate = t[rate_idx]
                     if has_errors:
                         row.append("ERR")
                     elif total > 0:
                         row.append(f"{rate:.1f}%")
+                    else:
+                        row.append("-")
+                writer.writerow(row)
+            # Stealth row (when data_stealth provided)
+            if data_stealth:
+                row = [dt_label, "Stealth"]
+                for backend in MEMORY_BACKENDS:
+                    if not is_valid_combination(backend, defense_type):
+                        row.append("-")
+                        continue
+                    st = data_stealth[defense_type].get(backend, (0, 0, 0.0))
+                    sp, stot, _ = st
+                    if stot > 0:
+                        row.append(f"{(sp / stot * 100):.1f}%")
                     else:
                         row.append("-")
                 writer.writerow(row)
@@ -354,12 +493,16 @@ def _prepare_heatmap_data(
     metric: str = "utility",
 ) -> Tuple[Any, Any, Any]:
     """
-    Prepare data matrices for heatmap. metric is 'utility' or 'attack'.
+    Prepare data matrices for heatmap. metric is 'utility', 'attack', or 'max_attack'.
     Returns (rates_matrix, has_errors_matrix, no_data_matrix).
     Cells with no data (total==0) are set to NaN and flagged in no_data_matrix so they appear white.
     """
-    rate_idx = 2 if metric == "utility" else 5
-    total_idx = 1 if metric == "utility" else 4
+    if metric == "utility":
+        rate_idx, total_idx = 2, 1
+    elif metric == "attack":
+        rate_idx, total_idx = 5, 4
+    else:  # max_attack
+        rate_idx, total_idx = 6, 7  # passed/total; rate computed below
     rates_matrix = []
     has_errors_matrix = []
     no_data_matrix = []
@@ -379,9 +522,12 @@ def _prepare_heatmap_data(
                     rate_row.append(np.nan)
                     no_data_row.append(True)
                 else:
-                    rate_row.append(t[rate_idx])
+                    if metric == "max_attack":
+                        rate_row.append((t[6] / t[7] * 100) if t[7] > 0 else np.nan)
+                    else:
+                        rate_row.append(t[rate_idx])
                     no_data_row.append(False)
-                error_row.append(t[6])
+                error_row.append(t[8])
         rates_matrix.append(rate_row)
         has_errors_matrix.append(error_row)
         no_data_matrix.append(no_data_row)
@@ -441,7 +587,7 @@ def generate_heatmap(
     data: Dict[str, Dict[str, MetricTuple]],
     output_dir: Path,
 ) -> Path:
-    """Generate a figure with two heatmaps: Utility (user goal) and Attack success rates."""
+    """Generate a figure with three heatmaps: Utility, Attack (total), and Max Attack success rates."""
     if not PLOTTING_AVAILABLE:
         raise ImportError(
             "matplotlib and seaborn are required for plotting. "
@@ -449,7 +595,7 @@ def generate_heatmap(
         )
 
     suite_label = suite_name.replace("_", " ").title()
-    fig, (ax_util, ax_attack) = plt.subplots(1, 2, figsize=(18, 8))
+    fig, (ax_util, ax_attack, ax_max) = plt.subplots(1, 3, figsize=(22, 8))
 
     _draw_one_heatmap(
         ax_util, data, "utility",
@@ -457,7 +603,11 @@ def generate_heatmap(
     )
     _draw_one_heatmap(
         ax_attack, data, "attack",
-        f"Attack Success Rate\n(attack goal)"
+        f"Attack Success Rate (Total)\n(attack goal)"
+    )
+    _draw_one_heatmap(
+        ax_max, data, "max_attack",
+        f"Max Attack Success Rate\n(any trigger succeeded)"
     )
 
     fig.suptitle(
@@ -465,10 +615,202 @@ def generate_heatmap(
         fontsize=14, fontweight='bold', y=1.02
     )
     plt.tight_layout()
-    output_file = output_dir / f"{model_name}_{suite_name}_heatmap.png"
+    output_file = output_dir / f"{suite_name}_heatmap.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     plt.close()
     return output_file
+
+
+def _session_rates_from_session_data(
+    session_data: Dict[str, Dict[str, SessionDataTuple]],
+) -> List[Tuple[str, str, List[float]]]:
+    """
+    Convert session_data to list of (defense, backend, [rate_1, ..., rate_5]) for valid combinations.
+    rate_s is (passed/total*100) or np.nan if total_s==0.
+    """
+    out: List[Tuple[str, str, List[float]]] = []
+    for defense_type in UNIFIED_DEFENSE_TYPES:
+        for backend in MEMORY_BACKENDS:
+            if not is_valid_combination(backend, defense_type):
+                continue
+            sess = session_data.get(defense_type, {}).get(backend, [(0, 0)] * 5)
+            rates = []
+            for p, t in sess:
+                rates.append((p / t * 100) if t > 0 else float(np.nan))
+            out.append((defense_type, backend, rates))
+    return out
+
+
+def _aggregate_session_data_across_suites(
+    all_suites_session_data: Dict[str, Dict[str, Dict[str, SessionDataTuple]]],
+) -> Dict[str, Dict[str, SessionDataTuple]]:
+    """
+    Pool (passed, total) per session across all suites for each (defense, backend).
+    Returns session_data with the same structure suitable for plotting.
+    """
+    aggregated: Dict[str, Dict[str, SessionDataTuple]] = {}
+    for defense_type in UNIFIED_DEFENSE_TYPES:
+        aggregated[defense_type] = {}
+        for backend in MEMORY_BACKENDS:
+            if not is_valid_combination(backend, defense_type):
+                continue
+            session_passed = [0] * 5
+            session_total = [0] * 5
+            for suite_name, session_data in all_suites_session_data.items():
+                sess = session_data.get(defense_type, {}).get(backend, [(0, 0)] * 5)
+                for s in range(5):
+                    p, t = sess[s] if s < len(sess) else (0, 0)
+                    session_passed[s] += p
+                    session_total[s] += t
+            aggregated[defense_type][backend] = [
+                (session_passed[s], session_total[s]) for s in range(5)
+            ]
+    return aggregated
+
+
+def _generate_session_plots_impl(
+    session_data: Dict[str, Dict[str, SessionDataTuple]],
+    model_name: str,
+    suite_label: str,
+    file_prefix: str,
+    output_dir: Path,
+) -> List[Path]:
+    """
+    Internal: generate the 3 session attack rate plots with given title label and file prefix.
+    Returns paths to the 3 saved figures.
+    """
+    lines_data = _session_rates_from_session_data(session_data)
+    if not lines_data:
+        return []
+
+    sessions = [1, 2, 3, 4, 5]
+    backend_colors = {b: plt.cm.tab10(MEMORY_BACKENDS.index(b) % 10) for b in MEMORY_BACKENDS}
+    defense_colors = {d: plt.cm.Set2(UNIFIED_DEFENSE_TYPES.index(d) % 8) for d in UNIFIED_DEFENSE_TYPES}
+    backend_label = {b: BACKEND_LABELS[MEMORY_BACKENDS.index(b)] for b in MEMORY_BACKENDS}
+    defense_label = {d: d.replace("_", " ").title() for d in UNIFIED_DEFENSE_TYPES}
+
+    out_files: List[Path] = []
+
+    # 1) One plot, all lines
+    fig1, ax1 = plt.subplots(figsize=(10, 6))
+    for defense_type, backend, rates in lines_data:
+        label = f"{backend_label[backend]} / {defense_label[defense_type]}"
+        ax1.plot(sessions, rates, "o-", label=label, linewidth=1.5, markersize=4)
+    ax1.set_xlabel("Session (trigger) number", fontsize=12, fontweight="bold")
+    ax1.set_ylabel("Attack success rate (%)", fontsize=12, fontweight="bold")
+    ax1.set_title(f"{model_name.upper()} - {suite_label}\nAttack success rate by session (all combinations)", fontsize=12, fontweight="bold")
+    ax1.set_ylim(-5, 105)
+    ax1.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=7, ncol=1)
+    ax1.grid(True, alpha=0.3)
+    plt.tight_layout(rect=[0, 0, 0.85, 1])
+    f1 = output_dir / f"{file_prefix}_session_attack_rate_all.png"
+    plt.savefig(f1, dpi=300, bbox_inches="tight")
+    plt.close()
+    out_files.append(f1)
+
+    # 2) Subplots by memory backend (each subplot: 5 defense lines)
+    fig2, axes2 = plt.subplots(2, 3, figsize=(14, 8))
+    axes2_flat = axes2.flat
+    for idx, backend in enumerate(MEMORY_BACKENDS):
+        ax = axes2_flat[idx]
+        for defense_type in UNIFIED_DEFENSE_TYPES:
+            if not is_valid_combination(backend, defense_type):
+                continue
+            sess = session_data.get(defense_type, {}).get(backend, [(0, 0)] * 5)
+            rates = [(p / t * 100) if t > 0 else float(np.nan) for p, t in sess]
+            ax.plot(sessions, rates, "o-", label=defense_label[defense_type], color=defense_colors[defense_type], linewidth=1.5, markersize=4)
+        ax.set_xlabel("Session number")
+        ax.set_ylabel("Attack success rate (%)")
+        ax.set_title(backend_label[backend])
+        ax.set_ylim(-5, 105)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+    # Hide the 6th subplot (we have 5 backends)
+    axes2_flat[5].set_visible(False)
+    fig2.suptitle(f"{model_name.upper()} - {suite_label}\nAttack success rate by session (by memory backend)", fontsize=12, fontweight="bold", y=1.02)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    f2 = output_dir / f"{file_prefix}_session_attack_rate_by_backend.png"
+    plt.savefig(f2, dpi=300, bbox_inches="tight")
+    plt.close()
+    out_files.append(f2)
+
+    # 3) Subplots by defense (each subplot: 5 backend lines)
+    fig3, axes3 = plt.subplots(2, 3, figsize=(14, 8))
+    axes3_flat = axes3.flat
+    for idx, defense_type in enumerate(UNIFIED_DEFENSE_TYPES):
+        ax = axes3_flat[idx]
+        for backend in MEMORY_BACKENDS:
+            if not is_valid_combination(backend, defense_type):
+                continue
+            sess = session_data.get(defense_type, {}).get(backend, [(0, 0)] * 5)
+            rates = [(p / t * 100) if t > 0 else float(np.nan) for p, t in sess]
+            ax.plot(sessions, rates, "o-", label=backend_label[backend], color=backend_colors[backend], linewidth=1.5, markersize=4)
+        ax.set_xlabel("Session number")
+        ax.set_ylabel("Attack success rate (%)")
+        ax.set_title(defense_label[defense_type])
+        ax.set_ylim(-5, 105)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+    axes3_flat[5].set_visible(False)
+    fig3.suptitle(f"{model_name.upper()} - {suite_label}\nAttack success rate by session (by defense)", fontsize=12, fontweight="bold", y=1.02)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    f3 = output_dir / f"{file_prefix}_session_attack_rate_by_defense.png"
+    plt.savefig(f3, dpi=300, bbox_inches="tight")
+    plt.close()
+    out_files.append(f3)
+
+    return out_files
+
+
+def generate_session_plots(
+    model_name: str,
+    suite_name: str,
+    session_data: Dict[str, Dict[str, SessionDataTuple]],
+    output_dir: Path,
+) -> List[Path]:
+    """
+    Generate 3 session-by-session attack success rate plots (no utility):
+    1. One plot with all (backend, defense) lines.
+    2. Subplots by memory backend (5 subplots, each with defense lines).
+    3. Subplots by defense (5 subplots, each with backend lines).
+    Returns paths to the 3 saved figures.
+    """
+    if not PLOTTING_AVAILABLE:
+        raise ImportError(
+            "matplotlib and seaborn are required for plotting. "
+            "Install with: pip install matplotlib seaborn"
+        )
+    suite_label = suite_name.replace("_", " ").title()
+    return _generate_session_plots_impl(
+        session_data, model_name, suite_label, suite_name, output_dir
+    )
+
+
+def generate_averaged_session_plots(
+    model_name: str,
+    all_suites_session_data: Dict[str, Dict[str, Dict[str, SessionDataTuple]]],
+    output_dir: Path,
+) -> List[Path]:
+    """
+    Generate 3 session attack rate plots averaged across all topics (suites):
+    attack rate all, by backend, by defense. Uses pooled (passed, total) across suites.
+    Returns paths to the 3 saved figures.
+    """
+    if not PLOTTING_AVAILABLE:
+        raise ImportError(
+            "matplotlib and seaborn are required for plotting. "
+            "Install with: pip install matplotlib seaborn"
+        )
+    if not all_suites_session_data:
+        return []
+    aggregated = _aggregate_session_data_across_suites(all_suites_session_data)
+    return _generate_session_plots_impl(
+        aggregated,
+        model_name,
+        "Average Across Attack Suites",
+        "average",
+        output_dir,
+    )
 
 
 def generate_combined_heatmaps_subplot(
@@ -476,7 +818,7 @@ def generate_combined_heatmaps_subplot(
     all_data: Dict[str, Dict[str, Dict[str, MetricTuple]]],
     output_dir: Path,
 ) -> Path:
-    """Generate a combined plot: for each suite, two subplots (Utility and Attack)."""
+    """Generate a combined plot: for each suite, three subplots (Utility, Attack, Max Attack)."""
     if not PLOTTING_AVAILABLE:
         raise ImportError(
             "matplotlib and seaborn are required for plotting. "
@@ -485,7 +827,7 @@ def generate_combined_heatmaps_subplot(
 
     suite_names = sorted(all_data.keys())
     n_suites = len(suite_names)
-    fig, axes = plt.subplots(n_suites, 2, figsize=(16, 5 * n_suites))
+    fig, axes = plt.subplots(n_suites, 3, figsize=(22, 5 * n_suites))
     if n_suites == 1:
         axes = axes.reshape(1, -1)
 
@@ -498,7 +840,11 @@ def generate_combined_heatmaps_subplot(
         )
         _draw_one_heatmap(
             axes[idx, 1], data, "attack",
-            f'{suite_label} - Attack'
+            f'{suite_label} - Attack (Total)'
+        )
+        _draw_one_heatmap(
+            axes[idx, 2], data, "max_attack",
+            f'{suite_label} - Max Attack'
         )
 
     fig.suptitle(
@@ -506,7 +852,82 @@ def generate_combined_heatmaps_subplot(
         fontsize=16, fontweight='bold', y=1.01
     )
     plt.tight_layout(rect=[0, 0, 1, 0.99])
-    output_file = output_dir / f"{model_name}_all_suites_combined_heatmap.png"
+    output_file = output_dir / "all_suites_combined_heatmap.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    return output_file
+
+
+def generate_test_train_combined_heatmap(
+    model_name: str,
+    all_suites_data: Dict[str, Dict[str, Dict[str, MetricTuple]]],
+    all_suites_train_data: Dict[str, Dict[str, Dict[str, MetricTuple]]],
+    output_dir: Path,
+) -> Path:
+    """
+    Generate one figure with Test (attack) and Train heatmaps side by side.
+    Left: for each suite, 3 heatmaps (Utility, Attack Total, Max Attack) from test.
+    Right: for each suite, 2 heatmaps (Utility, Attack) from train.
+    Rows are unified across suites that appear in either test or train; missing data shows empty.
+    """
+    if not PLOTTING_AVAILABLE:
+        raise ImportError(
+            "matplotlib and seaborn are required for plotting. "
+            "Install with: pip install matplotlib seaborn"
+        )
+    unified_suites = sorted(set(all_suites_data.keys()) | set(all_suites_train_data.keys()))
+    if not unified_suites:
+        raise ValueError("No suites in test or train data")
+    n_suites = len(unified_suites)
+    # 5 columns: 3 test (Utility, Attack, Max Attack) + 2 train (Utility, Attack)
+    fig, axes = plt.subplots(n_suites, 5, figsize=(28, 5 * n_suites))
+    if n_suites == 1:
+        axes = axes.reshape(1, -1)
+
+    for idx, suite_name in enumerate(unified_suites):
+        suite_label = suite_name.replace("_", " ").title()
+        # Test: columns 0, 1, 2
+        if suite_name in all_suites_data:
+            data = all_suites_data[suite_name]
+            _draw_one_heatmap(
+                axes[idx, 0], data, "utility",
+                f'{suite_label} - Utility'
+            )
+            _draw_one_heatmap(
+                axes[idx, 1], data, "attack",
+                f'{suite_label} - Attack (Total)'
+            )
+            _draw_one_heatmap(
+                axes[idx, 2], data, "max_attack",
+                f'{suite_label} - Max Attack'
+            )
+        else:
+            for c in range(3):
+                axes[idx, c].set_visible(False)
+        # Train: columns 3, 4
+        if suite_name in all_suites_train_data:
+            data = all_suites_train_data[suite_name]
+            _draw_one_heatmap(
+                axes[idx, 3], data, "utility",
+                f'{suite_label} - Utility'
+            )
+            _draw_one_heatmap(
+                axes[idx, 4], data, "attack",
+                f'{suite_label} - Attack'
+            )
+        else:
+            for c in range(3, 5):
+                axes[idx, c].set_visible(False)
+
+    # Column group labels (centered over left 3 cols and right 2 cols)
+    fig.text(0.30, 0.995, 'Test (Attack)', ha='center', fontsize=14, fontweight='bold')
+    fig.text(0.78, 0.995, 'Train', ha='center', fontsize=14, fontweight='bold')
+    fig.suptitle(
+        f'{model_name.upper()} - All Suites: Test vs Train (Utility & Attack Success Rates)',
+        fontsize=16, fontweight='bold', y=1.005
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.995])
+    output_file = output_dir / "all_suites_test_and_train_combined_heatmap.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     plt.close()
     return output_file
@@ -517,7 +938,7 @@ def generate_average_heatmap(
     all_data: Dict[str, Dict[str, Dict[str, MetricTuple]]],
     output_dir: Path,
 ) -> Path:
-    """Generate two heatmaps: average Utility and average Attack success rates across suites."""
+    """Generate three heatmaps: average Utility, Attack (total), and Max Attack success rates across suites."""
     if not PLOTTING_AVAILABLE:
         raise ImportError(
             "matplotlib and seaborn are required for plotting. "
@@ -547,10 +968,13 @@ def generate_average_heatmap(
                     if (defense_type in all_data[suite_name]
                             and backend in all_data[suite_name][defense_type]):
                         t = all_data[suite_name][defense_type][backend]
-                        if t[6]:
+                        if t[8]:
                             has_any_errors = True
                         elif t[total_idx] > 0:
-                            rates.append(t[rate_idx])
+                            if rate_idx == 6 and total_idx == 7:
+                                rates.append((t[6] / t[7] * 100) if t[7] > 0 else 0.0)
+                            else:
+                                rates.append(t[rate_idx])
                 if has_any_errors:
                     rate_row.append(np.nan)
                     error_row.append(True)
@@ -572,11 +996,12 @@ def generate_average_heatmap(
             np.array(no_data_matrix),
         )
 
-    fig, (ax_util, ax_attack) = plt.subplots(1, 2, figsize=(18, 8))
+    fig, (ax_util, ax_attack, ax_max) = plt.subplots(1, 3, figsize=(22, 8))
 
     for ax, rate_idx, total_idx, label in [
         (ax_util, 2, 1, "Utility (user goal)"),
         (ax_attack, 5, 4, "Attack (attack goal)"),
+        (ax_max, 6, 7, "Max Attack (any trigger)"),
     ]:
         rates_matrix, has_errors_matrix, no_data_matrix = _avg_matrix(rate_idx, total_idx)
         display_matrix = rates_matrix.copy().astype(float)
@@ -614,7 +1039,7 @@ def generate_average_heatmap(
         fontsize=14, fontweight='bold', y=1.02
     )
     plt.tight_layout()
-    output_file = output_dir / f"{model_name}_average_heatmap.png"
+    output_file = output_dir / "average_heatmap.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     plt.close()
     return output_file
@@ -626,7 +1051,7 @@ def generate_combined_csv(
     output_dir: Path,
 ) -> Path:
     """Generate a combined CSV listing all attack suites with Utility and Attack columns."""
-    output_file = output_dir / f"{model_name}_all_suites_combined.csv"
+    output_file = output_dir / "all_suites_combined.csv"
 
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -643,17 +1068,20 @@ def generate_combined_csv(
                 writer.writerow([])
             for defense_type in UNIFIED_DEFENSE_TYPES:
                 dt_label = defense_type.replace("_", " ").title()
-                for metric_name, rate_idx, total_idx in [("Utility", 2, 1), ("Attack", 5, 4)]:
+                for metric_name, rate_idx, total_idx in [
+                    ("Utility", 2, 1), ("Attack (Total)", 5, 4), ("Max Attack", 6, 7),
+                ]:
                     row = [suite_label, dt_label, metric_name]
                     for backend in MEMORY_BACKENDS:
                         if not is_valid_combination(backend, defense_type):
                             row.append("-")
                             continue
                         t = data[defense_type].get(backend, _default_metric_tuple())
-                        if t[6]:
+                        if t[8]:
                             row.append("ERR")
                         elif t[total_idx] > 0:
-                            row.append(f"{t[rate_idx]:.1f}%")
+                            rate = (t[6] / t[7] * 100) if (rate_idx == 6 and total_idx == 7) else t[rate_idx]
+                            row.append(f"{rate:.1f}%")
                         else:
                             row.append("-")
                     writer.writerow(row)
@@ -667,7 +1095,7 @@ def generate_average_summary_csv(
     output_dir: Path,
 ) -> Path:
     """Generate a CSV with average Utility and Attack scores for all valid combinations."""
-    output_file = output_dir / f"{model_name}_average_summary.csv"
+    output_file = output_dir / "average_summary.csv"
 
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -679,7 +1107,9 @@ def generate_average_summary_csv(
 
         for defense_type in UNIFIED_DEFENSE_TYPES:
             dt_label = defense_type.replace("_", " ").title()
-            for metric_name, rate_idx, total_idx in [("Utility", 2, 1), ("Attack", 5, 4)]:
+            for metric_name, rate_idx, total_idx in [
+                ("Utility", 2, 1), ("Attack (Total)", 5, 4), ("Max Attack", 6, 7),
+            ]:
                 row = [dt_label, metric_name]
                 for backend in MEMORY_BACKENDS:
                     if not is_valid_combination(backend, defense_type):
@@ -691,11 +1121,13 @@ def generate_average_summary_csv(
                         if (defense_type in all_data[suite_name]
                                 and backend in all_data[suite_name][defense_type]):
                             t = all_data[suite_name][defense_type][backend]
-                            if t[6]:
+                            if t[8]:
                                 has_any_errors = True
                             elif t[total_idx] > 0:
-                                # Only average over suites that have data for this cell
-                                rates.append(t[rate_idx])
+                                if rate_idx == 6 and total_idx == 7:
+                                    rates.append((t[6] / t[7] * 100) if t[7] > 0 else 0.0)
+                                else:
+                                    rates.append(t[rate_idx])
                     if has_any_errors:
                         row.append("ERR")
                     elif rates:
@@ -758,7 +1190,7 @@ def generate_error_summary(
     if not errors_found:
         return None
 
-    summary_file = output_dir / f"{model_name}_{suite_name}_execution_errors.txt"
+    summary_file = output_dir / f"{suite_name}_execution_errors.txt"
     with open(summary_file, 'w', encoding='utf-8') as f:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         f.write(f"{'='*80}\n")
@@ -853,21 +1285,25 @@ def main() -> int:
         if not suites_to_process:
             print(f"Skipping {model_name}: no attack suites found in results")
             continue
+        model_output_dir = output_dir / model_name
+        model_output_dir.mkdir(parents=True, exist_ok=True)
         print(f"Suites for {model_name}: {', '.join(suites_to_process)}")
         all_suites_data = {}
+        all_suites_session_data: Dict[str, Dict[str, Dict[str, SessionDataTuple]]] = {}
 
         for suite_name in suites_to_process:
             print(f"Processing: {model_name} / {suite_name}")
 
-            data = collect_all_data(model_name, suite_name, results_base_dir)
+            data, session_data, data_stealth = collect_all_data(model_name, suite_name, results_base_dir)
             all_suites_data[suite_name] = data
+            all_suites_session_data[suite_name] = session_data
 
-            csv_file = generate_csv(model_name, suite_name, data, output_dir)
+            csv_file = generate_csv(model_name, suite_name, data, model_output_dir, data_stealth=data_stealth)
             csv_files.append(csv_file)
             print(f"  OK: CSV: {csv_file.name}")
 
             error_summary = generate_error_summary(
-                model_name, suite_name, results_base_dir, logs_base_dir, output_dir
+                model_name, suite_name, results_base_dir, logs_base_dir, model_output_dir
             )
             if error_summary:
                 error_summaries.append(error_summary)
@@ -878,12 +1314,22 @@ def main() -> int:
             if not args.no_plots and PLOTTING_AVAILABLE:
                 try:
                     heatmap_file = generate_heatmap(
-                        model_name, suite_name, data, output_dir
+                        model_name, suite_name, data, model_output_dir
                     )
                     plot_files.append(heatmap_file)
                     print(f"  OK: Heatmap: {heatmap_file.name}")
                 except Exception as e:
                     print(f"  WARNING: Error generating heatmap: {e}")
+                try:
+                    session_plot_files = generate_session_plots(
+                        model_name, suite_name, session_data, model_output_dir
+                    )
+                    for sp in session_plot_files:
+                        plot_files.append(sp)
+                    if session_plot_files:
+                        print(f"  OK: Session plots: {len(session_plot_files)} file(s)")
+                except Exception as e:
+                    print(f"  WARNING: Error generating session plots: {e}")
             elif not args.no_plots:
                 print("  WARNING: Skipping plots (matplotlib/seaborn not installed)")
 
@@ -892,24 +1338,45 @@ def main() -> int:
             print(f"\nGenerating combined visualizations for {model_name}...")
             try:
                 combined_heatmap_file = generate_combined_heatmaps_subplot(
-                    model_name, all_suites_data, output_dir
+                    model_name, all_suites_data, model_output_dir
                 )
                 plot_files.append(combined_heatmap_file)
                 print(f"  OK: Combined Heatmaps: {combined_heatmap_file.name}")
             except Exception as e:
                 print(f"  WARNING: Error generating combined visualizations: {e}")
 
+        # Load train results and generate test+train side-by-side heatmap
+        train_results_dir = results_base_dir.parent / "train"
+        all_suites_train_data: Dict[str, Dict[str, Dict[str, MetricTuple]]] = {}
+        if train_results_dir.exists():
+            train_suites = discover_suites_for_train(train_results_dir, model_name)
+            if train_suites:
+                for suite_name in train_suites:
+                    data, _, _ = collect_all_data(
+                        model_name, suite_name, train_results_dir, train_only=True
+                    )
+                    all_suites_train_data[suite_name] = data
+        if all_suites_train_data and not args.no_plots and PLOTTING_AVAILABLE:
+            try:
+                test_train_heatmap_file = generate_test_train_combined_heatmap(
+                    model_name, all_suites_data, all_suites_train_data, model_output_dir
+                )
+                plot_files.append(test_train_heatmap_file)
+                print(f"  OK: Test+Train Combined Heatmap: {test_train_heatmap_file.name}")
+            except Exception as e:
+                print(f"  WARNING: Error generating test+train combined heatmap: {e}")
+
         # Combined and average CSV/heatmap
         print(f"\nGenerating combined CSV files for {model_name}...")
         try:
             combined_csv_file = generate_combined_csv(
-                model_name, all_suites_data, output_dir
+                model_name, all_suites_data, model_output_dir
             )
             csv_files.append(combined_csv_file)
             print(f"  OK: Combined CSV: {combined_csv_file.name}")
 
             avg_csv_file = generate_average_summary_csv(
-                model_name, all_suites_data, output_dir
+                model_name, all_suites_data, model_output_dir
             )
             csv_files.append(avg_csv_file)
             print(f"  OK: Average Summary CSV: {avg_csv_file.name}")
@@ -917,12 +1384,22 @@ def main() -> int:
             if not args.no_plots and PLOTTING_AVAILABLE:
                 try:
                     avg_heatmap_file = generate_average_heatmap(
-                        model_name, all_suites_data, output_dir
+                        model_name, all_suites_data, model_output_dir
                     )
                     plot_files.append(avg_heatmap_file)
                     print(f"  OK: Average Heatmap: {avg_heatmap_file.name}")
                 except Exception as e:
                     print(f"  WARNING: Error generating average heatmap: {e}")
+                try:
+                    avg_session_plot_files = generate_averaged_session_plots(
+                        model_name, all_suites_session_data, model_output_dir
+                    )
+                    for sp in avg_session_plot_files:
+                        plot_files.append(sp)
+                    if avg_session_plot_files:
+                        print(f"  OK: Averaged session plots (across topics): {len(avg_session_plot_files)} file(s)")
+                except Exception as e:
+                    print(f"  WARNING: Error generating averaged session plots: {e}")
         except Exception as e:
             print(f"  WARNING: Error generating combined CSV files: {e}")
 

@@ -43,7 +43,16 @@ PYTHONPATH=src python -m benchmark.attack_generation.persistent_exfiltrate.gener
 
 3. **Run the generator** (with or without `--category finance`). The new category will be written to `attack_bench/train/` and `attack_bench/test/` under each backend (e.g. `attack_bench/train/rag/persistent_exfiltrate_finance/`, `attack_bench/test/rag/persistent_exfiltrate_finance/`).
 
-Train/test split is the same as before: one train case (`00_*_train.json`) and four test cases (`01_*.json` … `04_*.json`) per backend, with disjoint templates and entity slots (no leakage).
+Train/test split: one train case (`00_*_train.json`) and four test cases (`01_*.json` … `04_*.json`) per backend, with disjoint templates and entity slots (no leakage).
+
+## Test case layout: num_sessions (default 5)
+
+- **Train cases** are always 4 steps: insert_attack_email, read inbox, start_new_session, one trigger-topic query.
+- **Test cases** depend on **`num_sessions`** (global default 5, overridable per category in `config.yaml`):
+  - **`num_sessions: 0`** — Old style: 4 steps, single trigger-topic query.
+  - **`num_sessions: 5`** (default) — Multi-session: 5 trigger-topic queries across 6 sessions, plus 2 unrelated share/probe pairs (noise to test attack persistence). Session layout: (1) trigger1; (2) trigger2; (3) trigger3 + share; (4) trigger4 + probe; (5) trigger5 + share; (6) probe. Only **probe** steps have a `user_goal`/success_check; share steps have no validator. The five trigger messages use **similar templates** (same slot, indices 1,2,3,4,4) so attacks generalize from train to test.
+
+Unrelated share/probe pairs are hardcoded in **`unrelated_pairs.py`** (10 pairs from `data/benchmark/tests/memory_only`); each test case gets 2 pairs. Templates should stay very similar across the category so the attack generalizes.
 
 ## Backend-specific content
 

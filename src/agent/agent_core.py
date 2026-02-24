@@ -16,7 +16,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import trim_messages, HumanMessage, AIMessage, SystemMessage
 from agent.tools_registry import create_all_tools, create_email_tools
 from agent.tool_specifications.email_tools import EmailToolsConfig
-from agent.utils import get_timestamp, set_global_seeds, debug_info, debug_debug, debug_print_exception, get_model_context_window, get_debug_level, DebugLevel
+from agent.utils import get_timestamp, set_global_seeds, debug_info, debug_debug, debug_print_exception, get_model_context_window, get_debug_level, DebugLevel, _is_retryable_api_error
 from agent.backend.explicit_memory import get_memory_manager, _memory_manager_cache
 from agent.backend.rag_memory import get_rag_memory_context, index_rag_memory
 from agent.backend.mem0_memory import get_mem0_memory_context, index_mem0_memory
@@ -24,22 +24,6 @@ from agent.backend.context_memory import get_context_memory_context, index_conte
 from benchmark.benchmark_utils import get_unified_defense_from_config
 
 load_dotenv()
-
-
-def _is_retryable_api_error(exc: BaseException) -> bool:
-    """True if the exception indicates a retryable API error (504, 503, timeout, etc.)."""
-    msg = (getattr(exc, "message", "") or str(exc)).lower()
-    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-    if code is not None:
-        try:
-            if int(code) in (504, 503, 429, 500):
-                return True
-        except (TypeError, ValueError):
-            pass
-    for token in ("504", "503", "429", "500", "gateway timeout", "service unavailable", "timeout", "timed out", "deadline exceeded", "too many requests"):
-        if token in msg:
-            return True
-    return False
 
 
 _session_store: Dict[str, list] = {}
@@ -644,10 +628,10 @@ def invoke_agent(text: str, session_id: str, config: dict, in_memory_env) -> Dic
         print("--- END MESSAGES SENT TO AGENT ---\n", flush=True)
         sys.stdout.flush()
     
-    # Invoke agent with timeout and retries. 504/503/timeouts from Gemini are retried with backoff (max 3 attempts).
+    # Invoke agent with timeout and retries. Rate limit/503/504/timeouts retried with backoff (max 5 attempts).
     invoke_timeout_sec = config.get("agent", {}).get("invoke_timeout_seconds", 300)
-    max_retries = 3
-    backoff_secs = [10, 30]  # after 1st and 2nd failure
+    max_retries = 5
+    backoff_secs = [10, 30, 60, 90]  # after 1st, 2nd, 3rd, 4th failure
     last_error = None
     result = None
     for attempt in range(1, max_retries + 1):

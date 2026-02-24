@@ -84,6 +84,7 @@ def run_benchmark(
     config_path: str = "benchmark_config.yaml",
     force: bool = False,
     adaptive: bool = False,
+    stealth: bool = False,
     results_base_dir: Optional[Path] = None,
     logs_base_dir: Optional[Path] = None,
     target_model_name: Optional[str] = None
@@ -97,6 +98,8 @@ def run_benchmark(
         test_path: Path to test file, directory, or suite name
         config_path: Path to config file
         force: Force overwrite existing results
+        adaptive: If True, run in adaptive mode (optimize attacks when static attack fails).
+        stealth: If True and adaptive, optimizers optimize for both attack success and stealth (no detectable exfiltration).
         results_base_dir: Base directory for results (defaults to data/benchmark/results)
         
     Returns:
@@ -120,6 +123,10 @@ def run_benchmark(
         target_model_name=target_model_name,
         results_base_dir=results_base_dir
     )
+    
+    # When adaptive + --stealth: optimizers should optimize for attack + stealth (blend score with stealth goal)
+    if adaptive and stealth:
+        config.setdefault("benchmark", {})["adaptive_stealth"] = True
     
     # Get results_base_dir from config (in case it was set to default)
     results_base_dir = Path(config["benchmark"]["results_dir"])
@@ -275,7 +282,7 @@ def _check_result_for_errors(
 
 
 def _run_single_combination(
-    args_tuple: Tuple[str, str, str, str, bool, bool, Optional[Path], Optional[Path], Optional[str]]
+    args_tuple: Tuple[str, str, str, str, bool, bool, bool, Optional[Path], Optional[Path], Optional[str]]
 ) -> Tuple[str, str, Dict[str, Any]]:
     """
     Wrapper function to run a single backend+defense combination.
@@ -289,7 +296,7 @@ def _run_single_combination(
     All output is redirected to a log file specific to this combination.
     
     Args:
-        args_tuple: (memory_backend, unified_defense, test_path, config_path, force, adaptive, results_base_dir, logs_base_dir, target_model_name)
+        args_tuple: (memory_backend, unified_defense, test_path, config_path, force, adaptive, stealth, results_base_dir, logs_base_dir, target_model_name)
     
     Returns:
         (memory_backend, unified_defense, result_dict)
@@ -298,7 +305,7 @@ def _run_single_combination(
     
     # Set process name for debugging
     process_id = os.getpid()
-    memory_backend, unified_defense, test_path, config_path, force, adaptive, results_base_dir, logs_base_dir, target_model_name = args_tuple
+    memory_backend, unified_defense, test_path, config_path, force, adaptive, stealth, results_base_dir, logs_base_dir, target_model_name = args_tuple
     
     # Determine attack type from test_path (needed for result paths)
     if isinstance(test_path, str):
@@ -338,6 +345,7 @@ def _run_single_combination(
             config_path=config_path,
             force=force,
             adaptive=adaptive,
+            stealth=stealth,
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
             target_model_name=target_model_name
@@ -398,11 +406,15 @@ def _run_single_combination(
 _interrupted = False
 _executor_ref = None  # Reference to executor for cleanup on interrupt
 _futures_ref = None  # Reference to all futures for cancellation
+_shutdown_triggered = False  # Guard so we don't re-enter when killing process group
 
 
 def _signal_handler(signum, frame):
     """Handle SIGINT (Ctrl+C) and SIGTERM signals."""
-    global _interrupted, _executor_ref, _futures_ref
+    global _interrupted, _executor_ref, _futures_ref, _shutdown_triggered
+    # If we're already shutting down (e.g. re-entry after killing process group), exit immediately
+    if _shutdown_triggered:
+        os._exit(1)
     _interrupted = True
     print(f"\n\n{'='*80}", flush=True)
     print(f"INTERRUPTED: Received signal {signum}. Shutting down gracefully...", flush=True)
@@ -424,7 +436,18 @@ def _signal_handler(signum, frame):
         print("Terminating worker processes...", flush=True)
         _executor_ref.shutdown(wait=False, cancel_futures=True)
     
-    # Re-raise KeyboardInterrupt so the script exits properly
+    # On Unix, kill entire process group so any orphaned workers are terminated.
+    # Workers inherit our process group when spawned; killing the group ensures no stragglers.
+    if os.name != "nt":
+        _shutdown_triggered = True  # Before kill so re-entry (we get SIGTERM too) exits immediately
+        try:
+            pgid = os.getpgrp()
+            os.kill(-pgid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+        os._exit(1)
+    
+    # Re-raise KeyboardInterrupt so the script exits properly (Windows or if group kill skipped)
     raise KeyboardInterrupt("Benchmark interrupted by user")
 
 
@@ -435,6 +458,7 @@ def run_all_combinations(
     config_path: str = "benchmark_config.yaml",
     force: bool = False,
     adaptive: bool = False,
+    stealth: bool = False,
     num_workers: int = 1,
     results_base_dir: Optional[Path] = None,
     logs_base_dir: Optional[Path] = None,
@@ -498,7 +522,7 @@ def run_all_combinations(
     
     # Prepare arguments for each combination
     args_list = [
-        (backend, defense, test_path, config_path, force, adaptive, results_base_dir, logs_base_dir, target_model_name)
+        (backend, defense, test_path, config_path, force, adaptive, stealth, results_base_dir, logs_base_dir, target_model_name)
         for backend, defense in combinations
     ]
     
@@ -834,6 +858,9 @@ Examples:
   
   # Run in adaptive mode (optimize attacks when static attack fails) on train cases
   python scripts/run_benchmark.py --memory-backend rag --defense-type none --test data/benchmark/attack_bench/train/rag/persistent_exfiltrate_tax --adaptive
+  
+  # Adaptive with stealth: optimize for attack success AND stealth (no detectable exfiltration in response)
+  python scripts/run_benchmark.py --memory-backend rag --defense-type none --test data/benchmark/attack_bench/train/rag/persistent_exfiltrate_tax --adaptive --stealth
         """
     )
     
@@ -895,6 +922,12 @@ Examples:
         "--adaptive",
         action="store_true",
         help="Run in adaptive benchmark mode (optimize attacks when static attack fails). Default: static mode."
+    )
+    
+    parser.add_argument(
+        "--stealth",
+        action="store_true",
+        help="[Adaptive only] Optimize for both attack success and stealth (no detectable exfiltration in assistant response). Ignored in static mode."
     )
     
     parser.add_argument(
@@ -980,6 +1013,8 @@ Examples:
     print(f"\n{'='*80}")
     print(f"Configuration:")
     print(f"  Mode: {'adaptive' if args.adaptive else 'static'}")
+    if args.adaptive and args.stealth:
+        print(f"  Stealth: enabled (optimizer will favor attack + stealth)")
     print(f"  Memory backends: {memory_backends}")
     print(f"  Defense types: {defense_types}")
     print(f"  Total combinations: {len(memory_backends) * len(defense_types)}")
@@ -1016,6 +1051,7 @@ Examples:
             config_path=args.config,
             force=args.force,
             adaptive=args.adaptive,
+            stealth=args.stealth,
             num_workers=args.num_workers,
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
@@ -1040,6 +1076,7 @@ Examples:
             config_path=args.config,
             force=args.force,
             adaptive=args.adaptive,
+            stealth=args.stealth,
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
             target_model_name=args.target_model_name

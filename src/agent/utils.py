@@ -555,6 +555,54 @@ def get_gemini_client(api_key: Optional[str] = None):
     return genai.Client(api_key=api_key)
 
 
+def _is_retryable_api_error(exc: Exception) -> bool:
+    """True if the exception indicates a retryable API error (429, 503, 504, timeout, etc.)."""
+    msg = (getattr(exc, "message", "") or str(exc)).lower()
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if code is not None:
+        try:
+            if int(code) in (504, 503, 429, 500):
+                return True
+        except (TypeError, ValueError):
+            pass
+    for token in (
+        "504", "503", "429", "500",
+        "gateway timeout", "service unavailable", "timeout", "timed out",
+        "deadline exceeded", "too many requests", "resource exhausted", "quota",
+    ):
+        if token in msg:
+            return True
+    return False
+
+
+# Shared retry constants for LLM API calls
+_MAX_LLM_RETRIES = 5
+
+
+def _llm_retry_loop(
+    api_name: str,
+    base_delay: float,
+    max_retries: int,
+    fn,
+):
+    """Execute fn(); on retryable API errors, log and retry with exponential backoff up to max_retries."""
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            if _is_retryable_api_error(e) and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                print(f"WARNING: {api_name} API retryable error (attempt {attempt + 1}/{max_retries}): {e}", file=sys.stderr, flush=True)
+                print(f"   Retrying in {delay:.2f}s...", file=sys.stderr, flush=True)
+                time.sleep(delay)
+                continue
+            if _is_retryable_api_error(e):
+                print(f"WARNING: {api_name} API ERROR (final after {max_retries} attempts): {e}", file=sys.stderr, flush=True)
+            else:
+                print(f"WARNING: {api_name} API ERROR (non-retryable): {e}", file=sys.stderr, flush=True)
+            raise
+
+
 def call_openai_chat_completion(
     client,
     model: str,
@@ -611,46 +659,10 @@ def call_openai_chat_completion(
     if seed is not None:
         params["seed"] = seed
     
-    max_retries = 5
-    base_delay = 1.0  # Start with 1 second
-    
-    for attempt in range(max_retries):
-        try:
-            return client.chat.completions.create(**params)
-        except Exception as e:
-            error_str = str(e).lower()
-            
-            # Check for rate limiting errors
-            is_rate_limit = "rate limit" in error_str or "429" in error_str or "quota" in error_str
-            
-            # Check for connection errors (retryable)
-            is_connection_error = (
-                "connection" in error_str or 
-                "timeout" in error_str or
-                "network" in error_str or
-                "apiconnectionerror" in error_str or
-                type(e).__name__ == "APIConnectionError"
-            )
-            
-            # Only retry on rate limits or connection errors
-            if (is_rate_limit or is_connection_error) and attempt < max_retries - 1:
-                # Exponential backoff with jitter
-                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
-                error_type_display = "RATE LIMIT" if is_rate_limit else "CONNECTION"
-                print(f"WARNING: {error_type_display} ERROR (attempt {attempt + 1}/{max_retries}): {e}", file=sys.stderr, flush=True)
-                print(f"   Retrying in {delay:.2f}s...", file=sys.stderr, flush=True)
-                time.sleep(delay)
-                continue
-            else:
-                # Log non-retryable errors or final failure
-                if is_rate_limit:
-                    print(f"WARNING: RATE LIMIT ERROR (final after {max_retries} attempts): {e}", file=sys.stderr, flush=True)
-                elif is_connection_error:
-                    print(f"WARNING: CONNECTION ERROR (final after {max_retries} attempts): {e}", file=sys.stderr, flush=True)
-                else:
-                    print(f"WARNING: API ERROR (non-retryable): {e}", file=sys.stderr, flush=True)
-                # Re-raise the exception (this will be caught by test_bench and tracked)
-                raise
+    def _call():
+        return client.chat.completions.create(**params)
+
+    return _llm_retry_loop("OpenAI", base_delay=1.0, max_retries=_MAX_LLM_RETRIES, fn=_call)
 
 
 def call_gemini_chat_completion(
@@ -720,20 +732,18 @@ def call_gemini_chat_completion(
     # Use generate_content with contents list (works for both single and multiple messages)
     if len(chat_messages) == 0:
         raise ValueError("No user messages found in messages list")
-    
-    # Use generate_content with the list of Content objects
-    if gen_config:
-        response = client.models.generate_content(
-            model=model,
-            contents=chat_messages,
-            config=gen_config
-        )
-    else:
-        response = client.models.generate_content(
-            model=model,
-            contents=chat_messages
-        )
-    
+
+    def _call():
+        if gen_config:
+            return client.models.generate_content(
+                model=model,
+                contents=chat_messages,
+                config=gen_config
+            )
+        return client.models.generate_content(model=model, contents=chat_messages)
+
+    response = _llm_retry_loop("Gemini", base_delay=2.0, max_retries=_MAX_LLM_RETRIES, fn=_call)
+
     # Convert Gemini response to OpenAI-like format for compatibility
     class GeminiResponse:
         """Wrapper to make Gemini response compatible with OpenAI response format."""
