@@ -28,6 +28,7 @@ from benchmark.benchmark_utils import (
     should_skip_test,
     determine_attack_type,
     discover_test_files,
+    filter_attack_bench_test_files,
     get_attack_bench_train_or_test,
     get_attack_bench_suite_subfolder,
     get_log_path,
@@ -93,7 +94,8 @@ def run_benchmark(
     early_stop_patience: Optional[int] = None,
     results_base_dir: Optional[Path] = None,
     logs_base_dir: Optional[Path] = None,
-    target_model_name: Optional[str] = None
+    target_model_name: Optional[str] = None,
+    try_all_attack_candidates: bool = False,
 ) -> Dict[str, Any]:
     """
     Run benchmark for a specific memory backend and defense type.
@@ -157,9 +159,26 @@ def run_benchmark(
             "tests_passed": 0,
             "tests_failed": 0
         }
-    
-    model_name = config.get("agent", {}).get("target_model_name", "unknown")
+
+    # For attack_bench: only run test files that match the active (memory_backend, defense).
+    # Layout is attack_bench/<split>/<topic>/<backend>/<defense>/<file>.json — each combo has its own copy.
     is_attack_bench = "attack_bench" in str(test_files[0])
+    if is_attack_bench:
+        n_before = len(test_files)
+        test_files = filter_attack_bench_test_files(test_files, memory_backend, unified_defense)
+        if len(test_files) < n_before:
+            print(f"Attack bench: using only test files for {memory_backend}/{unified_defense} ({len(test_files)} of {n_before} discovered)")
+        if not test_files:
+            print(f"WARNING: No attack_bench test files match {memory_backend}/{unified_defense} under path: {test_path}")
+            return {
+                "success": False,
+                "error": f"No test files for {memory_backend}/{unified_defense}",
+                "tests_run": 0,
+                "tests_passed": 0,
+                "tests_failed": 0
+            }
+
+    model_name = config.get("agent", {}).get("target_model_name", "unknown")
     logs_folder = "attack_logs" if is_attack_bench else "logs"
     default_logs_dir = Path("data/benchmark") / logs_folder / model_name / memory_backend / unified_defense
     test_path_is_dir = Path(test_path).is_dir() if Path(test_path).exists() else (len(test_files) > 1)
@@ -256,12 +275,19 @@ def run_benchmark(
         print(f"SKIPPED: {len(missing)} test(s) already have results, {len(test_files) - len(missing)} will run")
     
     # Initialize TestBench with config dict directly (no temp file needed)
-    bench = TestBench(config=config, defense_type_override=unified_defense, force=force, adaptive=adaptive, logs_base_dir=logs_base_dir)
+    bench = TestBench(
+        config=config,
+        defense_type_override=unified_defense,
+        force=force,
+        adaptive=adaptive,
+        logs_base_dir=logs_base_dir,
+        try_all_attack_candidates=try_all_attack_candidates,
+    )
     
     try:
-        # Run tests - TestBench.run_all_tests expects a path string
-        # It will handle file/directory/suite discovery internally
-        results = bench.run_all_tests(test_path)
+        # Run tests. For attack_bench we pass the filtered test files so only the
+        # correct backend/defense test cases are run; otherwise discovery uses test_path.
+        results = bench.run_all_tests(test_path, test_files_override=test_files if is_attack_bench else None)
         
         # Calculate summary
         total_tests = len(results)
@@ -353,7 +379,7 @@ def _check_result_for_errors(
 
 
 def _run_single_combination(
-    args_tuple: Tuple[str, str, str, str, bool, bool, bool, Optional[Path], Optional[Path], Optional[str]]
+    args_tuple: Tuple[str, str, str, str, bool, bool, bool, Optional[Path], Optional[Path], Optional[str], bool]
 ) -> Tuple[str, str, Dict[str, Any]]:
     """
     Wrapper function to run a single backend+defense combination.
@@ -376,7 +402,20 @@ def _run_single_combination(
     
     # Set process name for debugging
     process_id = os.getpid()
-    memory_backend, unified_defense, test_path, config_path, force, adaptive, stealth, early_stop_patience, results_base_dir, logs_base_dir, target_model_name = args_tuple
+    (
+        memory_backend,
+        unified_defense,
+        test_path,
+        config_path,
+        force,
+        adaptive,
+        stealth,
+        early_stop_patience,
+        results_base_dir,
+        logs_base_dir,
+        target_model_name,
+        try_all_attack_candidates,
+    ) = args_tuple
     
     # Determine attack type from test_path (needed for result paths)
     if isinstance(test_path, str):
@@ -435,7 +474,8 @@ def _run_single_combination(
             early_stop_patience=early_stop_patience,
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
-            target_model_name=target_model_name
+            target_model_name=target_model_name,
+            try_all_attack_candidates=try_all_attack_candidates,
         )
         
         # Print completion summary to terminal
@@ -550,7 +590,8 @@ def run_all_combinations(
     num_workers: int = 1,
     results_base_dir: Optional[Path] = None,
     logs_base_dir: Optional[Path] = None,
-    target_model_name: Optional[str] = None
+    target_model_name: Optional[str] = None,
+    try_all_attack_candidates: bool = False,
 ) -> Dict[str, Any]:
     """
     Run benchmarks for all combinations of memory backends and defense types in parallel.
@@ -610,7 +651,20 @@ def run_all_combinations(
     
     # Prepare arguments for each combination
     args_list = [
-        (backend, defense, test_path, config_path, force, adaptive, stealth, early_stop_patience, results_base_dir, logs_base_dir, target_model_name)
+        (
+            backend,
+            defense,
+            test_path,
+            config_path,
+            force,
+            adaptive,
+            stealth,
+            early_stop_patience,
+            results_base_dir,
+            logs_base_dir,
+            target_model_name,
+            try_all_attack_candidates,
+        )
         for backend, defense in combinations
     ]
     
@@ -1027,6 +1081,13 @@ Examples:
     )
     
     parser.add_argument(
+        "--try-all",
+        dest="try_all_attack_candidates",
+        action="store_true",
+        help="[Static attack_bench only] When set, try all attack candidates listed in each test file (attack_candidates) sequentially until one succeeds or all fail. Default: use only the primary attack.",
+    )
+    
+    parser.add_argument(
         "--results-dir",
         type=str,
         help="Base directory for results (defaults to data/benchmark/results)"
@@ -1152,7 +1213,8 @@ Examples:
             num_workers=args.num_workers,
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
-            target_model_name=args.target_model_name
+            target_model_name=args.target_model_name,
+            try_all_attack_candidates=args.try_all_attack_candidates,
         )
     else:
         # Single combination mode
@@ -1177,7 +1239,8 @@ Examples:
             early_stop_patience=args.early_stop_patience,
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
-            target_model_name=args.target_model_name
+            target_model_name=args.target_model_name,
+            try_all_attack_candidates=args.try_all_attack_candidates,
         )
     
     # Exit with appropriate code

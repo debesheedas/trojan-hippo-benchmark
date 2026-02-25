@@ -40,11 +40,17 @@ def get_attack_email_from_cached(cached_path: Path) -> Optional[dict]:
     return None
 
 
-def propagate_attack_to_file(test_case_path: Path, attack_email: dict) -> bool:
-    """Set step 1 (insert_attack_email) attack_email in test_case_path. Returns True if updated."""
+def propagate_attack_to_file(test_case_path: Path, attack_email: dict, attack_candidates: Optional[List[dict]] = None) -> bool:
+    """Set step 1 (insert_attack_email) attack_email in test_case_path and optionally record all attack candidates.
+    
+    Returns True if updated.
+    """
     with open(test_case_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     updated = False
+    # Persist all candidate attacks (if provided) so static benchmark can optionally try them in order.
+    if attack_candidates is not None:
+        data["attack_candidates"] = attack_candidates
     for step in data.get("steps", []):
         if step.get("step_type") == "insert_attack_email":
             step["attack_email"] = attack_email
@@ -162,6 +168,91 @@ def find_train_file_in_bench(
     return None
 
 
+# Session checkpoints: 0, 10, 20, ..., 100 (same as generate_persistence_attack_bench.sh).
+SESSION_CHECKPOINTS: List[int] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+NUM_TRAIN_SPLITS = len(SESSION_CHECKPOINTS)
+# Ordered list of train splits for attack candidates. Same-split is tried first, then others in increasing order.
+TRAIN_SPLITS_ORDER: List[str] = [f"train_{i}" for i in SESSION_CHECKPOINTS]
+
+
+def _get_best_attack_for_train_split(
+    attack_bench_base: Path,
+    cache_base: Path,
+    train_split: str,
+    topic: str,
+    backend: str,
+    defense: str,
+    model: str,
+    stealth: bool,
+) -> Optional[Tuple[dict, str]]:
+    """
+    Return the single best attack (email, source) for the given train split.
+    Prefers cached (optimized) attack for that split, then original train file.
+    """
+    if train_split == "train":
+        split_cache_base = cache_base
+        layout_without_model = False
+        cache_label = "train_cache"
+    else:
+        # train_0 -> train_cache_0, train_10 -> train_cache_10, ..., train_100 -> train_cache_100
+        suffix = train_split.replace("train", "", 1).lstrip("_") or "0"
+        cache_dir_name = f"train_cache_{suffix}"
+        split_cache_base = attack_bench_base / cache_dir_name
+        if not split_cache_base.exists():
+            split_cache_base = cache_base
+            layout_without_model = False
+            cache_label = "train_cache"
+        else:
+            layout_without_model = True
+            cache_label = cache_dir_name
+
+    if stealth:
+        cached = find_cached_train_file_stealth(
+            split_cache_base, model, topic, backend, defense,
+            layout_without_model=layout_without_model,
+        )
+        if cached:
+            email = get_attack_email_from_cached(cached)
+            if email:
+                return (email, f"cached (stealth) {backend}/{defense} [{cache_label}]")
+        if defense != "none":
+            cached = find_cached_train_file_stealth(
+                split_cache_base, model, topic, backend, "none",
+                layout_without_model=layout_without_model,
+            )
+            if cached:
+                email = get_attack_email_from_cached(cached)
+                if email:
+                    return (email, f"cached (stealth) {backend}/none [{cache_label}]")
+
+    cached = find_cached_train_file(
+        split_cache_base, model, topic, backend, defense,
+        layout_without_model=layout_without_model,
+    )
+    if cached:
+        email = get_attack_email_from_cached(cached)
+        if email:
+            return (email, f"cached {backend}/{defense} [{cache_label}]")
+    if defense != "none":
+        cached = find_cached_train_file(
+            split_cache_base, model, topic, backend, "none",
+            layout_without_model=layout_without_model,
+        )
+        if cached:
+            email = get_attack_email_from_cached(cached)
+            if email:
+                return (email, f"cached {backend}/none [{cache_label}]")
+
+    bench_train = find_train_file_in_bench(
+        attack_bench_base, topic, backend, defense, train_split=train_split
+    )
+    if bench_train:
+        email = get_attack_email_from_file(bench_train)
+        if email:
+            return (email, f"original train {train_split} {backend}")
+    return None
+
+
 def get_attack_email_from_file(json_path: Path) -> Optional[dict]:
     """Extract the attack email from the first insert_attack_email step in a test JSON file."""
     if not json_path.exists():
@@ -196,72 +287,57 @@ def run(
 
     for topic, backend, defense, defense_dir in combo_dirs:
         suite_name = topic
-        attack_email = None
-        source_label = None
+        # Collect attack candidates: same-split train first, then train_0, train_10, ..., train_100
+        # in increasing order (skipping the same-split since already tried). Run with --try-all
+        # to try each candidate in order until one succeeds or all fail.
+        candidates: List[dict] = []
+        seen_emails = set()
 
-        # Per-split cache and train: test_10 -> train_cache_10 + train_10 (no model in path)
+        def _add_candidate(email: Optional[dict], source: str) -> None:
+            """Add candidate if non-empty and not a duplicate (by JSON representation)."""
+            if not email:
+                return
+            try:
+                key = json.dumps(email, sort_keys=True)
+            except TypeError:
+                key = None
+            if key is not None and key in seen_emails:
+                return
+            if key is not None:
+                seen_emails.add(key)
+            candidates.append({"attack_email": email, "source": source})
+
         test_split = _split_from_defense_dir(defense_dir, attack_bench_base)
-        train_split, cache_dir_name = _train_split_and_cache_dir(test_split)
-        if cache_dir_name == "train_cache":
-            split_cache_base = cache_base  # use --cache-dir (default attack_bench/train_cache)
-        else:
-            split_cache_base = attack_bench_base / cache_dir_name  # e.g. attack_bench/train_cache_10
-        layout_without_model = cache_dir_name != "train_cache"
+        train_split, _ = _train_split_and_cache_dir(test_split)
 
-        if stealth:
-            # 1a) Prefer stealth cache for this defense
-            cached_stealth = find_cached_train_file_stealth(
-                split_cache_base, model, topic, backend, defense, layout_without_model=layout_without_model
-            )
-            if cached_stealth:
-                attack_email = get_attack_email_from_cached(cached_stealth)
-                if attack_email:
-                    source_label = f"cached (stealth) {backend}/{defense}/{suite_name}"
-            # 1b) Fallback: stealth cache for defense=none
-            if not attack_email and defense != "none":
-                cached_stealth_none = find_cached_train_file_stealth(
-                    split_cache_base, model, topic, backend, "none", layout_without_model=layout_without_model
-                )
-                if cached_stealth_none:
-                    attack_email = get_attack_email_from_cached(cached_stealth_none)
-                    if attack_email:
-                        source_label = f"cached (stealth) {backend}/none/{suite_name} (fallback)"
+        # Order: same-split first (e.g. test_50 -> try train_50 first), then train_0, train_10, ...,
+        # train_100 in increasing order, skipping the same-split so it is not duplicated.
+        ordered_splits: List[str] = [train_split] + [
+            s for s in TRAIN_SPLITS_ORDER if s != train_split
+        ]
 
-        # 2) Normal cache for this defense (or first step when not stealth)
-        if not attack_email:
-            cached_train = find_cached_train_file(
-                split_cache_base, model, topic, backend, defense, layout_without_model=layout_without_model
+        for t_split in ordered_splits:
+            result = _get_best_attack_for_train_split(
+                attack_bench_base, cache_base, t_split,
+                topic, backend, defense, model, stealth,
             )
-            if cached_train:
-                attack_email = get_attack_email_from_cached(cached_train)
-                if attack_email:
-                    source_label = source_label or f"cached {backend}/{defense}/{suite_name}"
-        # 3) Fallback: cache for defense=none (unless we already used it)
-        if not attack_email and defense != "none":
-            cached_none = find_cached_train_file(
-                split_cache_base, model, topic, backend, "none", layout_without_model=layout_without_model
-            )
-            if cached_none:
-                attack_email = get_attack_email_from_cached(cached_none)
-                if attack_email:
-                    source_label = source_label or f"cached {backend}/none/{suite_name} (fallback)"
-        # 4) Fallback: original train file from same split (train_10 for test_10, train for test)
-        if not attack_email:
+            if result:
+                email, source = result
+                _add_candidate(email, source)
+
+        if not candidates:
+            # Fallback: original train file from same split only
             bench_train = find_train_file_in_bench(
                 attack_bench_base, topic, backend, defense, train_split=train_split
             )
             if bench_train:
                 attack_email = get_attack_email_from_file(bench_train)
                 if attack_email:
-                    source_label = f"original train {backend}/{suite_name}"
+                    _add_candidate(attack_email, f"original train {backend}/{suite_name}")
                 else:
                     skipped_no_attack.append(f"{backend}/{suite_name}")
                     continue
-            else:
-                skipped_no_attack.append(f"{backend}/{suite_name}")
-                continue
-
-        if not attack_email:
+        if not candidates:
             skipped_no_attack.append(f"{backend}/{suite_name}")
             continue
 
@@ -271,9 +347,12 @@ def run(
             continue
 
         split_label = f" [{test_split}]" if test_split != "test" else ""
-        print(f"  {topic}/{backend}/{defense}{split_label}: {source_label} → {len(test_files)} test file(s)")
+        primary = candidates[0]
+        primary_email = primary["attack_email"]
+        primary_source = primary.get("source", "unknown")
+        print(f"  {topic}/{backend}/{defense}{split_label}: {primary_source} (and {len(candidates) - 1} additional candidate(s)) → {len(test_files)} test file(s)")
         for test_path in sorted(test_files):
-            if propagate_attack_to_file(test_path, attack_email):
+            if propagate_attack_to_file(test_path, primary_email, candidates):
                 print(f"    updated {test_path.name}")
                 updated_count += 1
 

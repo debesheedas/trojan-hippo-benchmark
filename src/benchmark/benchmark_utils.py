@@ -602,6 +602,43 @@ def discover_test_files(
     return sorted(test_files)
 
 
+def filter_attack_bench_test_files(
+    test_files: List[Path],
+    memory_backend: str,
+    unified_defense: str,
+) -> List[Path]:
+    """
+    For attack_bench layout only: keep test files that match the given backend and defense.
+
+    Attack bench layout is: attack_bench/<split>/<topic>/<backend>/<defense>/<file>.json
+    When running with a specific (memory_backend, unified_defense), we must run only the
+    test files under .../<memory_backend>/<unified_defense>/ so that the correct test
+    case is used for that combination (each backend/defense has its own copy of tests).
+
+    Paths not under attack_bench are returned unchanged (no filtering).
+    """
+    if not test_files:
+        return []
+    # Check if any path is under attack_bench
+    any_attack_bench = any(ATTACK_BENCH_SEGMENT in str(p) for p in test_files)
+    if not any_attack_bench:
+        return list(test_files)
+
+    filtered = []
+    for p in test_files:
+        path_str = str(p.resolve())
+        if ATTACK_BENCH_SEGMENT not in path_str:
+            filtered.append(p)
+            continue
+        parts = Path(path_str).parts
+        # Require .../memory_backend/unified_defense/... (consecutive path components)
+        for i in range(len(parts) - 1):
+            if parts[i] == memory_backend and parts[i + 1] == unified_defense:
+                filtered.append(p)
+                break
+    return sorted(filtered)
+
+
 def determine_attack_type(test_file: Path, test_def: Optional[Dict[str, Any]] = None) -> str:
     """
     Determine the attack_type for a test file.

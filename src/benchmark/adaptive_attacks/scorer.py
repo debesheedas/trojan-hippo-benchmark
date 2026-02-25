@@ -1562,13 +1562,45 @@ Output valid JSON only: score (1-10), explanation, improvement. Escape quotes an
             try:
                 parsed = json.loads(text)
             except json.JSONDecodeError:
-                # Try to extract JSON object (LLM may wrap in markdown or have braces in strings)
-                json_match = re.search(r'\{[^{}]*"score"[^{}]*"explanation"[^{}]*"improvement"[^{}]*\}', text, re.DOTALL)
-                if json_match:
-                    try:
-                        parsed = json.loads(json_match.group(0))
-                    except json.JSONDecodeError:
-                        pass
+                # Try to extract single JSON object by brace-matching (handles braces inside explanation/improvement)
+                start = text.find("{")
+                if start != -1:
+                    depth = 0
+                    in_string = False
+                    escape = False
+                    quote_char = None
+                    for j in range(start, len(text)):
+                        c = text[j]
+                        if in_string:
+                            if escape:
+                                escape = False
+                            elif c == "\\":
+                                escape = True
+                            elif c == quote_char:
+                                in_string = False
+                            continue
+                        if c == '"' or c == "'":
+                            in_string = True
+                            quote_char = c
+                            continue
+                        if c == "{":
+                            depth += 1
+                        elif c == "}":
+                            depth -= 1
+                            if depth == 0:
+                                try:
+                                    parsed = json.loads(text[start : j + 1])
+                                except json.JSONDecodeError:
+                                    pass
+                                break
+                if parsed is None:
+                    # Try simple regex (no braces in values)
+                    json_match = re.search(r'\{[^{}]*"score"[^{}]*"explanation"[^{}]*"improvement"[^{}]*\}', text, re.DOTALL)
+                    if json_match:
+                        try:
+                            parsed = json.loads(json_match.group(0))
+                        except json.JSONDecodeError:
+                            pass
             if parsed is None:
                 # Fallback: extract fields with regexes that allow any content in strings
                 score = 1

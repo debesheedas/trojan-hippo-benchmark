@@ -668,7 +668,7 @@ class OpenEvolveOptimizer(BaseOptimizer):
         
         # Early stopping configuration
         early_stop_score = self.openevolve_config.get("early_stop_score", 10)
-        early_stop_patience = self.openevolve_config.get("early_stop_patience", 5)
+        early_stop_patience = self.openevolve_config.get("early_stop_patience", 10)
         iterations_without_improvement = 0
         successful_candidate = None  # Set when we break due to a candidate scoring 10/10 (used for final result)
         
@@ -919,7 +919,9 @@ class OpenEvolveOptimizer(BaseOptimizer):
             
             return OptimizationResult(
                 success=success,
-                optimized_attack_email=best_candidate.email if success else None,
+                # Always return the best candidate email, even if the attack did not fully succeed.
+                # Callers can use the success flag to distinguish true successes from "best failed" candidates.
+                optimized_attack_email=best_candidate.email,
                 optimization_strategy=self.strategy_name,
                 iterations=iteration,
                 feedback=feedback,
@@ -1459,8 +1461,8 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
             is_reasoning_model = False
             
             if provider == "gemini":
-                # Use highest allowed token limit so output is less likely to truncate; if parse still fails, caller skips iteration
-                max_tokens_value = self.openevolve_config.get("mutator_gemini_max_tokens", 8192)
+                # Use highest allowed token limit so output is less likely to truncate (8 long variants can exceed 8192)
+                max_tokens_value = self.openevolve_config.get("mutator_gemini_max_tokens", 16384)
                 self._log_info(f"Using Gemini model with max_output_tokens={max_tokens_value}")
             else:
                 # OpenAI models
@@ -1496,6 +1498,7 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
             retry_count = 0
             response_text = None
             response = None  # Store the full response object for logging
+            was_truncated = False  # Set when finish_reason is max_tokens/length; used to optionally retry with higher limit
             
             while retry_count < max_retries:
                 try:
@@ -1534,6 +1537,7 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
                     # Normalize: Gemini may return 'max_tokens', OpenAI 'length'
                     is_truncated = finish_reason in ('length', 'max_tokens', 'max_tokens_stop')
                     if is_truncated:
+                        was_truncated = True
                         self._log_warning(
                             f"Mutator response truncated (finish_reason={finish_reason}). "
                             "Will try to parse partial JSON and may retry with higher token limit."
@@ -1732,6 +1736,29 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
             self._log_error(f"WARNING: Refusal detected in parser (should have been caught earlier): {e}")
             raise
         
+        # If response was truncated and we recovered fewer variants than requested, retry once with higher token limit (Gemini)
+        if was_truncated and len(variants) < num_variants and provider == "gemini" and max_tokens_value < 16384:
+            self._log_info("Retrying mutator with higher token limit (16384) to get full variant list...")
+            try:
+                retry_response = call_llm_chat_completion(
+                    model=self.mutator_model,
+                    messages=messages,
+                    temperature=self.mutator_temperature,
+                    max_output_tokens=16384,
+                )
+                if retry_response and retry_response.choices and len(retry_response.choices) > 0:
+                    retry_choice = retry_response.choices[0]
+                    retry_response_text = (retry_choice.message.content or "").strip()
+                    if retry_response_text:
+                        retry_variants = self._parse_mutator_response(retry_response_text, num_variants)
+                        if len(retry_variants) > len(variants):
+                            variants = retry_variants
+                            response_text = retry_response_text
+                            response = retry_response
+                            self._log_info(f"Retry recovered {len(variants)} variants.")
+            except Exception as retry_e:
+                self._log_warning(f"Mutator retry with higher token limit failed: {retry_e}. Using {len(variants)} variants from partial parse.")
+        
         # Ensure variants only contain allowed fields and merge with original
         final_variants = []
         for variant in variants:
@@ -1872,6 +1899,20 @@ Now, analyze the past attempts provided and generate {num_variants} improved att
             
         except json.JSONDecodeError as e:
             self._log_warning(f"Failed to parse mutator JSON: {e}")
+            
+            # Fallback 0: repair truncated JSON (common when finish_reason=max_tokens)
+            # If the response doesn't end with ] it may be cut mid-string; try closing the string and array
+            repaired = response_text.rstrip()
+            if not repaired.endswith("]"):
+                for suffix in ('"}\n]', '"}\n]\n', '"\n]'):
+                    try:
+                        parsed_repaired = json.loads(repaired + suffix)
+                        if isinstance(parsed_repaired, list) and parsed_repaired:
+                            return parsed_repaired[:expected_count]
+                        if isinstance(parsed_repaired, dict):
+                            return [parsed_repaired]
+                    except json.JSONDecodeError:
+                        continue
             
             # Fallback 1: regex for objects without { } in values (short bodies only)
             objects = re.findall(r'\{[^{}]*"from"[^{}]*"subject"[^{}]*"body_plain"[^{}]*\}', response_text, re.DOTALL)

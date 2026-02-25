@@ -47,6 +47,7 @@ from benchmark.benchmark_utils import (
     ATTACK_BENCH_TEST,
     ATTACK_BENCH_TRAIN,
     ensure_email_unread,
+    filter_attack_bench_test_files,
     get_attack_bench_cache_dir_name,
     get_attack_bench_train_or_test,
     get_memory_backend_from_config,
@@ -71,7 +72,16 @@ except ImportError:
 class TestBench:
     """Test bench for email agent."""
     
-    def __init__(self, config_path: Optional[str] = None, config: Optional[Dict[str, Any]] = None, defense_type_override: Optional[str] = None, force: bool = False, adaptive: bool = False, logs_base_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        config_path: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+        defense_type_override: Optional[str] = None,
+        force: bool = False,
+        adaptive: bool = False,
+        logs_base_dir: Optional[Path] = None,
+        try_all_attack_candidates: bool = False,
+    ):
         """
         Initialize TestBench.
         
@@ -117,6 +127,9 @@ class TestBench:
         # No test directories needed - everything is in-memory
         self.test_dirs = []  # Kept for compatibility but will always be empty
         self.force = force  # Force overwrite existing results
+        # When True, static attack_bench tests will try all attack_candidates listed in the test file (if present)
+        # sequentially until one succeeds or all fail.
+        self.try_all_attack_candidates = try_all_attack_candidates
         self.logs_base_dir = Path(logs_base_dir) if logs_base_dir is not None else None  # Base directory for logs (None = use default)
         
         # Get memory backend from config
@@ -1071,10 +1084,6 @@ class TestBench:
                     pass
     
     def _run_static_test_from_file(self, test_file: Path) -> Dict[str, Any]:
-        # Reset execution error tracking at start of each test
-        test_execution_errors = []
-        test_execution_success = True
-        
         """
         Run a single test from a JSON file (static mode).
         
@@ -1119,7 +1128,56 @@ class TestBench:
             # Not an attack_bench test, load original test file
             with open(test_file, 'r', encoding='utf-8') as f:
                 test_def = json.load(f)
-        
+
+        # If requested and attack_candidates are present, try each candidate in order for attack_bench tests.
+        if (
+            is_attack_bench
+            and self.try_all_attack_candidates
+            and isinstance(test_def, dict)
+            and isinstance(test_def.get("attack_candidates"), list)
+            and test_def["attack_candidates"]
+        ):
+            import copy as _copy
+
+            candidates = test_def["attack_candidates"]
+            last_result: Optional[Dict[str, Any]] = None
+
+            for idx, candidate in enumerate(candidates):
+                attack_email = candidate.get("attack_email")
+                if not attack_email:
+                    continue
+
+                # Deep copy the test definition so per-candidate mutations don't leak.
+                candidate_test_def = _copy.deepcopy(test_def)
+
+                # Overwrite the first insert_attack_email step with this candidate's email.
+                for step in candidate_test_def.get("steps", []):
+                    if step.get("step_type") == "insert_attack_email":
+                        step["attack_email"] = attack_email
+                        break
+
+                result = self._run_static_test_with_def(test_file, candidate_test_def)
+                # Annotate which candidate was used and how many were tried.
+                result["attack_candidate_index"] = idx
+                result["attack_candidate_source"] = candidate.get("source")
+                result["attack_candidates_tried"] = idx + 1
+                last_result = result
+
+                if result.get("overall_success", False):
+                    return result
+
+            # If none succeeded but we ran at least one candidate, return the last attempt's result.
+            if last_result is not None:
+                return last_result
+
+        # Default: run once with the prepared test_def.
+        return self._run_static_test_with_def(test_file, test_def)
+
+    def _run_static_test_with_def(self, test_file: Path, test_def: Dict[str, Any]) -> Dict[str, Any]:
+        """Core static test runner that assumes test_def is already loaded and normalized."""
+        # Reset execution error tracking at start of each test
+        test_execution_errors: List[str] = []
+        test_execution_success = True
         # All test cases are now in normalized format - no normalization needed
         test_name = test_def["name"]
         description = test_def["description"]
@@ -2165,15 +2223,23 @@ class TestBench:
                 break
         # Only cache for train runs (train or train_10); _get_attack_bench_cache_path returns None for non-train
         cache_path = self._get_attack_bench_cache_path(test_file)
-        if attack_succeeded and cache_path is not None:
-            try:
-                self._cache_successful_attack(test_file, result)
-            except Exception as e:
-                print(f"⚠️  Warning: Failed to cache successful attack: {e}")
-                import traceback
-                traceback.print_exc()
-        elif result.get("optimization_used") and not attack_succeeded:
-            print(f"💾 Optimization was used but attack did not succeed - not caching")
+        if cache_path is not None:
+            if attack_succeeded:
+                try:
+                    self._cache_successful_attack(test_file, result, adaptive_success=True)
+                except Exception as e:
+                    print(f"⚠️  Warning: Failed to cache successful attack: {e}")
+                    import traceback
+                    traceback.print_exc()
+            elif result.get("optimization_used"):
+                # Optimization ran but attack did not fully succeed. Cache the best candidate (if any)
+                # so static benchmarks can still try it as a strong attack candidate.
+                try:
+                    self._cache_successful_attack(test_file, result, adaptive_success=False)
+                except Exception as e:
+                    print(f"⚠️  Warning: Failed to cache best optimized (failed) attack: {e}")
+                    import traceback
+                    traceback.print_exc()
         
         return result
     
@@ -2788,15 +2854,31 @@ class TestBench:
                                 "strategy": optimization_result.optimization_strategy,
                                 "iterations": optimization_result.iterations,
                                 "feedback": optimization_result.feedback,
-                                "optimized_attack_email": optimization_result.optimized_attack_email
+                                "optimized_attack_email": optimization_result.optimized_attack_email,
+                                "score": (optimization_result.final_evaluation or {}).get("score"),
+                                "success": True,
                             }
                         else:
                             print(f"ERROR: All optimization strategies failed for step {i}")
-                            step_result["optimization"] = {
-                                "strategy": "all_failed",
-                                "iterations": 0,
-                                "feedback": optimization_result.feedback
-                            }
+                            # Even on failure, optimizers like OpenEvolve can provide the best candidate so far.
+                            # Record it so we can cache and reuse it later.
+                            if optimization_result.optimized_attack_email:
+                                optimization_used = True
+                                step_result["optimization"] = {
+                                    "strategy": optimization_result.optimization_strategy,
+                                    "iterations": optimization_result.iterations,
+                                    "feedback": optimization_result.feedback,
+                                    "optimized_attack_email": optimization_result.optimized_attack_email,
+                                    "score": (optimization_result.final_evaluation or {}).get("score"),
+                                    "success": False,
+                                }
+                            else:
+                                step_result["optimization"] = {
+                                    "strategy": "all_failed",
+                                    "iterations": 0,
+                                    "feedback": optimization_result.feedback,
+                                    "success": False,
+                                }
                     
                     step_results.append(step_result)
                     
@@ -3478,9 +3560,13 @@ class TestBench:
             else:
                 print(f"ℹ️ No vectorstore found in rag_memory_config (will be created when agent processes emails)")
     
-    def _cache_successful_attack(self, test_file: Path, result: Dict[str, Any]):
-        """Cache a test with successful attacks for future runs."""
-        print(f"💾 Caching successful attack for {test_file.name}")
+    def _cache_successful_attack(self, test_file: Path, result: Dict[str, Any], adaptive_success: bool = True):
+        """Cache a test with optimized attacks for future runs.
+        
+        If adaptive_success is False, this represents the best candidate found during optimization,
+        even though the attack did not fully succeed.
+        """
+        print(f"💾 Caching optimized attack for {test_file.name} (adaptive_success={adaptive_success})")
         
         try:
             test_file_str = str(test_file)
@@ -3532,11 +3618,12 @@ class TestBench:
             # Add optimization metadata
             cached_test["optimization_metadata"] = {
                 "optimized": True,
+                "adaptive_success": adaptive_success,
                 "optimization_timestamp": datetime.now().isoformat(),
                 "model_name": self.model_name
             }
             
-            # Save cached version (attack success; always when this method is called)
+            # Save cached version (either a successful attack or the best failed candidate)
             with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(cached_test, f, indent=2, ensure_ascii=False)
             
@@ -3576,9 +3663,19 @@ class TestBench:
             verbose=True  # TestBench prints warnings
         )
     
-    def run_all_tests(self, test_path: str) -> List[Dict[str, Any]]:
-        """Run all tests from the specified path (file or directory). If path is a directory, all *.json files in it are run."""
-        test_files = self.discover_test_files(test_path)
+    def run_all_tests(self, test_path: str, test_files_override: Optional[List[Path]] = None) -> List[Dict[str, Any]]:
+        """Run all tests from the specified path (file or directory). If path is a directory, all *.json files in it are run.
+        When test_files_override is provided (e.g. attack_bench filtered by backend/defense), use that list instead of discovering.
+        For attack_bench, only test files under .../memory_backend/defense/ are ever run (enforced here when override is None too)."""
+        if test_files_override is not None:
+            test_files = list(test_files_override)
+        else:
+            test_files = self.discover_test_files(test_path)
+        # Enforce backend/defense match for attack_bench even when no override (e.g. direct call to run_all_tests)
+        if test_files and ATTACK_BENCH_SEGMENT in str(test_files[0]):
+            test_files = filter_attack_bench_test_files(
+                test_files, self.memory_backend_name, self.unified_defense
+            )
         if not test_files:
             return []
         # Show actual test path (file or directory) so logs/results location is clear when using --test with a folder

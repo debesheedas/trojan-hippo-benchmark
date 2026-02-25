@@ -1300,6 +1300,8 @@ def main() -> int:
 
     # For cross-session ASR plots: model -> topic -> backend -> {session_idx: (attack_passed, attack_total)}
     model_topic_backend_sessions: Dict[str, Dict[str, Dict[str, Dict[int, Tuple[int, int]]]]] = {}
+    # For cross-session ASR by defense: model -> backend -> defense_type -> {session_idx: (attack_passed, attack_total)} (summed over topics)
+    model_backend_defense_sessions: Dict[str, Dict[str, Dict[str, Dict[int, Tuple[int, int]]]]] = {}
 
     # Per-test-folder consolidation
     for test_folder in test_folders:
@@ -1434,6 +1436,12 @@ def main() -> int:
                             continue
                         total_attack_passed += mt[3]  # attack_passed
                         total_attack_total += mt[4]   # attack_total
+                        # Per-defense cross-session (all topics): backend -> defense -> session
+                        mbds = model_backend_defense_sessions.setdefault(model_name, {})
+                        bds = mbds.setdefault(backend, {})
+                        ds = bds.setdefault(defense_type, {})
+                        prev = ds.get(session_idx, (0, 0))
+                        ds[session_idx] = (prev[0] + mt[3], prev[1] + mt[4])
                     if total_attack_total == 0:
                         continue
                     backend_sessions = topic_backend_sessions.setdefault(backend, {})
@@ -1533,6 +1541,42 @@ def main() -> int:
                     print(f"  OK: Session ASR plot (all topics): {out_path.relative_to(output_root)}")
             except Exception as e:
                 print(f"  WARNING: Error generating averaged session plot for {model_name}: {e}")
+
+            # 3) All topics, ASR vs. session with defense=none only: one plot, one line per memory backend
+            if model_backend_defense_sessions.get(model_name):
+                try:
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    for backend in MEMORY_BACKENDS:
+                        bds = model_backend_defense_sessions[model_name].get(backend, {})
+                        sess_map = bds.get("none")
+                        if not sess_map:
+                            continue
+                        xs, ys = [], []
+                        for s in sessions_sorted:
+                            if s not in sess_map:
+                                continue
+                            p, t = sess_map[s]
+                            if t > 0:
+                                xs.append(s)
+                                ys.append(p / t * 100.0)
+                        if xs:
+                            label = BACKEND_LABELS[MEMORY_BACKENDS.index(backend)]
+                            ax.plot(xs, ys, marker="o", label=label)
+                    if ax.has_data():
+                        ax.set_xlabel("Session index")
+                        ax.set_ylabel("Attack success rate (%)")
+                        ax.set_title(f"{model_name} - All topics: ASR vs. session (defense=None)")
+                        ax.set_ylim(-5, 105)
+                        ax.grid(True, alpha=0.3)
+                        ax.legend(fontsize=8)
+                        fig.tight_layout()
+                        out_path = model_output_dir / "all_topics_sessions_asr_defense_none.png"
+                        fig.savefig(out_path, dpi=300)
+                        plt.close(fig)
+                        plot_files.append(out_path)
+                        print(f"  OK: Session ASR (defense=None): {out_path.relative_to(output_root)}")
+                except Exception as e:
+                    print(f"  WARNING: Error generating session ASR (defense=None) plot for {model_name}: {e}")
 
     print(f"\n{'='*80}")
     print("Consolidation complete!")
