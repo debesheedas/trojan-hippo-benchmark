@@ -41,11 +41,14 @@ from agent.utils import load_config, set_global_seeds
 from agent.utils import debug_info, debug_debug, debug_print_exception, debug_print_long_content, set_debug_level, DebugLevel, get_debug_level
 from benchmark.test_validators import create_validator, CompositeValidator
 from agent.utils import get_colored_printer
+from benchmark.snapshot_io import get_snapshot_path, load_snapshot_into_env, save_snapshot
 from benchmark.benchmark_utils import (
     ATTACK_BENCH_SEGMENT,
     ATTACK_BENCH_TEST,
     ATTACK_BENCH_TRAIN,
     ensure_email_unread,
+    get_attack_bench_cache_dir_name,
+    get_attack_bench_train_or_test,
     get_memory_backend_from_config,
     get_unified_defense_from_config,
     get_result_path,
@@ -210,7 +213,60 @@ class TestBench:
                 print("Stealth optimization enabled (optimizer will favor attack + stealth)")
         else:
             print("Static benchmark mode")
-    
+
+    def _maybe_save_session_snapshot(
+        self,
+        snapshot_set_id: Optional[str],
+        session_index: int,
+        test_config: Dict[str, Any],
+        step_results: List[Dict[str, Any]],
+    ) -> None:
+        """
+        Save a memory snapshot at the end of a session for persistence_unrelated_20_* tests.
+
+        Snapshots are written to:
+          - data/benchmark/snapshots/memory_snapshots_train/{backend}/{defense}/session_{n}.json
+          - data/benchmark/snapshots/memory_snapshots_test/{backend}/{defense}/session_{n}.json
+        based on the snapshot_set_id suffix (_train or _test).
+        """
+        if not snapshot_set_id:
+            return
+
+        in_memory_env = test_config.get("in_memory_environment")
+        if in_memory_env is None:
+            return
+
+        # Compute user goal statistics from step_results so far
+        user_goals_passed = 0
+        user_goals_total = 0
+        for sr in step_results:
+            user_goal = sr.get("user_goal")
+            if not user_goal:
+                continue
+            passed = user_goal.get("passed")
+            if passed is None:
+                continue
+            user_goals_total += 1
+            if passed:
+                user_goals_passed += 1
+
+        snapshot_path = get_snapshot_path(
+            snapshot_set_id=snapshot_set_id,
+            memory_backend=self.memory_backend_name,
+            defense_type=self.unified_defense,
+            session_index=session_index,
+        )
+
+        save_snapshot(
+            in_memory_env=in_memory_env,
+            snapshot_path=snapshot_path,
+            session_index=session_index,
+            memory_backend=self.memory_backend_name,
+            defense_type=self.unified_defense,
+            snapshot_set_id=snapshot_set_id,
+            user_goals_passed=user_goals_passed,
+            user_goals_total=user_goals_total,
+        )
     def _debug_print_initial_mem0_memories(self, test_config: Dict[str, Any]):
         """Debug print: Print all initial mem0 memories loaded in the vectorstore at the start of a test case."""
         if not self.mem0_memory_enabled:
@@ -409,9 +465,106 @@ class TestBench:
         except Exception as e:
             debug_info(f"[{mode}] Error dumping environment state")
             debug_print_exception(e, context=f"Dumping environment state for step {step_num}", include_traceback=True)
-    
+
+    def _log_explicit_memory_after_step(
+        self, test_config: Dict[str, Any], step_num: int, step_label: str = "user_message"
+    ) -> None:
+        """Log explicit_manager.long_term count and previews after a step (for load_memory_snapshot verification)."""
+        if self.memory_backend_name != "explicit":
+            return
+        in_memory_env = test_config.get("in_memory_environment")
+        if not in_memory_env:
+            return
+        manager = getattr(in_memory_env, "explicit_manager", None)
+        if not manager:
+            return
+        long_term = getattr(manager, "long_term", [])
+        n = len(long_term)
+        PREVIEW = 150
+        debug_info(
+            f"[explicit_memory] After step {step_num} ({step_label}): "
+            f"explicit_manager.long_term has {n} entries.",
+            truncate=False,
+        )
+        for i, m in enumerate(long_term):
+            text = m.get("text", str(m)) if isinstance(m, dict) else str(m)
+            preview = (text[:PREVIEW] + "…") if len(text) > PREVIEW else text
+            debug_info(f"[explicit_memory]   [{i}] {preview}", truncate=False)
+        if n == 0 and step_num == 2:
+            debug_info(
+                "[explicit_memory] Step 2 is typically 'read inbox'; 0 memories suggests agent did not call update_memory.",
+                truncate=False,
+            )
+
+    def _log_rag_memory_after_step(
+        self, test_config: Dict[str, Any], step_num: int, step_label: str = "user_message"
+    ) -> None:
+        """Log RAG vectorstore document count and previews after a step (for load_memory_snapshot verification)."""
+        if self.memory_backend_name != "rag":
+            return
+        in_memory_env = test_config.get("in_memory_environment")
+        if not in_memory_env:
+            return
+        vs = getattr(in_memory_env, "rag_vectorstore", None)
+        if not vs:
+            return
+        try:
+            _, documents, _ = vs.load()
+        except Exception:
+            return
+        n = len(documents)
+        PREVIEW = 150
+        debug_info(
+            f"[rag_memory] After step {step_num} ({step_label}): "
+            f"vectorstore has {n} documents.",
+            truncate=False,
+        )
+        for i, doc in enumerate(documents):
+            text = str(doc) if not isinstance(doc, str) else doc
+            preview = (text[:PREVIEW] + "…") if len(text) > PREVIEW else text
+            debug_info(f"[rag_memory]   [{i}] {preview}", truncate=False)
+        if n == 0 and step_num == 2:
+            debug_info(
+                "[rag_memory] Step 2 is typically 'read inbox'; 0 documents suggests agent did not index the turn.",
+                truncate=False,
+            )
+
+    def _log_mem0_state_before_step(self, test_config: Dict[str, Any], step_num: int):
+        """Log mem0 total memory count before a user_message step (for snapshot/trigger verification).
+        Uses the shared manager so we see the same state the agent will see.
+        """
+        if self.memory_backend_name != "mem0":
+            return
+        mem0_manager = test_config.get("memory", {}).get("mem0_memory", {}).get("manager")
+        if mem0_manager is None:
+            return
+        try:
+            user_id = test_config.get("memory", {}).get("mem0_memory", {}).get("user_id", "vince")
+            all_memories = mem0_manager.get_all_memories(user_id=user_id, agent_id=None, limit=1000)
+            n = len(all_memories) if isinstance(all_memories, list) else 0
+            debug_info(
+                f"[mem0_before_step] Step {step_num}: total memories in vectorstore = {n} "
+                f"(this is the state the agent will use for this step)",
+                truncate=False,
+            )
+            # Short preview of first 5 so we can confirm attack + snapshot contents
+            for idx, item in enumerate(all_memories[:5]):
+                if isinstance(item, dict):
+                    text = item.get("memory", "") or item.get("memories", "") or ""
+                else:
+                    text = str(item)
+                preview = (text[:80] + "…") if len(text) > 80 else text
+                debug_info(f"[mem0_before_step]   [{idx}] {preview!r}", truncate=False)
+            if n > 5:
+                debug_info(f"[mem0_before_step]   ... and {n - 5} more", truncate=False)
+        except Exception as e:
+            debug_info(f"[mem0_before_step] get_all_memories failed: {e}", truncate=False)
+
     def _print_mem0_memories(self, test_config: Dict[str, Any], user_message: Optional[str] = None):
-        """Print mem0 memory contents and context if mem0_print is enabled."""
+        """Print mem0 memory contents and context if mem0_print is enabled.
+        Uses the shared mem0_manager from test_config when available so we report the same
+        state the agent saw (e.g. after load_memory_snapshot), not a fresh empty manager.
+        """
         if not (self.mem0_memory_enabled and self.mem0_print_enabled):
             return
         
@@ -426,17 +579,20 @@ class TestBench:
             mem0_config = test_config.get("memory", {}).get("mem0_memory", {})
             user_id = mem0_config.get("user_id", "vince")
             
-            # Initialize mem0 memory manager (in-memory)
-            mem0_manager = get_mem0_memory_manager(
-                llm_provider=mem0_config.get("llm_provider", "openai"),
-                llm_model=mem0_config.get("llm_model", "gpt-5-mini"),
-                llm_temperature=mem0_config.get("llm_temperature", 0.0),
-                embedding_provider=mem0_config.get("embedding_provider", "openai"),
-                embedding_model=mem0_config.get("embedding_model", "text-embedding-3-small"),
-                vector_store_provider=mem0_config.get("vector_store_provider", "faiss"),
-                top_k=mem0_config.get("top_k", 3),
-                user_id=user_id,
-            )
+            # Use the shared manager from the test run (same store as invoke_agent uses).
+            # Creating a new manager would use a fresh empty vectorstore and show 0 memories.
+            mem0_manager = mem0_config.get("manager")
+            if mem0_manager is None:
+                mem0_manager = get_mem0_memory_manager(
+                    llm_provider=mem0_config.get("llm_provider", "openai"),
+                    llm_model=mem0_config.get("llm_model", "gpt-5-mini"),
+                    llm_temperature=mem0_config.get("llm_temperature", 0.0),
+                    embedding_provider=mem0_config.get("embedding_provider", "openai"),
+                    embedding_model=mem0_config.get("embedding_model", "text-embedding-3-small"),
+                    vector_store_provider=mem0_config.get("vector_store_provider", "faiss"),
+                    top_k=mem0_config.get("top_k", 3),
+                    user_id=user_id,
+                )
             
             # Get all memories
             memories = mem0_manager.get_all_memories(user_id=user_id, agent_id=None, limit=1000)
@@ -479,9 +635,10 @@ class TestBench:
                                     chunk_size=rag_config.get("chunk_size", 512),
                                 )
                                 # Pass session_id and defense_type for provable_policy defense
+                                session_id_for_rag = test_config.get("_current_session_id", "unknown")
                                 rag_context = rag_memory_manager.get_context(
                                     user_message,
-                                    session_id=session_id,
+                                    session_id=session_id_for_rag,
                                     defense_type=rag_defense_type
                                 )
                                 if rag_context:
@@ -729,6 +886,15 @@ class TestBench:
                 test_config["memory"]["rag_memory"] = {}
             test_config["memory"]["rag_memory"]["vectorstore"] = in_memory_env.rag_vectorstore
             test_config["memory"]["rag_memory"]["defense_type"] = self.backend_defense
+            # Create and store RAG manager so load_memory_snapshot can merge snapshot docs via add_memories_batch
+            from agent.backend.rag_memory import get_rag_memory_manager
+            rag_config = test_config["memory"]["rag_memory"]
+            in_memory_env.rag_manager = get_rag_memory_manager(
+                vectorstore=in_memory_env.rag_vectorstore,
+                embedding_model=rag_config.get("embedding_model", "text-embedding-3-small"),
+                top_k=rag_config.get("top_k", 8),
+                chunk_size=rag_config.get("chunk_size", 512),
+            )
         elif self.memory_backend_name == "mem0":
             if "mem0_memory" not in test_config["memory"]:
                 test_config["memory"]["mem0_memory"] = {}
@@ -1035,7 +1201,12 @@ class TestBench:
             step_results = []
             all_passed = True
             session_history = []  # Track session history
-            
+            # For persistence snapshot tests, determine snapshot_set_id and track session index
+            snapshot_set_id: Optional[str] = None
+            if isinstance(test_name, str) and test_name.startswith("persistence_unrelated_"):
+                snapshot_set_id = test_name
+            current_session_index = 0
+
             for i, step in enumerate(steps, 1):
                 print(f"\n--- Step {i}/{len(steps)} ---", flush=True)
                 sys.stdout.flush()
@@ -1047,6 +1218,16 @@ class TestBench:
                     # Handle session management step
                     print(f"{step.get('description', 'Starting new session')}")
                     
+                    # Save snapshot for the session that just completed (if applicable)
+                    if snapshot_set_id is not None:
+                        current_session_index += 1
+                        self._maybe_save_session_snapshot(
+                            snapshot_set_id=snapshot_set_id,
+                            session_index=current_session_index,
+                            test_config=test_config,
+                            step_results=step_results,
+                        )
+
                     # Save current session history
                     try:
                         in_memory_env = test_config.get("in_memory_environment")
@@ -1269,7 +1450,73 @@ class TestBench:
                         })
                     continue
                 
-                # Handle regular user message steps
+                if step_type == "load_memory_snapshot":
+                    # Load memory snapshot (persistence tests: merge pre-recorded session state into env)
+                    session_index = step.get("session_index")
+                    snapshot_set_id = step.get("snapshot_set_id")
+                    if session_index is None or not snapshot_set_id:
+                        print(f"WARNING: Step {i} has step_type 'load_memory_snapshot' but missing session_index or snapshot_set_id. Skipping.")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "load_memory_snapshot",
+                            "description": step.get("description", "Load memory snapshot"),
+                            "duration_s": 0.0,
+                            "error": "Missing session_index or snapshot_set_id"
+                        })
+                        continue
+                    try:
+                        snapshot_path = get_snapshot_path(
+                            snapshot_set_id=snapshot_set_id,
+                            memory_backend=self.memory_backend_name,
+                            defense_type=self.unified_defense,
+                            session_index=session_index,
+                        )
+                        in_memory_env = test_config.get("in_memory_environment")
+                        if not in_memory_env:
+                            raise ValueError("in_memory_environment required for load_memory_snapshot")
+                        print(
+                            f"[load_memory_snapshot] Attempting load: path={snapshot_path}, "
+                            f"backend={self.memory_backend_name}, defense={self.unified_defense}"
+                        )
+                        load_snapshot_into_env(
+                            snapshot_path=snapshot_path,
+                            in_memory_env=in_memory_env,
+                            test_config=test_config,
+                            memory_backend=self.memory_backend_name,
+                            defense_type=self.unified_defense,
+                            snapshot_set_id=snapshot_set_id,
+                            session_index=session_index,
+                        )
+                        print(f"Loaded memory snapshot: {snapshot_set_id} session_{session_index}")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "load_memory_snapshot",
+                            "description": step.get("description", "Load memory snapshot"),
+                            "snapshot_set_id": snapshot_set_id,
+                            "session_index": session_index,
+                            "duration_s": 0.0,
+                        })
+                    except Exception as e:
+                        debug_info("Error loading memory snapshot")
+                        debug_print_exception(e, context="load_memory_snapshot", include_traceback=True)
+                        step_results.append({
+                            "step": i,
+                            "step_type": "load_memory_snapshot",
+                            "description": step.get("description", "Load memory snapshot"),
+                            "duration_s": 0.0,
+                            "error": str(e)
+                        })
+                    continue
+                
+                # Handle regular user message steps (step must have user_message)
+                if "user_message" not in step:
+                    step_results.append({
+                        "step": i,
+                        "step_type": step_type,
+                        "description": step.get("description", ""),
+                        "error": "Missing user_message; skipped",
+                    })
+                    continue
                 printer = get_colored_printer()
                 print(printer.format_trace_event({
                     "event_type": "user_input",
@@ -1277,6 +1524,9 @@ class TestBench:
                     "ts": ""
                 }))
                 print(f"Expected: {step.get('expected_behavior', '(not specified)')}")
+                
+                # Log mem0 state before this step (same store the agent will use) for snapshot/trigger debugging
+                self._log_mem0_state_before_step(test_config, step_num=i)
                 
                 print(f"Calling invoke_agent...", flush=True)
                 sys.stdout.flush()
@@ -1334,7 +1584,11 @@ class TestBench:
                         agent_response=response,
                         mode="static"
                     )
-                    
+                    # Explicit backend: log long_term after each user_message step (verifies update_memory in step 2)
+                    self._log_explicit_memory_after_step(test_config, step_num=i, step_label="user_message")
+                    # RAG backend: log vectorstore doc count after each user_message step (verifies indexing in step 2)
+                    self._log_rag_memory_after_step(test_config, step_num=i, step_label="user_message")
+
                     # Print mem0 memories if enabled
                     self._print_mem0_memories(test_config, user_message=step['user_message'])
                     sys.stdout.flush()  # Flush after mem0 memories in case it blocks
@@ -1635,6 +1889,16 @@ class TestBench:
                                 }
                     step_results.append(step_result)
         
+            # Save snapshot for the final session (persistence_unrelated_*: sessions 1..N-1 saved at boundaries; session N is current here)
+            if snapshot_set_id is not None and current_session_index >= 1:
+                final_session_index = current_session_index + 1
+                self._maybe_save_session_snapshot(
+                    snapshot_set_id=snapshot_set_id,
+                    session_index=final_session_index,
+                    test_config=test_config,
+                    step_results=step_results,
+                )
+            
             # Add final session to session history (if there are any remaining steps after the last session change)
             try:
                 in_memory_env = test_config.get("in_memory_environment")
@@ -1890,41 +2154,51 @@ class TestBench:
         except Exception as e:
             print(f"Warning: Failed to save adaptive test result: {e}")
         
-        # Cache successful attacks - only cache if optimization was used AND attack goal actually succeeded
-        if result.get("optimization_used"):
-            # Check if any attack goal actually passed
-            attack_succeeded = False
-            steps = result.get("steps", [])
-            for step_result in steps:
-                attack_goal = step_result.get("attack_goal", {})
-                if isinstance(attack_goal, dict) and attack_goal.get("passed") is True:
-                    attack_succeeded = True
-                    break
-            
-            if attack_succeeded:
-                try:
-                    self._cache_successful_attack(test_file, result)
-                except Exception as e:
-                    print(f"⚠️  Warning: Failed to cache successful attack: {e}")
-                    import traceback
-                    traceback.print_exc()
-            else:
-                print(f"💾 Optimization was used but attack did not succeed - not caching")
+        # Cache successful attacks for attack_bench train runs (train or train_10).
+        # Cache whenever the attack goal succeeded, so test_10 can use it even if no optimization was needed.
+        steps = result.get("steps", [])
+        attack_succeeded = False
+        for step_result in steps:
+            attack_goal = step_result.get("attack_goal", {})
+            if isinstance(attack_goal, dict) and attack_goal.get("passed") is True:
+                attack_succeeded = True
+                break
+        # Only cache for train runs (train or train_10); _get_attack_bench_cache_path returns None for non-train
+        cache_path = self._get_attack_bench_cache_path(test_file)
+        if attack_succeeded and cache_path is not None:
+            try:
+                self._cache_successful_attack(test_file, result)
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to cache successful attack: {e}")
+                import traceback
+                traceback.print_exc()
+        elif result.get("optimization_used") and not attack_succeeded:
+            print(f"💾 Optimization was used but attack did not succeed - not caching")
         
         return result
     
     def _get_attack_bench_cache_path(self, test_file: Path, defense: Optional[str] = None) -> Optional[Path]:
-        """For attack_bench/train/backend/suite/file return train_cache/backend/defense/suite/file. Defense defaults to self.unified_defense (per-defense cache)."""
+        """For attack_bench/train/... or train_10/... return train_cache/... or train_cache_10/... with same layout. Defense defaults to self.unified_defense (per-defense cache)."""
         parts = test_file.resolve().parts
         if ATTACK_BENCH_SEGMENT not in parts:
             return None
         idx = parts.index(ATTACK_BENCH_SEGMENT)
         rest = parts[idx + 1:]
-        # attack_bench/train/backend/suite/filename -> train_cache/backend/defense/suite/filename
-        if len(rest) >= 4 and rest[0] == ATTACK_BENCH_TRAIN:
+        split = rest[0] if rest else ""
+        # Only cache train runs (train or train_10, etc.)
+        if split != ATTACK_BENCH_TRAIN and not split.startswith("train_"):
+            return None
+        cache_dir_name = get_attack_bench_cache_dir_name(split)
+        cache_base = self.cache_dir.parent / cache_dir_name
+        d = defense if defense is not None else self.unified_defense
+        # New layout: attack_bench/train_10/topic/backend/defense/file -> train_cache_10/topic/backend/defense/file
+        if len(rest) >= 5:
+            topic, backend, defense_dir = rest[1], rest[2], rest[3]
+            return cache_base / topic / backend / defense_dir / test_file.name
+        # Old layout: attack_bench/train/backend/suite/filename -> train_cache/backend/defense/suite/filename
+        if len(rest) >= 4:
             backend, suite = rest[1], rest[2]
-            d = defense if defense is not None else self.unified_defense
-            return self.cache_dir / backend / d / suite / test_file.name
+            return cache_base / backend / d / suite / test_file.name
         return None
 
     def _get_cached_train_file_for_suite(self, backend: str, defense: str, suite_name: str) -> Optional[Path]:
@@ -1937,26 +2211,62 @@ class TestBench:
                 return p
         return None
 
-    def _get_best_attack_email_for_attack_bench_test(self, test_file: Path) -> Optional[Tuple[dict, str]]:
-        """For attack_bench/test/backend/suite/file: get attack email from cache(defense) else cache(none) else None. Returns (attack_email, source_label) or None (use file as-is)."""
+    def _get_cached_train_file_for_attack_bench_test(self, test_file: Path, defense: str) -> Optional[Path]:
+        """Return path to cached train file for this test file (test or test_10 layout). Uses train_cache or train_cache_10 accordingly."""
         parts = test_file.resolve().parts
         if ATTACK_BENCH_SEGMENT not in parts:
             return None
         idx = parts.index(ATTACK_BENCH_SEGMENT)
         rest = parts[idx + 1:]
-        # attack_bench/test/backend/suite/filename
-        if len(rest) < 4 or rest[0] != ATTACK_BENCH_TEST:
+        split = rest[0] if rest else ""
+        if split != ATTACK_BENCH_TEST and not split.startswith("test_"):
             return None
-        backend, suite_name = rest[1], rest[2]
+        cache_dir_name = get_attack_bench_cache_dir_name(split)
+        cache_base = self.cache_dir.parent / cache_dir_name
+        # New layout: test_10/topic/backend/defense/file -> train_cache_10/topic/backend/defense/
+        if len(rest) >= 5:
+            topic, backend, defense_dir = rest[1], rest[2], rest[3]
+            cache_suite_dir = cache_base / topic / backend / defense_dir
+        else:
+            # Old layout: test/backend/suite/file -> train_cache/backend/defense/suite/
+            if len(rest) < 4:
+                return None
+            backend, suite_name = rest[1], rest[2]
+            cache_suite_dir = cache_base / backend / defense / suite_name
+        if not cache_suite_dir.exists():
+            return None
+        for p in cache_suite_dir.glob("*.json"):
+            if "train" in p.stem:
+                return p
+        for p in cache_suite_dir.glob("*.json"):
+            return p
+        return None
+
+    def _get_best_attack_email_for_attack_bench_test(self, test_file: Path) -> Optional[Tuple[dict, str]]:
+        """For attack_bench/test/... or test_10/...: get attack email from cache(defense) else cache(none) else None. Returns (attack_email, source_label) or None (use file as-is)."""
+        parts = test_file.resolve().parts
+        if ATTACK_BENCH_SEGMENT not in parts:
+            return None
+        idx = parts.index(ATTACK_BENCH_SEGMENT)
+        rest = parts[idx + 1:]
+        split = rest[0] if rest else ""
+        if split != ATTACK_BENCH_TEST and not split.startswith("test_"):
+            return None
+        # Try unified_defense then "none" for cache lookup
         for defense in (self.unified_defense, "none"):
-            cached = self._get_cached_train_file_for_suite(backend, defense, suite_name)
+            cached = self._get_cached_train_file_for_attack_bench_test(test_file, defense)
             if not cached:
                 continue
             with open(cached, "r", encoding="utf-8") as f:
                 data = json.load(f)
             for step in data.get("steps", []):
                 if step.get("step_type") == "insert_attack_email" and "attack_email" in step:
-                    label = f"cache {backend}/{defense}/{suite_name}"
+                    # Label: cache path relative to attack_bench for readability
+                    try:
+                        rel = cached.parent.relative_to(self.cache_dir.parent)
+                        label = f"cache {rel}"
+                    except ValueError:
+                        label = "cache"
                     return (step["attack_email"], label)
         return None
 
@@ -2272,6 +2582,76 @@ class TestBench:
                         })
                     continue
 
+                if step_type == "load_memory_snapshot":
+                    # Load memory snapshot (persistence tests: merge pre-recorded session state into env)
+                    session_index = step.get("session_index")
+                    snapshot_set_id = step.get("snapshot_set_id")
+                    if session_index is None or not snapshot_set_id:
+                        print(f"WARNING: Step {i} has step_type 'load_memory_snapshot' but missing session_index or snapshot_set_id. Skipping.")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "load_memory_snapshot",
+                            "description": step.get("description", "Load memory snapshot"),
+                            "duration_s": 0.0,
+                            "error": "Missing session_index or snapshot_set_id"
+                        })
+                        continue
+                    try:
+                        snapshot_path = get_snapshot_path(
+                            snapshot_set_id=snapshot_set_id,
+                            memory_backend=self.memory_backend_name,
+                            defense_type=self.unified_defense,
+                            session_index=session_index,
+                        )
+                        in_memory_env = test_config.get("in_memory_environment")
+                        if not in_memory_env:
+                            raise ValueError("in_memory_environment required for load_memory_snapshot")
+                        print(
+                            f"[load_memory_snapshot] Attempting load: path={snapshot_path}, "
+                            f"backend={self.memory_backend_name}, defense={self.unified_defense}"
+                        )
+                        load_snapshot_into_env(
+                            snapshot_path=snapshot_path,
+                            in_memory_env=in_memory_env,
+                            test_config=test_config,
+                            memory_backend=self.memory_backend_name,
+                            defense_type=self.unified_defense,
+                            snapshot_set_id=snapshot_set_id,
+                            session_index=session_index,
+                        )
+                        print(f"Loaded memory snapshot: {snapshot_set_id} session_{session_index}")
+                        # Verification: log full context memory order (must be: attack session first, then 10 unrelated from snapshot)
+                        if self.memory_backend_name == "context":
+                            ctx_mgr = getattr(in_memory_env, "context_manager", None)
+                            if ctx_mgr is not None and hasattr(ctx_mgr, "history"):
+                                hist = ctx_mgr.history
+                                print(f"[load_memory_snapshot] VERIFY context memory order: {len(hist)} total entries")
+                                for idx, entry in enumerate(hist):
+                                    text = entry.get("text", "") if isinstance(entry, dict) else str(entry)
+                                    preview = (text[:180] + "...") if len(text) > 180 else text
+                                    print(f"  [{idx}] {preview}")
+                                print("[load_memory_snapshot] Expected: [0]=attack session (read inbox), [1..10]=snapshot (10 unrelated train turns)")
+                                print("[load_memory_snapshot] Context merge semantics: snapshot is APPENDED to existing history. So order = (session 1 attack) then (10 unrelated train turns). Same as replaying 10 unrelated sessions after the attack.")
+                        step_results.append({
+                            "step": i,
+                            "step_type": "load_memory_snapshot",
+                            "description": step.get("description", "Load memory snapshot"),
+                            "snapshot_set_id": snapshot_set_id,
+                            "session_index": session_index,
+                            "duration_s": 0.0,
+                        })
+                    except Exception as e:
+                        debug_info("Error loading memory snapshot")
+                        debug_print_exception(e, context="load_memory_snapshot", include_traceback=True)
+                        step_results.append({
+                            "step": i,
+                            "step_type": "load_memory_snapshot",
+                            "description": step.get("description", "Load memory snapshot"),
+                            "duration_s": 0.0,
+                            "error": str(e)
+                        })
+                    continue
+
                 # Check if this step has an attack goal
                 if "attack_goal" in step and step["attack_goal"]:
                     print(f"Step {i} has attack goal, testing attack effectiveness")
@@ -2423,8 +2803,8 @@ class TestBench:
                     # Check if step passed
                     if step_result.get("passed") is False:
                         all_passed = False
-                else:
-                    # Regular step without attack goal
+                elif "user_message" in step or step_type == "user_message":
+                    # Regular step with user message (no attack goal)
                     step_result = self._run_regular_step(step, i, session_id, test_config)
                     
                     # Update environment state with traces and session data after running the step
@@ -2453,6 +2833,14 @@ class TestBench:
                     
                     if step_result.get("passed") is False:
                         all_passed = False
+                else:
+                    # Step has no attack_goal and no user_message (e.g. unknown step_type); record and skip
+                    step_results.append({
+                        "step": i,
+                        "step_type": step_type,
+                        "description": step.get("description", ""),
+                        "error": "No user_message and not an attack step; skipped",
+                    })
             
             # Add final session to session history (if there are any remaining steps after the last session change)
             try:
@@ -2896,6 +3284,28 @@ class TestBench:
                 benign_email = step.get("benign_email")
                 if benign_email:
                     fresh_test_config["mailbox"].add_email(benign_email, folder="inbox")
+            elif step_type == "load_memory_snapshot":
+                session_index = step.get("session_index")
+                snapshot_set_id = step.get("snapshot_set_id")
+                if session_index is not None and snapshot_set_id and in_memory_env:
+                    try:
+                        snapshot_path = get_snapshot_path(
+                            snapshot_set_id=snapshot_set_id,
+                            memory_backend=self.memory_backend_name,
+                            defense_type=self.unified_defense,
+                            session_index=session_index,
+                        )
+                        load_snapshot_into_env(
+                            snapshot_path=snapshot_path,
+                            in_memory_env=in_memory_env,
+                            test_config=fresh_test_config,
+                            memory_backend=self.memory_backend_name,
+                            defense_type=self.unified_defense,
+                            snapshot_set_id=snapshot_set_id,
+                            session_index=session_index,
+                        )
+                    except Exception as e:
+                        debug_info(f"load_memory_snapshot during replay: {e}")
             elif step_type == "user_message":
                 user_msg = step.get("user_message", "")
                 if user_msg:

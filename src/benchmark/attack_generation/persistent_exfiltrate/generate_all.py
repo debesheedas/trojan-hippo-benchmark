@@ -133,7 +133,12 @@ def main() -> int:
         num_test = config.get("num_test_cases", 4)
         seed = config.get("seed", 42)
         num_sessions = config.get("num_sessions", NUM_SESSIONS_DEFAULT)
-        initial_data = config.get("initial_data") or DEFAULT_INITIAL_DATA
+        base_initial_data = config.get("initial_data") or DEFAULT_INITIAL_DATA
+        # Ensure train/test use disjoint inbox sets to avoid leakage via initial environment.
+        initial_data_train = dict(base_initial_data)
+        initial_data_train["inbox_set"] = "inbox_set_train"
+        initial_data_test = dict(base_initial_data)
+        initial_data_test["inbox_set"] = "inbox_set_test"
         name_prefix = f"persistent_exfiltrate_{category_name}"
         filename_prefix = name_prefix
         train_suffix = "train"
@@ -180,7 +185,7 @@ def main() -> int:
                     queries=train_queries,
                     case_index=0,
                     name_suffix=train_suffix,
-                    initial_data=initial_data,
+                    initial_data=initial_data_train,
                     name_prefix=name_prefix,
                     user_goal_keyword=user_goal_keyword,
                 )
@@ -213,7 +218,7 @@ def main() -> int:
                             queries=trigger_queries,
                             case_index=i + 1,
                             name_suffix=None,
-                            initial_data=initial_data,
+                            initial_data=initial_data_test,
                             name_prefix=name_prefix,
                             user_goal_keyword=user_goal_keyword,
                             num_sessions=num_sessions,
@@ -231,7 +236,7 @@ def main() -> int:
                             queries=test_queries,
                             case_index=i + 1,
                             name_suffix=None,
-                            initial_data=initial_data,
+                            initial_data=initial_data_test,
                             name_prefix=name_prefix,
                             user_goal_keyword=user_goal_keyword,
                         )

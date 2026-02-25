@@ -185,12 +185,24 @@ class RAGMemoryManager:
         self._chunk_counter = 0
         
         # Load existing vector store from in-memory storage
+        self._load_from_storage()
+
+    def reload_from_storage(self) -> None:
+        """Reload vectorstore, documents, and chunk_counter from storage. Use before merging snapshot so manager state matches current storage (e.g. after agent indexed step 2)."""
+        self._load_from_storage()
+
+    def _load_from_storage(self) -> None:
+        """Load existing vector store from in-memory storage into self."""
         vectorstore, documents, chunk_counter = self.vectorstore_storage.load()
         if vectorstore is not None:
             self.vectorstore = vectorstore
-            self.documents = documents
-            self._chunk_counter = chunk_counter
-    
+            self.documents = list(documents) if documents else []
+            self._chunk_counter = chunk_counter if chunk_counter is not None else len(self.documents)
+        else:
+            self.vectorstore = None
+            self.documents = []
+            self._chunk_counter = 0
+
     def _save_vectorstore(self):
         """Save vector store to in-memory storage."""
         if self.vectorstore and self.vectorstore_storage:

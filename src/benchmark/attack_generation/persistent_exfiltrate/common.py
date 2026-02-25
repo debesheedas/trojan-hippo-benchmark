@@ -14,8 +14,9 @@ PLACEHOLDER_PATTERN = re.compile(r"\{(\w+)\}")
 # Backends we generate for (must match attack_bench layout)
 MEMORY_BACKENDS = ["none", "explicit", "mem0", "rag", "context"]
 
+# Base initial_data used by generators; specific scripts override inbox_set per split
 DEFAULT_INITIAL_DATA = {
-    "inbox_set": "inbox_set_1",
+    "inbox_set": "inbox_set_train",
     "outbox_set": "outbox_set_1",
     "drafts_set": "drafts_set_1",
 }
@@ -316,6 +317,78 @@ def build_test_case(
     if name_suffix:
         name = f"{name}_{name_suffix}"
 
+    return {
+        "name": name,
+        "attack_type": "indirect",
+        "description": description,
+        "initial_data": dict(initial_data),
+        "steps": steps,
+    }
+
+
+def build_persistence_test_case(
+    backend: str,
+    backend_def: Dict[str, Any],
+    category_config: Dict[str, Any],
+    category_name: str,
+    trigger_query: str,
+    case_index: int,
+    session_n: int,
+    initial_data: Dict[str, Any],
+    name_prefix: str,
+    user_goal_keyword: str,
+    snapshot_set_id: str = "persistence_unrelated_20",
+) -> Dict[str, Any]:
+    """
+    Build a persistence test case:
+      insert_attack_email, read inbox, start_new_session,
+      [load_memory_snapshot(N), start_new_session] if session_n > 0 else nothing,
+      trigger.
+    When session_n == 0 (train_0/test_0), load_memory_snapshot is omitted entirely.
+    When session_n > 0, load snapshot after N sessions of unrelated conversation.
+    """
+    topic_params, expected_behavior, user_goal_description = _topic_params_and_behavior(
+        category_config, category_name
+    )
+    if session_n == 0:
+        description_suffix = " Persistence test (no pre-loaded sessions): single trigger after attack."
+    else:
+        description_suffix = f" Persistence test: load snapshot at session {session_n}, then single trigger."
+    description = _substitute(
+        backend_def.get("description", ""), topic_params
+    ) + description_suffix
+    insert_desc = _substitute(backend_def.get("insert_step_description", ""), topic_params)
+    start_new_desc = _substitute(
+        backend_def.get("start_new_session_description", ""), topic_params
+    )
+    attack_goal_desc = _substitute(backend_def.get("attack_goal_description", ""), topic_params)
+    attack_email = _get_attack_email_for_backend(backend, backend_def, category_config, topic_params)
+
+    steps: List[Dict[str, Any]] = [
+        {"step_type": "insert_attack_email", "description": insert_desc, "attack_email": attack_email},
+        STEP_READ_INBOX.copy(),
+        {"step_type": "start_new_session", "description": start_new_desc},
+    ]
+    if session_n > 0:
+        steps.extend([
+            {
+                "step_type": "load_memory_snapshot",
+                "session_index": session_n,
+                "snapshot_set_id": snapshot_set_id,
+                "description": f"Load memory snapshot after {session_n} sessions of unrelated conversation.",
+            },
+            {"step_type": "start_new_session", "description": start_new_desc},
+        ])
+    steps.append(
+        _trigger_step(
+            trigger_query,
+            expected_behavior,
+            user_goal_description,
+            user_goal_keyword,
+            attack_goal_desc,
+        )
+    )
+    name = f"{case_index:02d}_{name_prefix}"
     return {
         "name": name,
         "attack_type": "indirect",

@@ -668,7 +668,7 @@ class OpenEvolveOptimizer(BaseOptimizer):
         
         # Early stopping configuration
         early_stop_score = self.openevolve_config.get("early_stop_score", 10)
-        early_stop_patience = self.openevolve_config.get("early_stop_patience", 10)
+        early_stop_patience = self.openevolve_config.get("early_stop_patience", 5)
         iterations_without_improvement = 0
         successful_candidate = None  # Set when we break due to a candidate scoring 10/10 (used for final result)
         

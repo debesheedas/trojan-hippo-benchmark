@@ -479,7 +479,12 @@ class Mem0MemoryManager:
                 combined_metadata["label"] = session_label
             else:
                 # Default to T if no session_id provided
-                combined_metadata["label"] = "T"
+                session_label = "T"
+                combined_metadata["label"] = session_label
+            debug_info(
+                f"[mem0_defense] provable_policy: memories will be stored with session_label={combined_metadata.get('label', 'T')}",
+                truncate=False,
+            )
         
         try:
             # Mem0 uses agent_id presence to choose extraction prompt:
@@ -1344,12 +1349,24 @@ def index_mem0_memory(text: str, response_text: str, session_id: str, mem0_memor
         ]
         
         if not defense_manager.should_index_memory(session_id, conversation_messages):
+            if mem0_defense_type == "no_untrusted_tools":
+                debug_info(
+                    "[mem0_defense] no_untrusted_tools: memory indexing blocked for this turn (session UNTRUSTED due to untrusted tool use).",
+                    truncate=False,
+                )
             if mem0_memory_config.get("mem0_print", False):
                 print(f"\nDefense '{mem0_defense_type}' blocked memory indexing for this turn")
             return
         
         filtered_messages = defense_manager.filter_messages(conversation_messages)
-        
+        n_passed = len(filtered_messages)
+        n_excluded = len(conversation_messages) - n_passed
+        if mem0_defense_type == "user_prompt_only" and n_excluded > 0:
+            debug_info(
+                f"[mem0_defense] user_prompt_only: passing {n_passed} user message(s) to mem0 for extraction "
+                f"({n_excluded} assistant message(s) excluded)",
+                truncate=False,
+            )
         if not filtered_messages:
             if mem0_memory_config.get("mem0_print", False):
                 print(f"\nDefense '{mem0_defense_type}' filtered out all messages")
@@ -1381,6 +1398,13 @@ def index_mem0_memory(text: str, response_text: str, session_id: str, mem0_memor
             session_id=session_id,
             defense_type=mem0_defense_type,
         )
+        if result:
+            results = result.get("results", [])
+            if mem0_defense_type == "user_prompt_only" and not results:
+                debug_info(
+                    "[mem0_defense] No memories extracted this turn; user_prompt_only indexed only user message(s) (assistant reply excluded).",
+                    truncate=False,
+                )
         if mem0_memory_config.get("mem0_print", False) and result:
             results = result.get("results", [])
             if results:

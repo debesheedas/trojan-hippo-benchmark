@@ -28,6 +28,11 @@ from benchmark.benchmark_utils import (
     should_skip_test,
     determine_attack_type,
     discover_test_files,
+    get_attack_bench_train_or_test,
+    get_attack_bench_suite_subfolder,
+    get_log_path,
+    get_result_path,
+    is_valid_combination,
     prepare_benchmark_config,
     UNIFIED_DEFENSE_TYPES,
     MEMORY_BACKENDS,
@@ -85,6 +90,7 @@ def run_benchmark(
     force: bool = False,
     adaptive: bool = False,
     stealth: bool = False,
+    early_stop_patience: Optional[int] = None,
     results_base_dir: Optional[Path] = None,
     logs_base_dir: Optional[Path] = None,
     target_model_name: Optional[str] = None
@@ -128,6 +134,12 @@ def run_benchmark(
     if adaptive and stealth:
         config.setdefault("benchmark", {})["adaptive_stealth"] = True
     
+    # When adaptive: inject early_stop_patience from CLI (default 5) into openevolve config
+    if adaptive and early_stop_patience is not None:
+        config.setdefault("benchmark", {}).setdefault("openevolve", {})["early_stop_patience"] = early_stop_patience
+    elif adaptive:
+        config.setdefault("benchmark", {}).setdefault("openevolve", {})["early_stop_patience"] = 5
+    
     # Get results_base_dir from config (in case it was set to default)
     results_base_dir = Path(config["benchmark"]["results_dir"])
     
@@ -149,14 +161,75 @@ def run_benchmark(
     model_name = config.get("agent", {}).get("target_model_name", "unknown")
     is_attack_bench = "attack_bench" in str(test_files[0])
     logs_folder = "attack_logs" if is_attack_bench else "logs"
-    logs_dir = Path("data/benchmark") / logs_folder / model_name / memory_backend / unified_defense
+    default_logs_dir = Path("data/benchmark") / logs_folder / model_name / memory_backend / unified_defense
     test_path_is_dir = Path(test_path).is_dir() if Path(test_path).exists() else (len(test_files) > 1)
     if test_path_is_dir:
         print(f"Test path: {test_path} (directory with {len(test_files)} test file(s))")
     else:
         print(f"Test path: {test_path} ({len(test_files)} test file(s))")
-    print(f"Logs will be written to: {logs_dir.resolve()}")
+    if logs_base_dir is not None:
+        print(f"Logs base dir override: {logs_base_dir.resolve()}")
+    else:
+        print(f"Logs will be written under: {default_logs_dir.resolve()}")
     print(f"Found {len(test_files)} test file(s)")
+    
+    # Skip invalid backend+defense combinations (e.g. explicit+user_prompt_only, context+limit_memory_length)
+    if not is_valid_combination(memory_backend, unified_defense):
+        skip_msg = (
+            f"SKIPPED: Invalid combination. {memory_backend} + {unified_defense} is not applicable "
+            "(this backend/defense pair is skipped by design)."
+        )
+        print(skip_msg)
+        # Use attack_results/attack_logs for attack_bench so paths match normal run
+        effective_results_base = results_base_dir
+        effective_logs_base = logs_base_dir
+        if is_attack_bench:
+            effective_results_base = Path(str(results_base_dir).replace("results", "attack_results"))
+            if logs_base_dir is not None:
+                logs_str = str(logs_base_dir)
+                effective_logs_base = Path(logs_str.replace("/logs", "/attack_logs").replace("logs", "attack_logs"))
+            else:
+                effective_logs_base = Path("data/benchmark/attack_logs")
+        if effective_logs_base is None:
+            effective_logs_base = Path("data/benchmark/logs")
+        # Write one log and one result per test so logs/results structure reflects skip
+        for test_file in test_files:
+            try:
+                attack_type = determine_attack_type(test_file, None)
+                log_path = get_log_path(
+                    memory_backend, unified_defense, model_name, attack_type, test_file, effective_logs_base
+                )
+                result_path = get_result_path(
+                    memory_backend, unified_defense, model_name, attack_type, test_file, effective_results_base
+                )
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                result_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.write_text(
+                    f"Log file opened: {log_path}\n"
+                    f"Memory backend: {memory_backend}, Defense: {unified_defense}\n"
+                    f"{skip_msg}\n"
+                    "No tests run (invalid combination).\n",
+                    encoding="utf-8",
+                )
+                skip_result = {
+                    "skipped": True,
+                    "reason": "invalid_combination",
+                    "message": f"{memory_backend} + {unified_defense} is not applicable",
+                    "memory_backend": memory_backend,
+                    "defense_type": unified_defense,
+                    "test_file": str(test_file),
+                }
+                result_path.write_text(json.dumps(skip_result, indent=2), encoding="utf-8")
+            except Exception as e:
+                print(f"Warning: could not write skip marker for {test_file.name}: {e}")
+        return {
+            "success": True,
+            "skipped": True,
+            "reason": "invalid_combination",
+            "tests_run": 0,
+            "tests_passed": 0,
+            "tests_failed": 0,
+        }
     
     # Check if all results exist
     all_exist, missing = check_results_exist(
@@ -194,8 +267,6 @@ def run_benchmark(
         total_tests = len(results)
         passed_tests = sum(1 for r in results if r.get("overall_success", False))
         failed_tests = total_tests - passed_tests
-
-        print(f"\nLog files written to: {logs_dir.resolve()}", flush=True)
         return {
             "success": True,
             "memory_backend": memory_backend,
@@ -296,7 +367,7 @@ def _run_single_combination(
     All output is redirected to a log file specific to this combination.
     
     Args:
-        args_tuple: (memory_backend, unified_defense, test_path, config_path, force, adaptive, stealth, results_base_dir, logs_base_dir, target_model_name)
+        args_tuple: (memory_backend, unified_defense, test_path, config_path, force, adaptive, stealth, early_stop_patience, results_base_dir, logs_base_dir, target_model_name)
     
     Returns:
         (memory_backend, unified_defense, result_dict)
@@ -305,7 +376,7 @@ def _run_single_combination(
     
     # Set process name for debugging
     process_id = os.getpid()
-    memory_backend, unified_defense, test_path, config_path, force, adaptive, stealth, results_base_dir, logs_base_dir, target_model_name = args_tuple
+    memory_backend, unified_defense, test_path, config_path, force, adaptive, stealth, early_stop_patience, results_base_dir, logs_base_dir, target_model_name = args_tuple
     
     # Determine attack type from test_path (needed for result paths)
     if isinstance(test_path, str):
@@ -330,12 +401,27 @@ def _run_single_combination(
         # Determine if this is an attack_bench test (uses attack_logs folder)
         is_attack_bench = "attack_bench" in str(test_path)
         logs_folder = "attack_logs" if is_attack_bench else "logs"
+        model_name = target_model_name or "unknown"
+        # For attack_bench, log path includes split (test/test_10) and topic: attack_logs/<split>/<model>/<topic>/<backend>/<defense>/
+        attack_logs_subdir = None
+        if is_attack_bench:
+            path_obj = Path(test_path)
+            first_file = path_obj if path_obj.is_file() else None
+            if not first_file and path_obj.exists() and path_obj.is_dir():
+                discovered = discover_test_files(test_path=str(test_path))
+                first_file = discovered[0] if discovered else None
+            if first_file is not None:
+                split = get_attack_bench_train_or_test(first_file)
+                topic = get_attack_bench_suite_subfolder(first_file) or "unknown"
+                attack_logs_subdir = f"{logs_folder}/{split}/{model_name}/{topic}/{memory_backend}/{unified_defense}"
+            if attack_logs_subdir is None:
+                attack_logs_subdir = f"{logs_folder}/{model_name}/{memory_backend}/{unified_defense}"
         
         print(f"[PID {process_id}] Starting: {memory_backend} + {unified_defense}")
         if is_attack_bench:
-            print(f"Individual test logs will be written to: data/benchmark/{logs_folder}/{target_model_name or 'unknown'}/{memory_backend}/{unified_defense}/")
+            print(f"Individual test logs will be written to: data/benchmark/{attack_logs_subdir}/")
         else:
-            print(f"Individual test logs will be written to: data/benchmark/{logs_folder}/{target_model_name or 'unknown'}/{memory_backend}/{unified_defense}/{attack_type}/")
+            print(f"Individual test logs will be written to: data/benchmark/{logs_folder}/{model_name}/{memory_backend}/{unified_defense}/{attack_type}/")
         print(f"{'='*80}\n", flush=True)
         
         result = run_benchmark(
@@ -346,6 +432,7 @@ def _run_single_combination(
             force=force,
             adaptive=adaptive,
             stealth=stealth,
+            early_stop_patience=early_stop_patience,
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
             target_model_name=target_model_name
@@ -385,7 +472,7 @@ def _run_single_combination(
         else:
             status = "ERROR"
         if is_attack_bench:
-            print(f"{status} {memory_backend.upper()} + {unified_defense} - See individual test logs in data/benchmark/{logs_folder}/{target_model_name or 'unknown'}/{memory_backend}/{unified_defense}/", flush=True)
+            print(f"{status} {memory_backend.upper()} + {unified_defense} - See individual test logs in data/benchmark/{attack_logs_subdir or logs_folder + '/' + model_name + '/' + memory_backend + '/' + unified_defense}/", flush=True)
         else:
             print(f"{status} {memory_backend.upper()} + {unified_defense} - See individual test logs in data/benchmark/{logs_folder}/{target_model_name or 'unknown'}/{memory_backend}/{unified_defense}/{attack_type}/", flush=True)
     
@@ -459,6 +546,7 @@ def run_all_combinations(
     force: bool = False,
     adaptive: bool = False,
     stealth: bool = False,
+    early_stop_patience: Optional[int] = None,
     num_workers: int = 1,
     results_base_dir: Optional[Path] = None,
     logs_base_dir: Optional[Path] = None,
@@ -522,7 +610,7 @@ def run_all_combinations(
     
     # Prepare arguments for each combination
     args_list = [
-        (backend, defense, test_path, config_path, force, adaptive, stealth, results_base_dir, logs_base_dir, target_model_name)
+        (backend, defense, test_path, config_path, force, adaptive, stealth, early_stop_patience, results_base_dir, logs_base_dir, target_model_name)
         for backend, defense in combinations
     ]
     
@@ -931,6 +1019,14 @@ Examples:
     )
     
     parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=5,
+        metavar="N",
+        help="[Adaptive only] OpenEvolve early-stop patience: stop if no improvement for N iterations (default: 5). Ignored in static mode."
+    )
+    
+    parser.add_argument(
         "--results-dir",
         type=str,
         help="Base directory for results (defaults to data/benchmark/results)"
@@ -1052,6 +1148,7 @@ Examples:
             force=args.force,
             adaptive=args.adaptive,
             stealth=args.stealth,
+            early_stop_patience=args.early_stop_patience,
             num_workers=args.num_workers,
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
@@ -1077,6 +1174,7 @@ Examples:
             force=args.force,
             adaptive=args.adaptive,
             stealth=args.stealth,
+            early_stop_patience=args.early_stop_patience,
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
             target_model_name=args.target_model_name

@@ -23,6 +23,20 @@ PYTHONPATH=src python -m benchmark.attack_generation.persistent_exfiltrate.gener
 PYTHONPATH=src python -m benchmark.attack_generation.persistent_exfiltrate.generate_all --attack-bench-dir data/benchmark/attack_bench
 ```
 
+### Persistence tests (test_N)
+
+To generate **test-only** persistence cases (used with the memory snapshot system): insert_attack_email → read inbox → **load_memory_snapshot(N)** → start_new_session → trigger. Output goes under `attack_bench/test_{N}/` (e.g. `test_4/`).
+
+```bash
+# Generate test_4 for all categories
+PYTHONPATH=src python -m benchmark.attack_generation.persistent_exfiltrate.generate_persistence_tests --n 4
+
+# One category only
+PYTHONPATH=src python -m benchmark.attack_generation.persistent_exfiltrate.generate_persistence_tests --n 4 --category tax
+```
+
+Requires snapshots to be built first (e.g. `python scripts/build_persistence_snapshots.py`).
+
 ## Adding a new category (e.g. for 7 more topics)
 
 1. **Create a new directory** under `categories/`, e.g. `categories/finance/`.

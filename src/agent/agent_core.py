@@ -497,7 +497,8 @@ def _create_agent_executor(
             )
             if explicit_memory_context:
                 memory_lines = explicit_memory_context.split('\n')
-                print(f"Loaded {len(memory_manager.long_term)} explicit memories into system prompt ({len(explicit_memory_context)} chars, {len(memory_lines)} lines)")
+                limit_note = f" (limit_memory_length: max {limit_memory_size} chars per entry when stored)" if explicit_defense_type == "limit_memory_length" else ""
+                print(f"Loaded {len(memory_manager.long_term)} explicit memories into system prompt ({len(explicit_memory_context)} chars, {len(memory_lines)} lines){limit_note}")
             else:
                 print(f"No explicit memories loaded (in-memory)")
         except (OSError, IOError, ValueError, KeyError) as e:
@@ -634,11 +635,18 @@ def invoke_agent(text: str, session_id: str, config: dict, in_memory_env) -> Dic
     backoff_secs = [10, 30, 60, 90]  # after 1st, 2nd, 3rd, 4th failure
     last_error = None
     result = None
+    # LangGraph recursion_limit: default 25 can be hit on long tool-use turns; use config or 50.
+    recursion_limit = config.get("agent", {}).get("recursion_limit", 50)
+    invoke_config = {"recursion_limit": recursion_limit}
+
+    def _invoke():
+        return agent.invoke({"messages": messages_for_agent}, config=invoke_config)
+
     for attempt in range(1, max_retries + 1):
         try:
             executor = ThreadPoolExecutor(max_workers=1)
             try:
-                future = executor.submit(agent.invoke, {"messages": messages_for_agent})
+                future = executor.submit(_invoke)
                 result = future.result(timeout=invoke_timeout_sec)
             finally:
                 executor.shutdown(wait=False)

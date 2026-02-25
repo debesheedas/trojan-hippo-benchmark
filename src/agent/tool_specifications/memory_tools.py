@@ -107,7 +107,9 @@ class UpdateMemoryTool(BaseTool):
         # Defense: limit_memory_length – truncate memory_text to configured limit
         if self.explicit_defense_type == "limit_memory_length" and isinstance(memory_text, str):
             if len(memory_text) > self.limit_memory_size:
+                orig_len = len(memory_text)
                 memory_text = memory_text[:self.limit_memory_size]
+                print(f"[explicit_memory] limit_memory_length: truncated memory from {orig_len} to {self.limit_memory_size} chars.")
 
         # Log tool call
         if self.session_id:

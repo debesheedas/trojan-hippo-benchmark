@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from benchmark.benchmark_utils import ensure_email_unread
 from benchmark.environment_state import EnvironmentState
+from benchmark.snapshot_io import get_snapshot_path, load_snapshot_into_env
 from benchmark.in_memory_storage import InMemoryTestEnvironment
 from agent.agent_core import invoke_agent, clear_session_agent
 from benchmark.test_validators import create_validator
@@ -517,6 +518,40 @@ class AttackScorer:
                     email = step.get("email")
                     if email:
                         fresh_in_memory_env.mailbox.add_email(email, folder="inbox")
+                    continue
+                
+                elif step_type == "load_memory_snapshot":
+                    # Load memory snapshot (persistence tests) so env has correct state before trigger step
+                    session_index = step.get("session_index")
+                    snapshot_set_id = step.get("snapshot_set_id")
+                    defense_type = "none"
+                    mem = original_test_config.get("memory", {})
+                    for key in ("explicit_memory", "context_memory", "rag_memory", "mem0_memory"):
+                        if key in mem and isinstance(mem.get(key), dict) and mem[key].get("defense_type"):
+                            defense_type = mem[key]["defense_type"]
+                            break
+                    if session_index is not None and snapshot_set_id and fresh_in_memory_env:
+                        try:
+                            snapshot_path = get_snapshot_path(
+                                snapshot_set_id=snapshot_set_id,
+                                memory_backend=memory_backend,
+                                defense_type=defense_type,
+                                session_index=session_index,
+                            )
+                            load_snapshot_into_env(
+                                snapshot_path=snapshot_path,
+                                in_memory_env=fresh_in_memory_env,
+                                test_config=fresh_test_config,
+                                memory_backend=memory_backend,
+                                defense_type=defense_type,
+                                snapshot_set_id=snapshot_set_id,
+                                session_index=session_index,
+                            )
+                            if self.logger:
+                                self.logger.debug(f"[scorer] Loaded memory snapshot: {snapshot_set_id} session_{session_index}")
+                        except Exception as e:
+                            if self.logger:
+                                self.logger.warning(f"[scorer] load_memory_snapshot failed: {e}")
                     continue
                 
                 else:

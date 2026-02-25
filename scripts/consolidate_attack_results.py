@@ -6,6 +6,11 @@ Consolidates TEST results from the attack benchmark. Reads from
 data/benchmark/attack_results/test/ and data/benchmark/attack_logs/test/ by default
 (train/test layout matches attack_bench). Generates CSV tables and visualizations.
 
+If --results-dir points to the attack_results base (e.g. data/benchmark/attack_results),
+discovers all test folders (test, test_4, ...) and processes each separately, writing
+output under consolidated_attack_results/<model>/<test_folder>/ so each test run has
+its own heatmaps and CSVs.
+
 Discovers suites from the results directory (model/backend/defense/suite/) and only
 generates CSVs and plots for suites that have result files present.
 
@@ -50,10 +55,14 @@ from benchmark.benchmark_utils import (
 # Constants
 BACKEND_LABELS = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
 
-# Default paths for attack benchmark (test results live under attack_results/test/)
-DEFAULT_RESULTS_DIR = Path("data/benchmark/attack_results/test")
+# Default paths for attack benchmark.
+# By default we point at the *base* attack_results directory and automatically
+# process all subfolders starting with "test" (test, test_2, test_4, ...).
+DEFAULT_ATTACK_RESULTS_BASE = Path("data/benchmark/attack_results")
+DEFAULT_RESULTS_DIR = DEFAULT_ATTACK_RESULTS_BASE
 DEFAULT_TRAIN_RESULTS_DIR = Path("data/benchmark/attack_results/train")
-DEFAULT_LOGS_DIR = Path("data/benchmark/attack_logs/test")
+DEFAULT_LOGS_BASE = Path("data/benchmark/attack_logs")
+DEFAULT_LOGS_DIR = DEFAULT_LOGS_BASE
 DEFAULT_OUTPUT_DIR = Path("data/benchmark/consolidated_attack_results")
 
 # Data tuple: (user_passed, user_total, user_rate, attack_passed, attack_total, attack_rate,
@@ -74,12 +83,15 @@ def get_attack_results_dir(
 ) -> Path:
     """
     Get the results directory for attack benchmark.
-    Path structure: {results_base_dir}/{model_name}/{memory_backend}/{defense_type}/
-    With optional suite: {results_base_dir}/{model_name}/{memory_backend}/{defense_type}/{suite_name}/
+    New path structure (per-topic suites):
+        {results_base_dir}/{model_name}/{suite_name}/{memory_backend}/{defense_type}/
+    When suite_name is None (should be rare), returns:
+        {results_base_dir}/{model_name}/{memory_backend}/{defense_type}/
     """
-    p = results_base_dir / model_name / memory_backend / unified_defense
+    p = results_base_dir / model_name
     if suite_name:
         p = p / suite_name
+    p = p / memory_backend / unified_defense
     return p
 
 
@@ -93,25 +105,18 @@ def _iter_result_files_for_suite(
     train_only: bool = False,
 ):
     """
-    Iterate over result JSON files for a suite, supporting both:
-    - Legacy: result files directly in results_dir (model/backend/defense/*.json)
-    - New: result files in results_dir/suite_name/*.json
+    Iterate over result JSON files for a given suite in the new layout.
+
+    New layout: results_dir points directly at:
+        {results_base_dir}/{model}/{suite}/{backend}/{defense}/
+
     When train_only=False: skips files whose stem contains TRAIN_STEM_MARKER (test only).
     When train_only=True: only yields files whose stem contains TRAIN_STEM_MARKER (train only).
     """
     want_train = train_only
-    # New layout: defense/suite_name/*.json
-    suite_dir = results_dir / suite_name
-    if suite_dir.is_dir():
-        for p in suite_dir.glob("*.json"):
-            if suite_name not in p.stem:
-                continue
-            if (TRAIN_STEM_MARKER in p.stem) == want_train:
-                yield p
-    # Legacy: defense/*.json (filter by suite in stem)
+    if not results_dir.is_dir():
+        return
     for p in results_dir.glob("*.json"):
-        if suite_name not in p.stem:
-            continue
         if (TRAIN_STEM_MARKER in p.stem) == want_train:
             yield p
 
@@ -322,66 +327,77 @@ def discover_models(results_base_dir: Path) -> List[str]:
     return sorted(models)
 
 
+def discover_test_folders(attack_results_base: Path) -> Tuple[List[Optional[str]], bool]:
+    """
+    Discover test folder names under attack_results (e.g. test, test_4).
+    Returns (list of folder names, at_root). at_root=True means we're at attack_results root.
+    When at_root=False, returns ([None], False) for single-folder mode.
+    """
+    if not attack_results_base.exists():
+        return ([None], False)
+    # At root if we see test/ or train/ as direct children (attack_results layout)
+    at_root = (attack_results_base / "test").is_dir() or (attack_results_base / "train").is_dir()
+    if not at_root:
+        return ([None], False)
+    test_folders = sorted(
+        d.name for d in attack_results_base.iterdir()
+        if d.is_dir() and d.name.startswith("test")
+    )
+    if not test_folders:
+        return ([None], False)
+    return (test_folders, True)
+
+
 def discover_suites(results_base_dir: Path, model_name: str) -> List[str]:
     """
-    Discover attack suite names that actually have result files under this model.
-    Scans the results directory structure and returns only suites that have at least
-    one non-train result JSON file. This ensures we only generate CSVs/plots for
-    suites that exist in the results folder.
+    Discover attack suite names (topics) that actually have result files under this model.
+
+    New layout:
+        {results_base_dir}/{model_name}/{suite}/{backend}/{defense}/NN.json
+
+    We treat each immediate subdirectory of {results_base_dir}/{model_name} as a suite/topic.
     """
-    suites = set()
-    for defense_type in UNIFIED_DEFENSE_TYPES:
-        for backend in MEMORY_BACKENDS:
-            if not is_valid_combination(backend, defense_type):
-                continue
-            results_dir = results_base_dir / model_name / backend / defense_type
-            if not results_dir.exists():
-                continue
-            # New layout: result files in results_dir/suite_name/*.json
-            for subdir in results_dir.iterdir():
-                if subdir.is_dir():
-                    suite_name = subdir.name
-                    for p in subdir.glob("*.json"):
-                        if suite_name in p.stem and TRAIN_STEM_MARKER not in p.stem:
-                            suites.add(suite_name)
-                            break
-            # Legacy layout: result files directly in results_dir/*.json
-            for p in results_dir.glob("*.json"):
-                if TRAIN_STEM_MARKER in p.stem:
-                    continue
-                # Stem e.g. "01_persistent_exfiltrate_tax" -> suite "persistent_exfiltrate_tax"
-                parts = p.stem.split("_", 1)
-                if len(parts) >= 2:
-                    suites.add(parts[1])
+    suites = []
+    model_root = results_base_dir / model_name
+    if not model_root.exists():
+        return suites
+    for topic_dir in model_root.iterdir():
+        if not topic_dir.is_dir():
+            continue
+        suites.append(topic_dir.name)
     return sorted(suites)
 
 
 def discover_suites_for_train(results_base_dir: Path, model_name: str) -> List[str]:
     """
-    Discover suite names that have train result files under this model.
-    Same layout as discover_suites but only includes files whose stem contains TRAIN_STEM_MARKER.
+    Discover suite names (topics) that have train result files under this model.
+    Same directory layout as discover_suites, but only include topics that contain
+    at least one file whose stem includes TRAIN_STEM_MARKER.
     """
     suites = set()
-    for defense_type in UNIFIED_DEFENSE_TYPES:
-        for backend in MEMORY_BACKENDS:
-            if not is_valid_combination(backend, defense_type):
+    model_root = results_base_dir / model_name
+    if not model_root.exists():
+        return []
+    for topic_dir in model_root.iterdir():
+        if not topic_dir.is_dir():
+            continue
+        has_train = False
+        for backend_dir in topic_dir.iterdir():
+            if not backend_dir.is_dir():
                 continue
-            results_dir = results_base_dir / model_name / backend / defense_type
-            if not results_dir.exists():
-                continue
-            for subdir in results_dir.iterdir():
-                if subdir.is_dir():
-                    suite_name = subdir.name
-                    for p in subdir.glob("*.json"):
-                        if suite_name in p.stem and TRAIN_STEM_MARKER in p.stem:
-                            suites.add(suite_name)
-                            break
-            for p in results_dir.glob("*.json"):
-                if TRAIN_STEM_MARKER not in p.stem:
+            for defense_dir in backend_dir.iterdir():
+                if not defense_dir.is_dir():
                     continue
-                parts = p.stem.split("_", 1)
-                if len(parts) >= 2:
-                    suites.add(parts[1])
+                for p in defense_dir.glob("*.json"):
+                    if TRAIN_STEM_MARKER in p.stem:
+                        has_train = True
+                        break
+                if has_train:
+                    break
+            if has_train:
+                break
+        if has_train:
+            suites.add(topic_dir.name)
     return sorted(suites)
 
 
@@ -1229,13 +1245,13 @@ def main() -> int:
         "--results-dir",
         type=str,
         default=str(DEFAULT_RESULTS_DIR),
-        help="Base directory for attack results",
+        help="Attack results base directory (default: data/benchmark/attack_results). All subfolders starting with 'test' (e.g. test, test_2, test_4, ...) will be processed.",
     )
     parser.add_argument(
         "--logs-dir",
         type=str,
         default=str(DEFAULT_LOGS_DIR),
-        help="Base directory for attack logs",
+        help="Base directory for attack logs (default: data/benchmark/attack_logs)",
     )
     parser.add_argument(
         "--output-dir",
@@ -1255,166 +1271,275 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    results_base_dir = Path(args.results_dir)
-    logs_base_dir = Path(args.logs_dir)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    results_root = Path(args.results_dir)
+    output_root = Path(args.output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
 
-    all_models = discover_models(results_base_dir)
-    if not all_models:
-        print(f"WARNING: No models found in {results_base_dir}")
-        return 1
+    # Discover test folders (sessions): test, test_2, test_4, ...
+    test_folders = sorted(
+        d.name for d in results_root.iterdir()
+        if d.is_dir() and d.name.startswith("test")
+    )
+    if not test_folders:
+        print(f"WARNING: No test folders found under {results_root}")
+        return 0
 
-    models_to_process = [args.model] if args.model else all_models
+    # Helper for session index: test -> 0, test_2 -> 2, etc.
+    def _session_index(name: str) -> int:
+        if name == "test":
+            return 0
+        if name.startswith("test_"):
+            try:
+                return int(name.split("_", 1)[1])
+            except ValueError:
+                return 0
+        return 0
 
-    print(f"\n{'='*80}")
-    print("Consolidating Attack Results")
-    print(f"{'='*80}")
-    print(f"Models: {', '.join(models_to_process)}")
-    print(f"Results: {results_base_dir}")
-    print(f"Logs: {logs_base_dir}")
-    print(f"Output: {output_dir}")
-    print(f"{'='*80}\n")
+    csv_files: List[Path] = []
+    plot_files: List[Path] = []
 
-    csv_files = []
-    plot_files = []
-    error_summaries = []
+    # For cross-session ASR plots: model -> topic -> backend -> {session_idx: (attack_passed, attack_total)}
+    model_topic_backend_sessions: Dict[str, Dict[str, Dict[str, Dict[int, Tuple[int, int]]]]] = {}
 
-    for model_name in models_to_process:
-        suites_to_process = discover_suites(results_base_dir, model_name)
-        if not suites_to_process:
-            print(f"Skipping {model_name}: no attack suites found in results")
+    # Per-test-folder consolidation
+    for test_folder in test_folders:
+        current_results_dir = results_root / test_folder
+        if not current_results_dir.is_dir():
             continue
-        model_output_dir = output_dir / model_name
-        model_output_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Suites for {model_name}: {', '.join(suites_to_process)}")
-        all_suites_data = {}
-        all_suites_session_data: Dict[str, Dict[str, Dict[str, SessionDataTuple]]] = {}
 
-        for suite_name in suites_to_process:
-            print(f"Processing: {model_name} / {suite_name}")
+        all_models = discover_models(current_results_dir)
+        if not all_models:
+            print(f"WARNING: No models found in {current_results_dir}")
+            continue
 
-            data, session_data, data_stealth = collect_all_data(model_name, suite_name, results_base_dir)
-            all_suites_data[suite_name] = data
-            all_suites_session_data[suite_name] = session_data
+        models_to_process = [args.model] if args.model else all_models
 
-            csv_file = generate_csv(model_name, suite_name, data, model_output_dir, data_stealth=data_stealth)
-            csv_files.append(csv_file)
-            print(f"  OK: CSV: {csv_file.name}")
+        print(f"\n{'='*80}")
+        print(f"Consolidating Attack Results [{test_folder}]")
+        print(f"{'='*80}")
+        print(f"Test folder: {test_folder}")
+        print(f"Models: {', '.join(models_to_process)}")
+        print(f"Results: {current_results_dir}")
+        print(f"Output: {output_root}")
+        print(f"{'='*80}\n")
 
-            error_summary = generate_error_summary(
-                model_name, suite_name, results_base_dir, logs_base_dir, model_output_dir
-            )
-            if error_summary:
-                error_summaries.append(error_summary)
-                print(f"  WARNING: Error Summary: {error_summary.name}")
-            else:
-                print(f"  OK: No execution errors found")
+        session_idx = _session_index(test_folder)
 
-            if not args.no_plots and PLOTTING_AVAILABLE:
-                try:
-                    heatmap_file = generate_heatmap(
-                        model_name, suite_name, data, model_output_dir
+        for model_name in models_to_process:
+            model_results_dir = current_results_dir / model_name
+            if not model_results_dir.is_dir():
+                print(f"Skipping {model_name}: no results under {model_results_dir}")
+                continue
+
+            # Output dir for this test folder and model
+            model_output_dir = output_root / model_name / test_folder
+            model_output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Discover topics (suites) under this test folder/model
+            topic_dirs = [
+                d for d in model_results_dir.iterdir()
+                if d.is_dir()
+            ]
+            topics = sorted(d.name for d in topic_dirs)
+            if not topics:
+                print(f"Skipping {model_name}: no topics under {model_results_dir}")
+                continue
+            print(f"Topics for {model_name}: {', '.join(topics)}")
+
+            # Ensure cross-session structure for this model
+            mtbs = model_topic_backend_sessions.setdefault(model_name, {})
+
+            for topic in topics:
+                topic_dir = model_results_dir / topic
+                # Build per-defense/per-backend metrics for this topic & session
+                data: Dict[str, Dict[str, MetricTuple]] = {}
+                for defense_type in UNIFIED_DEFENSE_TYPES:
+                    data[defense_type] = {}
+                    for backend in MEMORY_BACKENDS:
+                        if not is_valid_combination(backend, defense_type):
+                            continue
+                        comb_dir = topic_dir / backend / defense_type
+                        if not comb_dir.is_dir():
+                            data[defense_type][backend] = _default_metric_tuple()
+                            continue
+                        result_files = [
+                            p for p in comb_dir.glob("*.json")
+                            if TRAIN_STEM_MARKER not in p.stem
+                        ]
+                        if not result_files:
+                            data[defense_type][backend] = _default_metric_tuple()
+                            continue
+
+                        # Aggregate metrics over result files
+                        user_passed = user_total = attack_passed = attack_total = 0
+                        max_attack_passed = max_attack_total = 0
+                        has_execution_errors = False
+
+                        for result_file in result_files:
+                            result = parse_result_file(result_file)
+                            if not result:
+                                continue
+                            user_passed += result["user_passed"]
+                            user_total += result["user_total"]
+                            attack_passed += result["attack_passed"]
+                            attack_total += result["attack_total"]
+                            if result.get("execution_errors"):
+                                has_execution_errors = True
+                            # Max attack: count test case if any attack step passed
+                            if result["attack_total"] > 0:
+                                max_attack_total += 1
+                                if result["attack_passed"] >= 1:
+                                    max_attack_passed += 1
+
+                        user_rate = (user_passed / user_total * 100) if user_total > 0 else 0.0
+                        attack_rate = (attack_passed / attack_total * 100) if attack_total > 0 else 0.0
+                        metric_tuple: MetricTuple = (
+                            user_passed,
+                            user_total,
+                            user_rate,
+                            attack_passed,
+                            attack_total,
+                            attack_rate,
+                            max_attack_passed,
+                            max_attack_total,
+                            has_execution_errors,
+                        )
+                        data[defense_type][backend] = metric_tuple
+
+                # Write per-topic CSV and heatmap for this test folder
+                suite_label = f"{topic}_{test_folder}"
+                csv_file = generate_csv(model_name, suite_label, data, model_output_dir)
+                csv_files.append(csv_file)
+                print(f"  OK: CSV: {csv_file.relative_to(output_root)}")
+
+                if not args.no_plots and PLOTTING_AVAILABLE:
+                    try:
+                        heatmap_file = generate_heatmap(model_name, suite_label, data, model_output_dir)
+                        plot_files.append(heatmap_file)
+                        print(f"  OK: Heatmap: {heatmap_file.relative_to(output_root)}")
+                    except Exception as e:
+                        print(f"  WARNING: Error generating heatmap for {suite_label}: {e}")
+
+                # Update cross-session ASR aggregates: per topic, per backend
+                topic_backend_sessions = mtbs.setdefault(topic, {})
+                for backend in MEMORY_BACKENDS:
+                    # Aggregate attack_passed/attack_total across defenses for this backend
+                    total_attack_passed = 0
+                    total_attack_total = 0
+                    for defense_type in UNIFIED_DEFENSE_TYPES:
+                        if not is_valid_combination(backend, defense_type):
+                            continue
+                        mt = data.get(defense_type, {}).get(backend)
+                        if not mt:
+                            continue
+                        total_attack_passed += mt[3]  # attack_passed
+                        total_attack_total += mt[4]   # attack_total
+                    if total_attack_total == 0:
+                        continue
+                    backend_sessions = topic_backend_sessions.setdefault(backend, {})
+                    backend_sessions[session_idx] = (
+                        backend_sessions.get(session_idx, (0, 0))[0] + total_attack_passed,
+                        backend_sessions.get(session_idx, (0, 0))[1] + total_attack_total,
                     )
-                    plot_files.append(heatmap_file)
-                    print(f"  OK: Heatmap: {heatmap_file.name}")
-                except Exception as e:
-                    print(f"  WARNING: Error generating heatmap: {e}")
-                try:
-                    session_plot_files = generate_session_plots(
-                        model_name, suite_name, session_data, model_output_dir
-                    )
-                    for sp in session_plot_files:
-                        plot_files.append(sp)
-                    if session_plot_files:
-                        print(f"  OK: Session plots: {len(session_plot_files)} file(s)")
-                except Exception as e:
-                    print(f"  WARNING: Error generating session plots: {e}")
-            elif not args.no_plots:
-                print("  WARNING: Skipping plots (matplotlib/seaborn not installed)")
 
-        # Combined visualizations (one suite: still generate for consistency)
-        if not args.no_plots and PLOTTING_AVAILABLE:
-            print(f"\nGenerating combined visualizations for {model_name}...")
+    # Cross-session plots: per topic and averaged across topics, per model
+    if not args.no_plots and PLOTTING_AVAILABLE and model_topic_backend_sessions:
+        print(f"\n{'='*80}")
+        print("Generating cross-session ASR plots")
+        print(f"{'='*80}")
+        sessions_sorted = sorted({_session_index(name) for name in test_folders})
+
+        for model_name, topic_map in model_topic_backend_sessions.items():
+            model_output_dir = output_root / model_name
+            model_output_dir.mkdir(parents=True, exist_ok=True)
+
+            # 1) Per-topic plots
+            for topic, backend_map in topic_map.items():
+                # Skip if no data
+                if not backend_map:
+                    continue
+                try:
+                    import numpy as np  # already imported at top; ensure present
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    for backend in MEMORY_BACKENDS:
+                        if backend not in backend_map:
+                            continue
+                        passed_total_by_session = backend_map[backend]
+                        ys = []
+                        xs = []
+                        for s in sessions_sorted:
+                            if s not in passed_total_by_session:
+                                continue
+                            p, t = passed_total_by_session[s]
+                            if t > 0:
+                                xs.append(s)
+                                ys.append(p / t * 100.0)
+                        if xs:
+                            ax.plot(xs, ys, marker="o", label=backend)
+                    if ax.has_data():
+                        ax.set_xlabel("Session index")
+                        ax.set_ylabel("Attack success rate (%)")
+                        ax.set_title(f"{model_name} - {topic}: ASR vs. session")
+                        ax.set_ylim(-5, 105)
+                        ax.grid(True, alpha=0.3)
+                        ax.legend(fontsize=8)
+                        fig.tight_layout()
+                        out_path = model_output_dir / f"{topic}_sessions_asr.png"
+                        fig.savefig(out_path, dpi=300)
+                        plt.close(fig)
+                        plot_files.append(out_path)
+                        print(f"  OK: Session ASR plot (topic): {out_path.relative_to(output_root)}")
+                except Exception as e:
+                    print(f"  WARNING: Error generating per-topic session plot for {model_name}/{topic}: {e}")
+
+            # 2) Averaged across topics
+            # Aggregate passed/total across all topics for each backend/session
+            avg_backend_sessions: Dict[str, Dict[int, Tuple[int, int]]] = {}
+            for topic, backend_map in topic_map.items():
+                for backend, sess_map in backend_map.items():
+                    bmap = avg_backend_sessions.setdefault(backend, {})
+                    for s, (p, t) in sess_map.items():
+                        op, ot = bmap.get(s, (0, 0))
+                        bmap[s] = (op + p, ot + t)
             try:
-                combined_heatmap_file = generate_combined_heatmaps_subplot(
-                    model_name, all_suites_data, model_output_dir
-                )
-                plot_files.append(combined_heatmap_file)
-                print(f"  OK: Combined Heatmaps: {combined_heatmap_file.name}")
+                fig, ax = plt.subplots(figsize=(8, 5))
+                for backend in MEMORY_BACKENDS:
+                    if backend not in avg_backend_sessions:
+                        continue
+                    sess_map = avg_backend_sessions[backend]
+                    ys = []
+                    xs = []
+                    for s in sessions_sorted:
+                        if s not in sess_map:
+                            continue
+                        p, t = sess_map[s]
+                        if t > 0:
+                            xs.append(s)
+                            ys.append(p / t * 100.0)
+                    if xs:
+                        ax.plot(xs, ys, marker="o", label=backend)
+                if ax.has_data():
+                    ax.set_xlabel("Session index")
+                    ax.set_ylabel("Attack success rate (%)")
+                    ax.set_title(f"{model_name} - All topics: ASR vs. session")
+                    ax.set_ylim(-5, 105)
+                    ax.grid(True, alpha=0.3)
+                    ax.legend(fontsize=8)
+                    fig.tight_layout()
+                    out_path = model_output_dir / "all_topics_sessions_asr.png"
+                    fig.savefig(out_path, dpi=300)
+                    plt.close(fig)
+                    plot_files.append(out_path)
+                    print(f"  OK: Session ASR plot (all topics): {out_path.relative_to(output_root)}")
             except Exception as e:
-                print(f"  WARNING: Error generating combined visualizations: {e}")
-
-        # Load train results and generate test+train side-by-side heatmap
-        train_results_dir = results_base_dir.parent / "train"
-        all_suites_train_data: Dict[str, Dict[str, Dict[str, MetricTuple]]] = {}
-        if train_results_dir.exists():
-            train_suites = discover_suites_for_train(train_results_dir, model_name)
-            if train_suites:
-                for suite_name in train_suites:
-                    data, _, _ = collect_all_data(
-                        model_name, suite_name, train_results_dir, train_only=True
-                    )
-                    all_suites_train_data[suite_name] = data
-        if all_suites_train_data and not args.no_plots and PLOTTING_AVAILABLE:
-            try:
-                test_train_heatmap_file = generate_test_train_combined_heatmap(
-                    model_name, all_suites_data, all_suites_train_data, model_output_dir
-                )
-                plot_files.append(test_train_heatmap_file)
-                print(f"  OK: Test+Train Combined Heatmap: {test_train_heatmap_file.name}")
-            except Exception as e:
-                print(f"  WARNING: Error generating test+train combined heatmap: {e}")
-
-        # Combined and average CSV/heatmap
-        print(f"\nGenerating combined CSV files for {model_name}...")
-        try:
-            combined_csv_file = generate_combined_csv(
-                model_name, all_suites_data, model_output_dir
-            )
-            csv_files.append(combined_csv_file)
-            print(f"  OK: Combined CSV: {combined_csv_file.name}")
-
-            avg_csv_file = generate_average_summary_csv(
-                model_name, all_suites_data, model_output_dir
-            )
-            csv_files.append(avg_csv_file)
-            print(f"  OK: Average Summary CSV: {avg_csv_file.name}")
-
-            if not args.no_plots and PLOTTING_AVAILABLE:
-                try:
-                    avg_heatmap_file = generate_average_heatmap(
-                        model_name, all_suites_data, model_output_dir
-                    )
-                    plot_files.append(avg_heatmap_file)
-                    print(f"  OK: Average Heatmap: {avg_heatmap_file.name}")
-                except Exception as e:
-                    print(f"  WARNING: Error generating average heatmap: {e}")
-                try:
-                    avg_session_plot_files = generate_averaged_session_plots(
-                        model_name, all_suites_session_data, model_output_dir
-                    )
-                    for sp in avg_session_plot_files:
-                        plot_files.append(sp)
-                    if avg_session_plot_files:
-                        print(f"  OK: Averaged session plots (across topics): {len(avg_session_plot_files)} file(s)")
-                except Exception as e:
-                    print(f"  WARNING: Error generating averaged session plots: {e}")
-        except Exception as e:
-            print(f"  WARNING: Error generating combined CSV files: {e}")
+                print(f"  WARNING: Error generating averaged session plot for {model_name}: {e}")
 
     print(f"\n{'='*80}")
     print("Consolidation complete!")
     print(f"Generated {len(csv_files)} CSV file(s)")
-    if error_summaries:
-        print(f"\nWARNING: Generated {len(error_summaries)} error summary file(s)")
-        for ef in error_summaries:
-            print(f"   - {ef}")
-    else:
-        print("OK: No execution errors found")
     if not args.no_plots:
         print(f"Generated {len(plot_files)} plot file(s)")
-    print(f"Results saved to: {output_dir}")
+    print(f"Results saved to: {output_root}")
     print(f"{'='*80}\n")
     return 0
 

@@ -7,12 +7,18 @@ data/benchmark/attack_results/train/ and data/benchmark/attack_logs/train/ by de
 (train/test layout matches attack_bench). Includes only result files whose filename
 stem contains "train". Outputs go to data/benchmark/consolidated_train_results by default.
 
+Use --train-folder train_10 (or train_20, train_0, etc.) for train_N layout (model/topic/backend/defense);
+outputs go to data/benchmark/consolidated_<train-folder>_results and heatmaps show per-topic
+success rates.
+
 Discovers suites that have at least one train result file and generates CSVs/plots
 for those suites.
 
 Usage:
     python scripts/consolidate_train.py
-    python scripts/consolidate_train.py --results-dir data/benchmark/attack_results
+    python scripts/consolidate_train.py --train-folder train_10
+    python scripts/consolidate_train.py --train-folder train_20
+    python scripts/consolidate_train.py --results-dir data/benchmark/attack_results/train_20
     python scripts/consolidate_train.py --model gpt-4o-mini
     python scripts/consolidate_train.py --no-plots
 """
@@ -56,6 +62,12 @@ DEFAULT_RESULTS_DIR = Path("data/benchmark/attack_results/train")
 DEFAULT_LOGS_DIR = Path("data/benchmark/attack_logs/train")
 DEFAULT_OUTPUT_DIR = Path("data/benchmark/consolidated_train_results")
 
+# train_N paths (topic/suite is second level: model/topic/backend/defense/)
+# Used for train_10, train_20, train_0, etc. Base dirs are derived from --train-folder.
+ATTACK_RESULTS_BASE = Path("data/benchmark/attack_results")
+ATTACK_LOGS_BASE = Path("data/benchmark/attack_logs")
+CONSOLIDATED_BASE = Path("data/benchmark")
+
 # Data tuple: (user_passed, user_total, user_rate, attack_passed, attack_total, attack_rate,
 #              max_attack_passed, max_attack_total, has_execution_errors)
 # max_attack_*: count of test cases with >=1 attack success / count of test cases with attack steps
@@ -71,12 +83,15 @@ def get_attack_results_dir(
     unified_defense: str,
     results_base_dir: Path,
     suite_name: Optional[str] = None,
+    use_train_10_layout: bool = False,
 ) -> Path:
     """
     Get the results directory for attack benchmark.
-    Path structure: {results_base_dir}/{model_name}/{memory_backend}/{defense_type}/
-    With optional suite: {results_base_dir}/{model_name}/{memory_backend}/{defense_type}/{suite_name}/
+    Default path: {results_base_dir}/{model_name}/{memory_backend}/{defense_type}/ or +/{suite_name}/
+    train_10 layout: {results_base_dir}/{model_name}/{suite_name}/{memory_backend}/{defense_type}/
     """
+    if use_train_10_layout and suite_name:
+        return results_base_dir / model_name / suite_name / memory_backend / unified_defense
     p = results_base_dir / model_name / memory_backend / unified_defense
     if suite_name:
         p = p / suite_name
@@ -87,13 +102,20 @@ def get_attack_results_dir(
 TRAIN_STEM_MARKER = "train"
 
 
-def _iter_result_files_for_suite(results_dir: Path, suite_name: str):
+def _iter_result_files_for_suite(
+    results_dir: Path, suite_name: str, use_train_10_layout: bool = False
+):
     """
     Iterate over TRAIN result JSON files for a suite (stem must contain TRAIN_STEM_MARKER).
     Supports both:
     - New layout: result files in results_dir/suite_name/*.json
     - Legacy: result files directly in results_dir/*.json
+    - train_10 layout: results_dir is already model/suite/backend/defense, all *.json count
     """
+    if use_train_10_layout:
+        for p in results_dir.glob("*.json"):
+            yield p
+        return
     # New layout: defense/suite_name/*.json
     suite_dir = results_dir / suite_name
     if suite_dir.is_dir():
@@ -231,10 +253,11 @@ def collect_results_for_combination(
     model_name: str,
     suite_name: str,
     results_base_dir: Path,
+    use_train_10_layout: bool = False,
 ) -> Tuple[MetricTuple, SessionDataTuple, Tuple[int, int, float]]:
     """
     Collect user (utility), attack goal, and stealth goal statistics for a specific combination.
-    Only JSON files whose name contains the suite name are included.
+    Only JSON files whose name contains the suite name are included (or all *.json for train_10).
 
     Returns:
         (MetricTuple, SessionDataTuple, stealth_tuple)
@@ -244,14 +267,23 @@ def collect_results_for_combination(
         stealth_tuple: (stealth_passed, stealth_total, stealth_rate)
     """
     results_dir = get_attack_results_dir(
-        model_name, memory_backend, unified_defense, results_base_dir
+        model_name,
+        memory_backend,
+        unified_defense,
+        results_base_dir,
+        suite_name=suite_name if use_train_10_layout else None,
+        use_train_10_layout=use_train_10_layout,
     )
 
     default_session = [(0, 0)] * 5
     if not results_dir.exists():
         return ((0, 0, 0.0, 0, 0, 0.0, 0, 0, False), default_session, (0, 0, 0.0))
 
-    result_files = list(_iter_result_files_for_suite(results_dir, suite_name))
+    result_files = list(
+        _iter_result_files_for_suite(
+            results_dir, suite_name, use_train_10_layout=use_train_10_layout
+        )
+    )
 
     user_passed = user_total = attack_passed = attack_total = 0
     max_attack_passed = max_attack_total = 0
@@ -296,6 +328,17 @@ def collect_results_for_combination(
     return (metric_tuple, session_data, stealth_tuple)
 
 
+def discover_train_folders(attack_results_base: Path) -> List[str]:
+    """Discover train folder names under attack_results (e.g. train, train_0, train_10, train_20)."""
+    if not attack_results_base.exists():
+        return []
+    folders = sorted(
+        d.name for d in attack_results_base.iterdir()
+        if d.is_dir() and (d.name == "train" or d.name.startswith("train_"))
+    )
+    return folders
+
+
 def discover_models(results_base_dir: Path) -> List[str]:
     """Discover all models from the attack results directory structure."""
     models = []
@@ -307,11 +350,21 @@ def discover_models(results_base_dir: Path) -> List[str]:
     return sorted(models)
 
 
-def discover_suites(results_base_dir: Path, model_name: str) -> List[str]:
+def discover_suites(
+    results_base_dir: Path, model_name: str, use_train_10_layout: bool = False
+) -> List[str]:
     """
     Discover suite names that have at least one TRAIN result file under this model.
-    Returns only suites that have at least one result JSON file with TRAIN_STEM_MARKER in the stem.
+    Default: returns suites with result JSON files with TRAIN_STEM_MARKER in the stem.
+    train_10 layout: suites are direct subdirs of results_base_dir/model_name (topics).
     """
+    if use_train_10_layout:
+        model_dir = results_base_dir / model_name
+        if not model_dir.exists():
+            return []
+        return sorted(
+            d.name for d in model_dir.iterdir() if d.is_dir()
+        )
     suites = set()
     for defense_type in UNIFIED_DEFENSE_TYPES:
         for backend in MEMORY_BACKENDS:
@@ -347,6 +400,7 @@ def collect_all_data(
     model_name: str,
     suite_name: str,
     results_base_dir: Path,
+    use_train_10_layout: bool = False,
 ) -> Tuple[Dict[str, Dict[str, MetricTuple]], Dict[str, Dict[str, SessionDataTuple]], Dict[str, Dict[str, StealthTuple]]]:
     """
     Collect all data for a model and suite.
@@ -366,7 +420,12 @@ def collect_all_data(
             if not is_valid_combination(backend, defense_type):
                 continue
             metric_tuple, sess, stealth_tuple = collect_results_for_combination(
-                backend, defense_type, model_name, suite_name, results_base_dir
+                backend,
+                defense_type,
+                model_name,
+                suite_name,
+                results_base_dir,
+                use_train_10_layout=use_train_10_layout,
             )
             data[defense_type][backend] = metric_tuple
             session_data[defense_type][backend] = sess
@@ -799,6 +858,7 @@ def generate_error_summary(
     results_base_dir: Path,
     logs_base_dir: Path,
     output_dir: Path,
+    use_train_10_layout: bool = False,
 ) -> Optional[Path]:
     """
     Generate an error summary file for execution errors.
@@ -811,9 +871,16 @@ def generate_error_summary(
             if not is_valid_combination(memory_backend, unified_defense):
                 continue
             results_dir = get_attack_results_dir(
-                model_name, memory_backend, unified_defense, results_base_dir
+                model_name,
+                memory_backend,
+                unified_defense,
+                results_base_dir,
+                suite_name=suite_name if use_train_10_layout else None,
+                use_train_10_layout=use_train_10_layout,
             )
-            for result_file in _iter_result_files_for_suite(results_dir, suite_name):
+            for result_file in _iter_result_files_for_suite(
+                results_dir, suite_name, use_train_10_layout=use_train_10_layout
+            ):
                 result_data = parse_result_file(result_file)
                 if result_data and not result_data.get("execution_success", True):
                     errors_found.append({
@@ -824,14 +891,26 @@ def generate_error_summary(
                         "errors": result_data.get("execution_errors", []),
                     })
 
-            log_path = get_combination_log_path(
-                memory_backend=memory_backend,
-                unified_defense=unified_defense,
-                model_name=model_name,
-                attack_type=suite_name,
-                logs_base_dir=logs_base_dir,
-            )
-            log_data = parse_log_file(log_path)
+            if use_train_10_layout:
+                log_dir = logs_base_dir / model_name / suite_name / memory_backend / unified_defense
+                if log_dir.exists():
+                    log_path = next(
+                        (f for f in sorted(log_dir.iterdir()) if f.suffix == ".log"),
+                        None,
+                    )
+                else:
+                    log_path = None
+                if log_path is None:
+                    log_path = Path("/nonexistent")
+            else:
+                log_path = get_combination_log_path(
+                    memory_backend=memory_backend,
+                    unified_defense=unified_defense,
+                    model_name=model_name,
+                    attack_type=suite_name,
+                    logs_base_dir=logs_base_dir,
+                )
+            log_data = parse_log_file(log_path) if log_path else None
             if log_data and log_data.get("has_errors"):
                 errors_found.append({
                     "type": "log_file",
@@ -880,22 +959,28 @@ def main() -> int:
         description="Consolidate attack benchmark TRAIN results into CSV files and visualizations"
     )
     parser.add_argument(
+        "--train-folder",
+        type=str,
+        default=None,
+        help="Train folder to consolidate (e.g. train, train_0, train_10, train_20). If not set, discover and process all train* folders under attack_results.",
+    )
+    parser.add_argument(
         "--results-dir",
         type=str,
-        default=str(DEFAULT_RESULTS_DIR),
-        help="Base directory for attack results",
+        default=None,
+        help="Base directory for attack results (default: attack_results/<train-folder>)",
     )
     parser.add_argument(
         "--logs-dir",
         type=str,
-        default=str(DEFAULT_LOGS_DIR),
-        help="Base directory for attack logs",
+        default=None,
+        help="Base directory for attack logs (default: attack_logs/<train-folder>)",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default=str(DEFAULT_OUTPUT_DIR),
-        help="Output directory for consolidated files",
+        default=None,
+        help="Output directory for consolidated files (default: consolidated_<train-folder>_results)",
     )
     parser.add_argument(
         "--model",
@@ -909,123 +994,177 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    results_base_dir = Path(args.results_dir)
-    logs_base_dir = Path(args.logs_dir)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Determine which train folder(s) to process
+    if args.train_folder is not None:
+        train_folders = [args.train_folder]
+    else:
+        train_folders = discover_train_folders(ATTACK_RESULTS_BASE)
+        if not train_folders:
+            print("WARNING: No train folders found under data/benchmark/attack_results")
+            return 1
+        print(f"Discovered train folders: {', '.join(train_folders)}\n")
 
-    all_models = discover_models(results_base_dir)
-    if not all_models:
-        print(f"WARNING: No models found in {results_base_dir}")
-        return 1
+    all_csv_files = []
+    all_plot_files = []
+    all_error_summaries = []
 
-    models_to_process = [args.model] if args.model else all_models
-
-    print(f"\n{'='*80}")
-    print("Consolidating Train Results")
-    print(f"{'='*80}")
-    print(f"Models: {', '.join(models_to_process)}")
-    print(f"Results: {results_base_dir}")
-    print(f"Logs: {logs_base_dir}")
-    print(f"Output: {output_dir}")
-    print(f"{'='*80}\n")
-
-    csv_files = []
-    plot_files = []
-    error_summaries = []
-
-    for model_name in models_to_process:
-        suites_to_process = discover_suites(results_base_dir, model_name)
-        if not suites_to_process:
-            print(f"Skipping {model_name}: no train suites found in results")
-            continue
-        model_output_dir = output_dir / model_name
-        model_output_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Suites for {model_name}: {', '.join(suites_to_process)}")
-        all_suites_data = {}
-
-        for suite_name in suites_to_process:
-            print(f"Processing: {model_name} / {suite_name}")
-
-            data, session_data, data_stealth = collect_all_data(model_name, suite_name, results_base_dir)
-            all_suites_data[suite_name] = data
-
-            csv_file = generate_csv(model_name, suite_name, data, model_output_dir, data_stealth=data_stealth)
-            csv_files.append(csv_file)
-            print(f"  OK: CSV: {csv_file.name}")
-
-            error_summary = generate_error_summary(
-                model_name, suite_name, results_base_dir, logs_base_dir, model_output_dir
-            )
-            if error_summary:
-                error_summaries.append(error_summary)
-                print(f"  WARNING: Error Summary: {error_summary.name}")
+    for train_folder in train_folders:
+        # Any train_N (train_10, train_20, train_0, ...) uses topic-under-model layout; plain "train" uses default layout.
+        use_train_10_layout = train_folder != "train"
+        if args.results_dir is None:
+            results_base_dir = ATTACK_RESULTS_BASE / train_folder if use_train_10_layout else DEFAULT_RESULTS_DIR
+        else:
+            results_base_dir = Path(args.results_dir)
+        if args.logs_dir is None:
+            logs_base_dir = ATTACK_LOGS_BASE / train_folder if use_train_10_layout else DEFAULT_LOGS_DIR
+        else:
+            logs_base_dir = Path(args.logs_dir)
+        if args.output_dir is None:
+            # When processing all folders, put each under consolidated_train_results/<folder>/
+            if len(train_folders) > 1:
+                output_dir = CONSOLIDATED_BASE / "consolidated_train_results" / train_folder
             else:
-                print(f"  OK: No execution errors found")
+                output_dir = CONSOLIDATED_BASE / f"consolidated_{train_folder}_results" if use_train_10_layout else DEFAULT_OUTPUT_DIR
+        else:
+            output_dir = Path(args.output_dir)
 
-            if not args.no_plots and PLOTTING_AVAILABLE:
-                try:
-                    heatmap_file = generate_heatmap(
-                        model_name, suite_name, data, model_output_dir
-                    )
-                    plot_files.append(heatmap_file)
-                    print(f"  OK: Heatmap: {heatmap_file.name}")
-                except Exception as e:
-                    print(f"  WARNING: Error generating heatmap: {e}")
-            elif not args.no_plots:
-                print("  WARNING: Skipping plots (matplotlib/seaborn not installed)")
+        if not results_base_dir.exists():
+            print(f"Skipping {train_folder}: results dir does not exist: {results_base_dir}")
+            continue
 
-        # Combined visualizations (one suite: still generate for consistency)
-        if not args.no_plots and PLOTTING_AVAILABLE:
-            print(f"\nGenerating combined visualizations for {model_name}...")
-            try:
-                combined_heatmap_file = generate_combined_heatmaps_subplot(
-                    model_name, all_suites_data, model_output_dir
+        all_models = discover_models(results_base_dir)
+        if not all_models:
+            print(f"Skipping {train_folder}: no models found in {results_base_dir}")
+            continue
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        models_to_process = [args.model] if args.model else all_models
+
+        print(f"\n{'='*80}")
+        print(f"Consolidating Train Results [{train_folder}]")
+        print(f"{'='*80}")
+        print(f"Models: {', '.join(models_to_process)}")
+        print(f"Results: {results_base_dir}")
+        print(f"Logs: {logs_base_dir}")
+        print(f"Output: {output_dir}")
+        print(f"{'='*80}\n")
+
+        csv_files = []
+        plot_files = []
+        error_summaries = []
+
+        for model_name in models_to_process:
+            suites_to_process = discover_suites(
+                results_base_dir, model_name, use_train_10_layout=use_train_10_layout
+            )
+            if not suites_to_process:
+                print(f"Skipping {model_name}: no train suites found in results")
+                continue
+            model_output_dir = output_dir / model_name
+            model_output_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Suites for {model_name}: {', '.join(suites_to_process)}")
+            all_suites_data = {}
+
+            for suite_name in suites_to_process:
+                print(f"Processing: {model_name} / {suite_name}")
+
+                data, session_data, data_stealth = collect_all_data(
+                    model_name,
+                    suite_name,
+                    results_base_dir,
+                    use_train_10_layout=use_train_10_layout,
                 )
-                plot_files.append(combined_heatmap_file)
-                print(f"  OK: Combined Heatmaps: {combined_heatmap_file.name}")
-            except Exception as e:
-                print(f"  WARNING: Error generating combined visualizations: {e}")
+                all_suites_data[suite_name] = data
 
-        # Combined and average CSV/heatmap
-        print(f"\nGenerating combined CSV files for {model_name}...")
-        try:
-            combined_csv_file = generate_combined_csv(
-                model_name, all_suites_data, model_output_dir
-            )
-            csv_files.append(combined_csv_file)
-            print(f"  OK: Combined CSV: {combined_csv_file.name}")
+                csv_file = generate_csv(model_name, suite_name, data, model_output_dir, data_stealth=data_stealth)
+                csv_files.append(csv_file)
+                print(f"  OK: CSV: {csv_file.name}")
 
-            avg_csv_file = generate_average_summary_csv(
-                model_name, all_suites_data, model_output_dir
-            )
-            csv_files.append(avg_csv_file)
-            print(f"  OK: Average Summary CSV: {avg_csv_file.name}")
+                error_summary = generate_error_summary(
+                    model_name,
+                    suite_name,
+                    results_base_dir,
+                    logs_base_dir,
+                    model_output_dir,
+                    use_train_10_layout=use_train_10_layout,
+                )
+                if error_summary:
+                    error_summaries.append(error_summary)
+                    print(f"  WARNING: Error Summary: {error_summary.name}")
+                else:
+                    print(f"  OK: No execution errors found")
 
+                if not args.no_plots and PLOTTING_AVAILABLE:
+                    try:
+                        heatmap_file = generate_heatmap(
+                            model_name, suite_name, data, model_output_dir
+                        )
+                        plot_files.append(heatmap_file)
+                        print(f"  OK: Heatmap: {heatmap_file.name}")
+                    except Exception as e:
+                        print(f"  WARNING: Error generating heatmap: {e}")
+                elif not args.no_plots:
+                    print("  WARNING: Skipping plots (matplotlib/seaborn not installed)")
+
+            # Combined visualizations (one suite: still generate for consistency)
             if not args.no_plots and PLOTTING_AVAILABLE:
+                print(f"\nGenerating combined visualizations for {model_name}...")
                 try:
-                    avg_heatmap_file = generate_average_heatmap(
+                    combined_heatmap_file = generate_combined_heatmaps_subplot(
                         model_name, all_suites_data, model_output_dir
                     )
-                    plot_files.append(avg_heatmap_file)
-                    print(f"  OK: Average Heatmap: {avg_heatmap_file.name}")
+                    plot_files.append(combined_heatmap_file)
+                    print(f"  OK: Combined Heatmaps: {combined_heatmap_file.name}")
                 except Exception as e:
-                    print(f"  WARNING: Error generating average heatmap: {e}")
-        except Exception as e:
-            print(f"  WARNING: Error generating combined CSV files: {e}")
+                    print(f"  WARNING: Error generating combined visualizations: {e}")
+
+            # Combined and average CSV/heatmap
+            print(f"\nGenerating combined CSV files for {model_name}...")
+            try:
+                combined_csv_file = generate_combined_csv(
+                    model_name, all_suites_data, model_output_dir
+                )
+                csv_files.append(combined_csv_file)
+                print(f"  OK: Combined CSV: {combined_csv_file.name}")
+
+                avg_csv_file = generate_average_summary_csv(
+                    model_name, all_suites_data, model_output_dir
+                )
+                csv_files.append(avg_csv_file)
+                print(f"  OK: Average Summary CSV: {avg_csv_file.name}")
+
+                if not args.no_plots and PLOTTING_AVAILABLE:
+                    try:
+                        avg_heatmap_file = generate_average_heatmap(
+                            model_name, all_suites_data, model_output_dir
+                        )
+                        plot_files.append(avg_heatmap_file)
+                        print(f"  OK: Average Heatmap: {avg_heatmap_file.name}")
+                    except Exception as e:
+                        print(f"  WARNING: Error generating average heatmap: {e}")
+            except Exception as e:
+                print(f"  WARNING: Error generating combined CSV files: {e}")
+
+        all_csv_files.extend(csv_files)
+        all_plot_files.extend(plot_files)
+        all_error_summaries.extend(error_summaries)
+        print(f"  [{train_folder}] Done: {len(csv_files)} CSV(s), {len(plot_files)} plot(s) -> {output_dir}")
 
     print(f"\n{'='*80}")
     print("Consolidation complete!")
-    print(f"Generated {len(csv_files)} CSV file(s)")
-    if error_summaries:
-        print(f"\nWARNING: Generated {len(error_summaries)} error summary file(s)")
-        for ef in error_summaries:
+    print(f"Generated {len(all_csv_files)} CSV file(s)")
+    if all_error_summaries:
+        print(f"\nWARNING: Generated {len(all_error_summaries)} error summary file(s)")
+        for ef in all_error_summaries:
             print(f"   - {ef}")
     else:
         print("OK: No execution errors found")
     if not args.no_plots:
-        print(f"Generated {len(plot_files)} plot file(s)")
-    print(f"Results saved to: {output_dir}")
+        print(f"Generated {len(all_plot_files)} plot file(s)")
+    if len(train_folders) > 1:
+        print(f"Results saved under: {CONSOLIDATED_BASE / 'consolidated_train_results'} ({', '.join(train_folders)})")
+    else:
+        print(f"Results saved to: {output_dir}")
     print(f"{'='*80}\n")
     return 0
 

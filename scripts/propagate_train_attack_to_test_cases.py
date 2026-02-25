@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
 """
-Propagate attack email into test cases: use cached train for (backend, defense) if successful,
-else cached train for (backend, none), else original train file. Writes chosen attack into
-attack_bench/test/{backend}/{suite}/*.json.
+Propagate attack email into test cases. For each (topic, backend, defense) in test*:
+  attack = cache(same backend, same defense) else cache(same backend, none) else original train file.
+Writes chosen attack into attack_bench/test*/<topic>/<backend>/<defense>/*.json.
 
-Cache layout: train_cache/{backend}/{defense}/{suite}/00_*_train.json (one per defense).
-
-Workflow:
-1. Generate cases; run adaptive on train for each (backend, defense). Cache is per defense.
-2. Run this script with --defense D (or default: none). For each (backend, suite), attack =
-   cache(backend, D) else cache(backend, none) else original train file. Copies into test cases.
-3. Run run_benchmark.py on attack_bench/test/... for the desired defenses.
+Cache layout: train_cache/<model>/<topic>/<backend>/<defense>/... or train_cache_10/<topic>/<backend>/<defense>/...
 
 Usage:
-    python scripts/propagate_train_attack_to_test_cases.py --defense none
-    python scripts/propagate_train_attack_to_test_cases.py --defense user_prompt_only --dry-run
-    python scripts/propagate_train_attack_to_test_cases.py --defense none --stealth   # prefer _stealth cache if present
+    python scripts/propagate_train_attack_to_test_cases.py --model gemini-3.1-pro-preview
+    python scripts/propagate_train_attack_to_test_cases.py --model gemini-3.1-pro-preview --stealth
 """
 
 import argparse
@@ -27,7 +20,7 @@ from typing import List, Optional, Tuple
 # Project root
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Default paths (attack_bench contains train/, test/, train_cache/)
+# Default paths (attack_bench contains train/, test*, train_cache/)
 DEFAULT_ATTACK_BENCH = BASE_DIR / "data" / "benchmark" / "attack_bench"
 DEFAULT_CACHE_DIR = BASE_DIR / "data" / "benchmark" / "attack_bench" / "train_cache"
 
@@ -63,51 +56,109 @@ def propagate_attack_to_file(test_case_path: Path, attack_email: dict) -> bool:
     return updated
 
 
-def discover_suites(attack_bench_base: Path) -> List[Tuple[str, Path]]:
-    """Discover (backend, test_suite_dir) for each suite under attack_bench/test/<backend>/<suite>/."""
-    suites = []
-    test_base = attack_bench_base / "test"
-    if not test_base.exists():
-        return suites
-    for backend_dir in test_base.iterdir():
-        if not backend_dir.is_dir():
+def _discover_combinations_in_split(
+    attack_bench_base: Path, split_name: str
+) -> List[Tuple[str, str, str, Path]]:
+    """
+    Discover (topic, backend, defense, dir) for each combination under
+    attack_bench/<split>/<topic>/<backend>/<defense>/.
+    """
+    combos: List[Tuple[str, str, str, Path]] = []
+    base = attack_bench_base / split_name
+    if not base.exists():
+        return combos
+    for topic_dir in base.iterdir():
+        if not topic_dir.is_dir():
             continue
-        for suite_dir in backend_dir.iterdir():
-            if suite_dir.is_dir() and any(suite_dir.glob("*.json")):
-                suites.append((backend_dir.name, suite_dir))
-    return suites
+        topic = topic_dir.name
+        for backend_dir in topic_dir.iterdir():
+            if not backend_dir.is_dir():
+                continue
+            backend = backend_dir.name
+            for defense_dir in backend_dir.iterdir():
+                if not defense_dir.is_dir():
+                    continue
+                defense = defense_dir.name
+                if any(defense_dir.glob("*.json")):
+                    combos.append((topic, backend, defense, defense_dir))
+    return combos
 
 
-def find_cached_train_file(cache_base: Path, backend: str, defense: str, suite_name: str) -> Optional[Path]:
-    """Return path to the cached train file for this backend/defense/suite, or None. Cache layout: train_cache/<backend>/<defense>/<suite>/."""
-    cache_suite_dir = cache_base / backend / defense / suite_name
+def _split_from_defense_dir(defense_dir: Path, attack_bench_base: Path) -> str:
+    """Return test split name from defense_dir path, e.g. test_10 or test."""
+    try:
+        rel = defense_dir.relative_to(attack_bench_base)
+        parts = rel.parts
+        if parts:
+            return parts[0]
+    except ValueError:
+        pass
+    return "test"
+
+
+def _train_split_and_cache_dir(test_split: str) -> Tuple[str, str]:
+    """Return (train_split, cache_dir_name) for a test split. test_10 -> (train_10, train_cache_10)."""
+    if test_split != "test" and test_split.startswith("test_"):
+        suffix = test_split[4:]  # "test_10" -> "_10", "test_4" -> "_4"
+        return f"train{suffix}", f"train_cache{suffix}"
+    return "train", "train_cache"
+
+
+def find_cached_train_file(
+    cache_base: Path, model: str, topic: str, backend: str, defense: str,
+    layout_without_model: bool = False,
+) -> Optional[Path]:
+    """Return path to the cached train file, or None.
+    If layout_without_model=True (train_cache_10 style): cache_base/<topic>/<backend>/<defense>/*.json.
+    Else (train_cache style): cache_base/<model>/<topic>/<backend>/<defense>/*.json.
+    """
+    if layout_without_model:
+        cache_suite_dir = cache_base / topic / backend / defense
+    else:
+        cache_suite_dir = cache_base / model / topic / backend / defense
     if not cache_suite_dir.exists():
         return None
     for p in cache_suite_dir.glob("*.json"):
-        if TRAIN_STEM_MARKER in p.stem:
+        if "_stealth" in p.stem:
+            continue
+        if TRAIN_STEM_MARKER in p.stem or layout_without_model:
             return p
     return None
 
 
-def find_cached_train_file_stealth(cache_base: Path, backend: str, defense: str, suite_name: str) -> Optional[Path]:
-    """Return path to the cached train file with _stealth (saved when adaptive --stealth achieved both attack and stealth). Same layout as find_cached_train_file."""
-    cache_suite_dir = cache_base / backend / defense / suite_name
+def find_cached_train_file_stealth(
+    cache_base: Path, model: str, topic: str, backend: str, defense: str,
+    layout_without_model: bool = False,
+) -> Optional[Path]:
+    """Return path to the cached train file with _stealth (saved when adaptive --stealth achieved both attack and stealth)."""
+    if layout_without_model:
+        cache_suite_dir = cache_base / topic / backend / defense
+    else:
+        cache_suite_dir = cache_base / model / topic / backend / defense
     if not cache_suite_dir.exists():
         return None
     for p in cache_suite_dir.glob("*.json"):
-        if TRAIN_STEM_MARKER in p.stem and "_stealth" in p.stem:
+        if "_stealth" not in p.stem:
+            continue
+        if TRAIN_STEM_MARKER in p.stem or layout_without_model:
             return p
     return None
 
 
-def find_train_file_in_bench(attack_bench_base: Path, backend: str, suite_name: str) -> Optional[Path]:
-    """Return path to the train file in attack_bench/train/<backend>/<suite>/, or None."""
-    train_suite_dir = attack_bench_base / "train" / backend / suite_name
+def find_train_file_in_bench(
+    attack_bench_base: Path, topic: str, backend: str, defense: str,
+    train_split: str = "train",
+) -> Optional[Path]:
+    """Return path to the train file in attack_bench/<train_split>/<topic>/<backend>/<defense>/, or None."""
+    train_suite_dir = attack_bench_base / train_split / topic / backend / defense
     if not train_suite_dir.exists():
         return None
     for p in train_suite_dir.glob("*.json"):
         if TRAIN_STEM_MARKER in p.stem:
             return p
+    # Persistence train files are named 01.json, not *_train.json; accept any json as train for that dir
+    for p in train_suite_dir.glob("*.json"):
+        return p
     return None
 
 
@@ -126,30 +177,51 @@ def get_attack_email_from_file(json_path: Path) -> Optional[dict]:
 def run(
     attack_bench_base: Path,
     cache_base: Path,
-    defense: str,
-    dry_run: bool = False,
+    model: str,
     stealth: bool = False,
 ) -> int:
-    """For each (backend, suite): use attack from cache(backend, defense) else cache(backend, none) else original train file; write into test cases. If stealth=True, prefer _stealth cache first."""
+    """
+    For each (topic, backend, defense): use attack from cache(same defense) else cache(none)
+    else original train file; write into test cases. Fallback to defense=none is automatic.
+    If stealth=True, prefer _stealth cache first.
+    """
     updated_count = 0
     skipped_no_attack = []
     skipped_no_test_files = []
 
-    for backend, suite_dir in discover_suites(attack_bench_base):
-        suite_name = suite_dir.name
+    # Discover (topic, backend, defense) under all test* subfolders (e.g., test, test_10, ...)
+    combo_dirs: List[Tuple[str, str, str, Path]] = []
+    for split_dir in sorted(d for d in attack_bench_base.iterdir() if d.is_dir() and d.name.startswith("test")):
+        combo_dirs.extend(_discover_combinations_in_split(attack_bench_base, split_dir.name))
+
+    for topic, backend, defense, defense_dir in combo_dirs:
+        suite_name = topic
         attack_email = None
         source_label = None
 
+        # Per-split cache and train: test_10 -> train_cache_10 + train_10 (no model in path)
+        test_split = _split_from_defense_dir(defense_dir, attack_bench_base)
+        train_split, cache_dir_name = _train_split_and_cache_dir(test_split)
+        if cache_dir_name == "train_cache":
+            split_cache_base = cache_base  # use --cache-dir (default attack_bench/train_cache)
+        else:
+            split_cache_base = attack_bench_base / cache_dir_name  # e.g. attack_bench/train_cache_10
+        layout_without_model = cache_dir_name != "train_cache"
+
         if stealth:
             # 1a) Prefer stealth cache for this defense
-            cached_stealth = find_cached_train_file_stealth(cache_base, backend, defense, suite_name)
+            cached_stealth = find_cached_train_file_stealth(
+                split_cache_base, model, topic, backend, defense, layout_without_model=layout_without_model
+            )
             if cached_stealth:
                 attack_email = get_attack_email_from_cached(cached_stealth)
                 if attack_email:
                     source_label = f"cached (stealth) {backend}/{defense}/{suite_name}"
             # 1b) Fallback: stealth cache for defense=none
             if not attack_email and defense != "none":
-                cached_stealth_none = find_cached_train_file_stealth(cache_base, backend, "none", suite_name)
+                cached_stealth_none = find_cached_train_file_stealth(
+                    split_cache_base, model, topic, backend, "none", layout_without_model=layout_without_model
+                )
                 if cached_stealth_none:
                     attack_email = get_attack_email_from_cached(cached_stealth_none)
                     if attack_email:
@@ -157,21 +229,27 @@ def run(
 
         # 2) Normal cache for this defense (or first step when not stealth)
         if not attack_email:
-            cached_train = find_cached_train_file(cache_base, backend, defense, suite_name)
+            cached_train = find_cached_train_file(
+                split_cache_base, model, topic, backend, defense, layout_without_model=layout_without_model
+            )
             if cached_train:
                 attack_email = get_attack_email_from_cached(cached_train)
                 if attack_email:
                     source_label = source_label or f"cached {backend}/{defense}/{suite_name}"
         # 3) Fallback: cache for defense=none (unless we already used it)
         if not attack_email and defense != "none":
-            cached_none = find_cached_train_file(cache_base, backend, "none", suite_name)
+            cached_none = find_cached_train_file(
+                split_cache_base, model, topic, backend, "none", layout_without_model=layout_without_model
+            )
             if cached_none:
                 attack_email = get_attack_email_from_cached(cached_none)
                 if attack_email:
                     source_label = source_label or f"cached {backend}/none/{suite_name} (fallback)"
-        # 4) Fallback: original train file
+        # 4) Fallback: original train file from same split (train_10 for test_10, train for test)
         if not attack_email:
-            bench_train = find_train_file_in_bench(attack_bench_base, backend, suite_name)
+            bench_train = find_train_file_in_bench(
+                attack_bench_base, topic, backend, defense, train_split=train_split
+            )
             if bench_train:
                 attack_email = get_attack_email_from_file(bench_train)
                 if attack_email:
@@ -187,23 +265,17 @@ def run(
             skipped_no_attack.append(f"{backend}/{suite_name}")
             continue
 
-        test_files = [
-            p for p in suite_dir.glob("*.json")
-            if TRAIN_STEM_MARKER not in p.stem
-        ]
+        test_files = [p for p in defense_dir.glob("*.json") if TRAIN_STEM_MARKER not in p.stem]
         if not test_files:
             skipped_no_test_files.append(f"{backend}/{suite_name}")
             continue
 
-        print(f"  {backend}/{suite_name}: {source_label} → {len(test_files)} test file(s)")
+        split_label = f" [{test_split}]" if test_split != "test" else ""
+        print(f"  {topic}/{backend}/{defense}{split_label}: {source_label} → {len(test_files)} test file(s)")
         for test_path in sorted(test_files):
-            if dry_run:
-                print(f"    [dry-run] would update {test_path.name}")
+            if propagate_attack_to_file(test_path, attack_email):
+                print(f"    updated {test_path.name}")
                 updated_count += 1
-            else:
-                if propagate_attack_to_file(test_path, attack_email):
-                    print(f"    updated {test_path.name}")
-                    updated_count += 1
 
     if skipped_no_attack:
         print(f"\nSkipped (no attack source): {', '.join(skipped_no_attack)}")
@@ -215,13 +287,13 @@ def run(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Copy attack email into test cases: cache(defense) else cache(none) else original train."
+        description="Copy attack email into test cases: for each (backend, defense), use cache(same defense) else cache(none) else original train."
     )
     parser.add_argument(
-        "--defense",
+        "--model",
         type=str,
-        default="none",
-        help="Defense type for which to choose attack (default: none). Fallback: cache(none) then original.",
+        required=True,
+        help="Model name whose train_cache should be used (e.g. gemini-3.1-pro-preview).",
     )
     parser.add_argument(
         "--attack-bench",
@@ -236,11 +308,6 @@ def main() -> int:
         help="Base directory for train cache (default: data/benchmark/attack_bench/train_cache)",
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Only print what would be updated, do not write files",
-    )
-    parser.add_argument(
         "--stealth",
         action="store_true",
         help="Prefer attack from cached _stealth file (from adaptive --stealth run). If not found, fall back to normal cache then original train.",
@@ -251,13 +318,16 @@ def main() -> int:
     cache_base = args.cache_dir.resolve()
     print(f"Attack bench: {attack_bench_base}")
     print(f"Cache dir:    {cache_base}")
-    print(f"Defense:     {args.defense} (fallback: cache(none) then original train)")
+    print(f"Model:       {args.model}")
     if args.stealth:
         print("Stealth:     enabled (prefer _stealth cache)")
-    if args.dry_run:
-        print("Dry run: yes")
     print()
-    return run(attack_bench_base, cache_base, defense=args.defense, dry_run=args.dry_run, stealth=args.stealth)
+    return run(
+        attack_bench_base,
+        cache_base,
+        model=args.model,
+        stealth=args.stealth,
+    )
 
 
 if __name__ == "__main__":

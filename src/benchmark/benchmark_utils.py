@@ -36,11 +36,14 @@ MEMORY_BACKENDS = ["none", "explicit", "mem0", "rag", "context"]
 def is_valid_combination(memory_backend: str, unified_defense: str) -> bool:
     """
     Check if a memory backend and defense type combination is valid.
-    
-    Invalid combinations:
+    This is the single source of truth: run_benchmark and all consolidate/CI
+    scripts use it so invalid combinations are never run and are reflected as
+    skipped or "-" in logs, results, and CSVs.
+
+    Invalid combinations (skipped by design):
     - context + limit_memory_length (not applicable for context backend)
     - explicit + user_prompt_only (not applicable for explicit backend)
-    
+
     Args:
         memory_backend: Memory backend name
         unified_defense: Unified defense name
@@ -106,40 +109,77 @@ ATTACK_BENCH_TRAIN_CACHE = "train_cache"
 
 def get_attack_bench_train_or_test(test_file: Path) -> str:
     """
-    Return "train" or "test" based on whether the test file is under attack_bench/train/ or attack_bench/test/.
-    Used to place results and logs under attack_results/train|test/ and attack_logs/train|test/.
-    Defaults to "test" if path does not contain train (e.g. legacy or unknown).
+    Return "train", "train_N", "test", or "test_N" (e.g. "train_10", "test_4") based on test file path.
+    Used to place results and logs under attack_results/<train|train_10|test|test_4>/ and attack_logs/...
+    Check train_N and test_N before plain "train"/"test" so paths like attack_bench/train_10/ get their own folder.
     """
     path_str = str(test_file.resolve())
+    parts = Path(path_str).parts
+    if "attack_bench" in parts:
+        idx = parts.index("attack_bench")
+        if idx + 1 < len(parts):
+            split = parts[idx + 1]
+            if split.startswith("train_"):
+                return split  # train_10, train_2, etc.
+            if split == "train":
+                return "train"
+            if split.startswith("test_"):
+                return split  # test_4, test_10, etc.
+            if split == "test":
+                return "test"
+    # Fallback: substring checks for path_str (e.g. Windows or odd paths)
+    if "/attack_bench/train_" in path_str or "\\attack_bench\\train_" in path_str:
+        for p in parts:
+            if p.startswith("train_") and p[6:].isdigit():
+                return p
     if "/attack_bench/train/" in path_str or "\\attack_bench\\train\\" in path_str:
         return "train"
+    # test_4, test_8, etc. must be checked before plain "test" (otherwise test_4 would match "test")
+    if "/attack_bench/test_" in path_str or "\\attack_bench\\test_" in path_str:
+        # Extract folder name: .../attack_bench/test_4/... -> test_4
+        parts = Path(path_str).parts
+        if "attack_bench" in parts:
+            idx = parts.index("attack_bench")
+            if idx + 1 < len(parts) and parts[idx + 1].startswith("test_"):
+                return parts[idx + 1]
     if "/attack_bench/test/" in path_str or "\\attack_bench\\test\\" in path_str:
         return "test"
     return "test"
 
 
+def get_attack_bench_cache_dir_name(split: str) -> str:
+    """
+    Return cache folder name for a train split: train -> train_cache, train_10 -> train_cache_10.
+    Used so train_10 writes to attack_bench/train_cache_10/ with same layout as train_cache/.
+    """
+    if split == "train":
+        return "train_cache"
+    if split.startswith("train_"):
+        return "train_cache_" + split[6:]  # train_10 -> train_cache_10
+    # For test splits we look up in corresponding train cache (test_10 -> train_cache_10)
+    if split == "test":
+        return "train_cache"
+    if split.startswith("test_"):
+        return "train_cache_" + split[5:]  # test_10 -> train_cache_10
+    return "train_cache"
+
+
 def get_attack_bench_suite_subfolder(test_file: Path) -> Optional[str]:
     """
-    If the test file lives under attack_bench/.../<suite>/file.json, return <suite> (the test case suite name).
-    Supports:
-      - attack_bench/<backend>/<suite>/file.json (legacy flat)
-      - attack_bench/<train|test>/<backend>/<suite>/file.json (new layout)
-    Returns None if path is flat (file directly under backend).
+    For attack_bench files in the new layout:
+        attack_bench/<split>/<topic>/<backend>/<defense>/<file>.json
+    return the topic subfolder name.
     """
     parts = test_file.resolve().parts
     if ATTACK_BENCH_SEGMENT not in parts:
         return None
     idx = parts.index(ATTACK_BENCH_SEGMENT)
-    rest = parts[idx + 1:]  # after "attack_bench": [train|test|backend, ...]
-    if len(rest) <= 1:
-        return None  # file directly under backend (flat)
-    # New layout: attack_bench/train|test/backend/suite/file -> rest[0]=train|test, rest[2]=suite
-    if rest[0] in (ATTACK_BENCH_TRAIN, ATTACK_BENCH_TEST) and len(rest) >= 4:
-        return rest[2]  # suite name
-    # Legacy: attack_bench/backend/suite/file -> rest = [backend, suite, filename]
-    if len(rest) >= 2:
-        return rest[1]  # suite name
-    return None
+    rest = parts[idx + 1 :]  # after "attack_bench": [split, topic, backend, defense, ...]
+    if len(rest) < 2:
+        return None
+    # rest[0] is split: train, test, test_2, test_4, ...
+    # rest[1] is topic: finance, health, identity, legal, tax
+    return rest[1]
 
 
 def get_result_path(
@@ -171,35 +211,36 @@ def get_result_path(
         memory_backend, unified_defense, model_name, attack_type
     )
     
-    # Check if test is in attack_bench (skip attack_type folder for attack_bench tests)
-    # Also check if results_base_dir is attack_results (never use attack_type folder for attack_results)
+    # Check if test is in attack_bench (attack_bench tests use attack_results layout)
+    # Also check if results_base_dir is attack_results
     test_file_str = str(test_file)
     results_base_dir_str = str(results_base_dir)
     is_attack_bench = "attack_bench" in test_file_str
     is_attack_results = "attack_results" in results_base_dir_str
     
     if is_attack_bench or is_attack_results:
-        # For attack_bench: place under attack_results/<train|test>/<model>/...
+        # For attack_bench: place under attack_results/<split>/<model>/<topic>/<backend>/<defense>/<NN>.json
         train_or_test = get_attack_bench_train_or_test(test_file)
-        suite_subfolder = get_attack_bench_suite_subfolder(test_file)
-        if suite_subfolder:
+        topic = get_attack_bench_suite_subfolder(test_file)
+        if topic:
             result_path = (
-                results_base_dir /
-                train_or_test /
-                model_name /
-                backend_for_path /
-                defense_folder /
-                suite_subfolder /
-                test_file.name
+                results_base_dir
+                / train_or_test
+                / model_name
+                / topic
+                / backend_for_path
+                / defense_folder
+                / test_file.name
             )
         else:
+            # Fallback (should not normally happen with new layout)
             result_path = (
-                results_base_dir /
-                train_or_test /
-                model_name /
-                backend_for_path /
-                defense_folder /
-                test_file.name
+                results_base_dir
+                / train_or_test
+                / model_name
+                / backend_for_path
+                / defense_folder
+                / test_file.name
             )
     else:
         # Construct path: results/{model_name}/{memory_backend}/{defense_folder}/{attack_type}/{test_file_name}.json
@@ -250,35 +291,36 @@ def get_log_path(
         memory_backend, unified_defense, model_name, attack_type
     )
     
-    # Check if test is in attack_bench (skip attack_type folder for attack_bench tests)
-    # Also check if logs_base_dir is attack_logs (never use attack_type folder for attack_logs)
+    # Check if test is in attack_bench (attack_bench tests use attack_logs layout)
+    # Also check if logs_base_dir is attack_logs
     test_file_str = str(test_file)
     logs_base_dir_str = str(logs_base_dir)
     is_attack_bench = "attack_bench" in test_file_str
     is_attack_logs = "attack_logs" in logs_base_dir_str
     
     if is_attack_bench or is_attack_logs:
-        # For attack_bench: place under attack_logs/<train|test>/<model>/...
+        # For attack_bench: place under attack_logs/<split>/<model>/<topic>/<backend>/<defense>/<NN>.log
         train_or_test = get_attack_bench_train_or_test(test_file)
-        suite_subfolder = get_attack_bench_suite_subfolder(test_file)
-        if suite_subfolder:
+        topic = get_attack_bench_suite_subfolder(test_file)
+        if topic:
             log_path = (
-                logs_base_dir /
-                train_or_test /
-                model_name /
-                backend_for_path /
-                defense_folder /
-                suite_subfolder /
-                test_file.with_suffix('.log').name
+                logs_base_dir
+                / train_or_test
+                / model_name
+                / topic
+                / backend_for_path
+                / defense_folder
+                / test_file.with_suffix(".log").name
             )
         else:
+            # Fallback (should not normally happen with new layout)
             log_path = (
-                logs_base_dir /
-                train_or_test /
-                model_name /
-                backend_for_path /
-                defense_folder /
-                test_file.with_suffix('.log').name
+                logs_base_dir
+                / train_or_test
+                / model_name
+                / backend_for_path
+                / defense_folder
+                / test_file.with_suffix(".log").name
             )
     else:
         # Construct path: logs/{model_name}/{memory_backend}/{defense_folder}/{attack_type}/{test_file_name}.log
@@ -564,32 +606,33 @@ def determine_attack_type(test_file: Path, test_def: Optional[Dict[str, Any]] = 
     """
     Determine the attack_type for a test file.
     
-    For utility tests (in data/benchmark/tests/), detects suite by path/filename:
-    1. Checking if "memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", or "long_memory" is in the test file path
-    2. Checking if the filename starts with "memory_only_", "assistant_responses_", "untrusted_probe_", "untrusted_send_", "disable_send_", "memory_tools_", or "long_memory_"
+    For utility tests (in data/benchmark/tests/), detects suite primarily by path:
+    - data/benchmark/tests/<suite>/<NN>.json
     
     Args:
         test_file: Path to test file
         test_def: Optional test definition dict (if already loaded)
         
     Returns:
-        Attack type string ("memory_only", "assistant_responses", "untrusted_probe", "untrusted_send", "disable_send", "memory_tools", "long_memory", or from test_def if available)
+        Attack type string ("memory_only", "assistant_responses", "untrusted_probe", "untrusted_send",
+        "disable_send", "memory_tools", "long_memory", or from test_def if available)
     """
-    # Check if this is a memory_only, assistant_responses, untrusted_probe, untrusted_send, disable_send, memory_tools, or long_memory test by path or filename
+    # Check if this is a memory_only, assistant_responses, untrusted_probe, untrusted_send,
+    # disable_send, memory_tools, or long_memory test by path.
     test_file_str = str(test_file)
-    if "memory_only" in test_file_str or test_file.name.startswith("memory_only_"):
+    if "memory_only" in test_file_str:
         return "memory_only"
-    if "assistant_responses" in test_file_str or test_file.name.startswith("assistant_responses_"):
+    if "assistant_responses" in test_file_str:
         return "assistant_responses"
-    if "untrusted_probe" in test_file_str or test_file.name.startswith("untrusted_probe_"):
+    if "untrusted_probe" in test_file_str:
         return "untrusted_probe"
-    if "untrusted_send" in test_file_str or test_file.name.startswith("untrusted_send_"):
+    if "untrusted_send" in test_file_str:
         return "untrusted_send"
-    if "disable_send" in test_file_str or test_file.name.startswith("disable_send_"):
+    if "disable_send" in test_file_str:
         return "disable_send"
-    if "memory_tools" in test_file_str or test_file.name.startswith("memory_tools_"):
+    if "memory_tools" in test_file_str:
         return "memory_tools"
-    if "long_memory" in test_file_str or test_file.name.startswith("long_memory_"):
+    if "long_memory" in test_file_str:
         return "long_memory"
     
     # Valid utility suite types (used for path construction and validation)
