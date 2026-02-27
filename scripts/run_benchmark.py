@@ -95,7 +95,6 @@ def run_benchmark(
     results_base_dir: Optional[Path] = None,
     logs_base_dir: Optional[Path] = None,
     target_model_name: Optional[str] = None,
-    try_all_attack_candidates: bool = False,
 ) -> Dict[str, Any]:
     """
     Run benchmark for a specific memory backend and defense type.
@@ -135,6 +134,9 @@ def run_benchmark(
     # When adaptive + --stealth: optimizers should optimize for attack + stealth (blend score with stealth goal)
     if adaptive and stealth:
         config.setdefault("benchmark", {})["adaptive_stealth"] = True
+        # Stealth runs should use a mirrored cache root so they don't overwrite
+        # or mix with normal-mode train cache files.
+        config.setdefault("benchmark", {})["attack_bench_cache_root"] = "train_cache_stealth"
     
     # When adaptive: inject early_stop_patience from CLI (default 5) into openevolve config
     if adaptive and early_stop_patience is not None:
@@ -281,7 +283,6 @@ def run_benchmark(
         force=force,
         adaptive=adaptive,
         logs_base_dir=logs_base_dir,
-        try_all_attack_candidates=try_all_attack_candidates,
     )
     
     try:
@@ -414,7 +415,6 @@ def _run_single_combination(
         results_base_dir,
         logs_base_dir,
         target_model_name,
-        try_all_attack_candidates,
     ) = args_tuple
     
     # Determine attack type from test_path (needed for result paths)
@@ -475,7 +475,6 @@ def _run_single_combination(
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
             target_model_name=target_model_name,
-            try_all_attack_candidates=try_all_attack_candidates,
         )
         
         # Print completion summary to terminal
@@ -591,7 +590,6 @@ def run_all_combinations(
     results_base_dir: Optional[Path] = None,
     logs_base_dir: Optional[Path] = None,
     target_model_name: Optional[str] = None,
-    try_all_attack_candidates: bool = False,
 ) -> Dict[str, Any]:
     """
     Run benchmarks for all combinations of memory backends and defense types in parallel.
@@ -663,7 +661,6 @@ def run_all_combinations(
             results_base_dir,
             logs_base_dir,
             target_model_name,
-            try_all_attack_candidates,
         )
         for backend, defense in combinations
     ]
@@ -1081,13 +1078,6 @@ Examples:
     )
     
     parser.add_argument(
-        "--try-all",
-        dest="try_all_attack_candidates",
-        action="store_true",
-        help="[Static attack_bench only] When set, try all attack candidates listed in each test file (attack_candidates) sequentially until one succeeds or all fail. Default: use only the primary attack.",
-    )
-    
-    parser.add_argument(
         "--results-dir",
         type=str,
         help="Base directory for results (defaults to data/benchmark/results)"
@@ -1143,10 +1133,23 @@ Examples:
     test_path = args.test if args.test else args.suite
     
     # Determine results directory
-    results_base_dir = Path(args.results_dir) if args.results_dir else None
+    if args.results_dir:
+        results_base_dir = Path(args.results_dir)
+    elif args.stealth:
+        # Stealth runs default to a mirrored attack_results_stealth tree so that
+        # they never overwrite or mix with normal attack_results.
+        results_base_dir = Path("data/benchmark/attack_results_stealth")
+    else:
+        results_base_dir = None
     
     # Determine logs directory
-    logs_base_dir = Path(args.logs_dir) if args.logs_dir else None
+    if args.logs_dir:
+        logs_base_dir = Path(args.logs_dir)
+    elif args.stealth:
+        # Stealth runs default to a mirrored attack_logs_stealth tree.
+        logs_base_dir = Path("data/benchmark/attack_logs_stealth")
+    else:
+        logs_base_dir = None
     
     # Determine if memory backends and defense types were specified
     memory_backends_specified = args.memory_backend is not None
@@ -1214,7 +1217,6 @@ Examples:
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
             target_model_name=args.target_model_name,
-            try_all_attack_candidates=args.try_all_attack_candidates,
         )
     else:
         # Single combination mode
@@ -1240,7 +1242,6 @@ Examples:
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
             target_model_name=args.target_model_name,
-            try_all_attack_candidates=args.try_all_attack_candidates,
         )
     
     # Exit with appropriate code

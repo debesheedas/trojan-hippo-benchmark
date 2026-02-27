@@ -80,7 +80,6 @@ class TestBench:
         force: bool = False,
         adaptive: bool = False,
         logs_base_dir: Optional[Path] = None,
-        try_all_attack_candidates: bool = False,
     ):
         """
         Initialize TestBench.
@@ -127,9 +126,6 @@ class TestBench:
         # No test directories needed - everything is in-memory
         self.test_dirs = []  # Kept for compatibility but will always be empty
         self.force = force  # Force overwrite existing results
-        # When True, static attack_bench tests will try all attack_candidates listed in the test file (if present)
-        # sequentially until one succeeds or all fail.
-        self.try_all_attack_candidates = try_all_attack_candidates
         self.logs_base_dir = Path(logs_base_dir) if logs_base_dir is not None else None  # Base directory for logs (None = use default)
         
         # Get memory backend from config
@@ -165,6 +161,7 @@ class TestBench:
         self.results_base_dir.mkdir(parents=True, exist_ok=True)
         
         # Store default results base dir for attack_bench detection
+        # This may already point at an attack_results* directory (including _stealth variants).
         self.default_results_base_dir = self.results_base_dir
         
         # Unified test directory (hardcoded constant, not configurable)
@@ -184,9 +181,12 @@ class TestBench:
         from benchmark.environment_state import StateManager
         self.state_manager = StateManager()
         
-        # Cache directory for successful train attacks (under attack_bench/train_cache/)
-        # Static mode needs this to check for cached optimized attacks when running test cases
-        self.cache_dir = Path("data/benchmark/attack_bench/train_cache")
+        # Cache directory for successful train attacks (under attack_bench/train_cache*/).
+        # Static mode needs this to check for cached optimized attacks when running test cases.
+        # The root cache directory name can be overridden via benchmark.attack_bench_cache_root
+        # so stealth runs can use a mirrored cache tree (e.g. train_cache_stealth, train_cache_stealth_10, ...).
+        self.attack_bench_cache_root = benchmark_config.get("attack_bench_cache_root", "train_cache")
+        self.cache_dir = Path("data/benchmark/attack_bench") / self.attack_bench_cache_root
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
         # Adaptive mode is set by --adaptive flag (run_benchmark.py or test_bench.py CLI)
@@ -966,9 +966,13 @@ class TestBench:
         test_file_str = str(test_file)
         if "attack_bench" in test_file_str:
             # For attack_bench tests, use attack_results instead of results
-            # Replace "results" with "attack_results" in the path
-            if "results" in str(self.default_results_base_dir):
-                attack_results_dir = Path(str(self.default_results_base_dir).replace("results", "attack_results"))
+            # Replace "results" with "attack_results" in the path, unless we're already
+            # pointing at an attack_results* directory (including _stealth variants).
+            base_str = str(self.default_results_base_dir)
+            if "attack_results" in base_str:
+                attack_results_dir = self.default_results_base_dir
+            elif "results" in base_str:
+                attack_results_dir = Path(base_str.replace("results", "attack_results"))
             else:
                 # Fallback: construct attack_results path
                 attack_results_dir = self.default_results_base_dir.parent / "attack_results"
@@ -983,9 +987,12 @@ class TestBench:
         
         if "attack_bench" in test_file_str:
             # For attack_bench tests, use attack_logs instead of logs
-            # Replace "logs" with "attack_logs" in the path
+            # Replace "logs" with "attack_logs" in the path, unless we're already
+            # pointing at an attack_logs* directory (including _stealth variants).
             logs_dir_str = str(default_logs_dir)
-            if "/logs" in logs_dir_str:
+            if "attack_logs" in logs_dir_str:
+                attack_logs_dir = default_logs_dir
+            elif "/logs" in logs_dir_str:
                 attack_logs_dir = Path(logs_dir_str.replace("/logs", "/attack_logs"))
             elif logs_dir_str.endswith("logs"):
                 attack_logs_dir = Path(logs_dir_str[:-4] + "attack_logs")
@@ -1129,48 +1136,6 @@ class TestBench:
             with open(test_file, 'r', encoding='utf-8') as f:
                 test_def = json.load(f)
 
-        # If requested and attack_candidates are present, try each candidate in order for attack_bench tests.
-        if (
-            is_attack_bench
-            and self.try_all_attack_candidates
-            and isinstance(test_def, dict)
-            and isinstance(test_def.get("attack_candidates"), list)
-            and test_def["attack_candidates"]
-        ):
-            import copy as _copy
-
-            candidates = test_def["attack_candidates"]
-            last_result: Optional[Dict[str, Any]] = None
-
-            for idx, candidate in enumerate(candidates):
-                attack_email = candidate.get("attack_email")
-                if not attack_email:
-                    continue
-
-                # Deep copy the test definition so per-candidate mutations don't leak.
-                candidate_test_def = _copy.deepcopy(test_def)
-
-                # Overwrite the first insert_attack_email step with this candidate's email.
-                for step in candidate_test_def.get("steps", []):
-                    if step.get("step_type") == "insert_attack_email":
-                        step["attack_email"] = attack_email
-                        break
-
-                result = self._run_static_test_with_def(test_file, candidate_test_def)
-                # Annotate which candidate was used and how many were tried.
-                result["attack_candidate_index"] = idx
-                result["attack_candidate_source"] = candidate.get("source")
-                result["attack_candidates_tried"] = idx + 1
-                last_result = result
-
-                if result.get("overall_success", False):
-                    return result
-
-            # If none succeeded but we ran at least one candidate, return the last attempt's result.
-            if last_result is not None:
-                return last_result
-
-        # Default: run once with the prepared test_def.
         return self._run_static_test_with_def(test_file, test_def)
 
     def _run_static_test_with_def(self, test_file: Path, test_def: Dict[str, Any]) -> Dict[str, Any]:
@@ -2216,15 +2181,21 @@ class TestBench:
         # Cache whenever the attack goal succeeded, so test_10 can use it even if no optimization was needed.
         steps = result.get("steps", [])
         attack_succeeded = False
+        stealth_succeeded = False
         for step_result in steps:
             attack_goal = step_result.get("attack_goal", {})
             if isinstance(attack_goal, dict) and attack_goal.get("passed") is True:
                 attack_succeeded = True
-                break
+            sg = step_result.get("stealth_goal")
+            if isinstance(sg, dict) and sg.get("passed") is True:
+                stealth_succeeded = True
         # Only cache for train runs (train or train_10); _get_attack_bench_cache_path returns None for non-train
         cache_path = self._get_attack_bench_cache_path(test_file)
         if cache_path is not None:
-            if attack_succeeded:
+            # When using a dedicated stealth cache root, require both attack AND stealth to succeed
+            # before writing any cached file. Normal cache roots keep existing semantics.
+            is_stealth_cache_root = str(self.cache_dir.name).startswith("train_cache_stealth")
+            if attack_succeeded and (stealth_succeeded if is_stealth_cache_root else True):
                 try:
                     self._cache_successful_attack(test_file, result, adaptive_success=True)
                 except Exception as e:
@@ -2254,8 +2225,17 @@ class TestBench:
         # Only cache train runs (train or train_10, etc.)
         if split != ATTACK_BENCH_TRAIN and not split.startswith("train_"):
             return None
-        cache_dir_name = get_attack_bench_cache_dir_name(split)
-        cache_base = self.cache_dir.parent / cache_dir_name
+        # Derive cache base directory for this split from the configured cache root.
+        # This supports both the default train_cache[/_N] layout and mirrored roots
+        # such as train_cache_stealth[/_N] without changing the attack_bench structure.
+        cache_root = self.cache_dir.name  # e.g. "train_cache" or "train_cache_stealth"
+        if split == ATTACK_BENCH_TRAIN:
+            cache_base = self.cache_dir
+        else:
+            # split like "train_10" -> suffix "10" → train_cache[_stealth]_10
+            suffix = split.replace(ATTACK_BENCH_TRAIN, "", 1).lstrip("_") or "0"
+            cache_dir_name = f"{cache_root}_{suffix}"
+            cache_base = self.cache_dir.parent / cache_dir_name
         d = defense if defense is not None else self.unified_defense
         # New layout: attack_bench/train_10/topic/backend/defense/file -> train_cache_10/topic/backend/defense/file
         if len(rest) >= 5:
@@ -2287,8 +2267,15 @@ class TestBench:
         split = rest[0] if rest else ""
         if split != ATTACK_BENCH_TEST and not split.startswith("test_"):
             return None
-        cache_dir_name = get_attack_bench_cache_dir_name(split)
-        cache_base = self.cache_dir.parent / cache_dir_name
+        # Map test/test_N → corresponding train cache directory rooted at cache_root.
+        cache_root = self.cache_dir.name  # e.g. "train_cache" or "train_cache_stealth"
+        if split == ATTACK_BENCH_TEST:
+            cache_base = self.cache_dir
+        else:
+            # split like "test_10" -> suffix "10" → train_cache[_stealth]_10
+            suffix = split.replace(ATTACK_BENCH_TEST, "", 1).lstrip("_") or "0"
+            cache_dir_name = f"{cache_root}_{suffix}"
+            cache_base = self.cache_dir.parent / cache_dir_name
         # New layout: test_10/topic/backend/defense/file -> train_cache_10/topic/backend/defense/
         if len(rest) >= 5:
             topic, backend, defense_dir = rest[1], rest[2], rest[3]
@@ -3602,9 +3589,12 @@ class TestBench:
             
             # Update the test with optimized attack emails from the result
             steps = result.get("steps", [])
+            raw_score = None  # 1-10 from optimizer (e.g. OpenEvolve agentdojo_score)
             for i, step in enumerate(steps):
                 if "optimization" in step and "optimized_attack_email" in step["optimization"]:
                     optimized_email = step["optimization"]["optimized_attack_email"]
+                    if raw_score is None and "score" in step["optimization"]:
+                        raw_score = step["optimization"]["score"]
                     # Find the corresponding insert_attack_email step and update it
                     if i < len(cached_test.get("steps", [])):
                         cached_step = cached_test["steps"][i]
@@ -3614,11 +3604,14 @@ class TestBench:
                                 cached_test["steps"][j]["attack_email"] = optimized_email
                                 print(f"💾 Updated attack email in step {j+1} with optimized version")
                                 break
-            
+            # Normalized 0-1 score for propagate script: success=1.0, else raw_score/10
+            attack_score = 1.0 if adaptive_success else (float(raw_score) / 10.0 if raw_score is not None else 0.0)
+            attack_score = max(0.0, min(1.0, attack_score))
             # Add optimization metadata
             cached_test["optimization_metadata"] = {
                 "optimized": True,
                 "adaptive_success": adaptive_success,
+                "attack_score": attack_score,
                 "optimization_timestamp": datetime.now().isoformat(),
                 "model_name": self.model_name
             }

@@ -1,0 +1,139 @@
+% Main manuscript for LNCS submission
+% Based on samplepaper.tex (LLNCS macro package for Springer Computer Science proceedings)
+% Version 2.21 of 2022/01/12
+%
+\documentclass[runningheads]{llncs}
+%
+\usepackage[T1]{fontenc}
+% T1 fonts will be used to generate the final print and online PDFs,
+% so please use T1 fonts in your manuscript whenever possible.
+% Other font encondings may result in incorrect characters.
+%
+\usepackage{graphicx}
+% Used for displaying a sample figure. If possible, figure files should
+% be included in EPS format.
+%
+% If you use the hyperref package, please uncomment the following two lines
+% to display URLs in blue roman font according to Springer's eBook style:
+%\usepackage{color}
+%\renewcommand\UrlFont{\color{blue}\rmfamily}
+%\urlstyle{rm}
+%
+\begin{document}
+%
+\title{Persistent Data Exfiltration in Memory-Augmented LLM Agents: Benchmark and Provable Defense}
+%
+%\titlerunning{Abbreviated paper title}
+% If the paper title is too long for the running head, you can set
+% an abbreviated paper title here
+%
+\author{First Author\inst{1}\orcidID{0000-1111-2222-3333} \and
+Second Author\inst{2,3}\orcidID{1111-2222-3333-4444} \and
+Third Author\inst{3}\orcidID{2222--3333-4444-5555}}
+%
+\authorrunning{F. Author et al.}
+% First names are abbreviated in the running head.
+% If there are more than two authors, 'et al.' is used.
+%
+\institute{Princeton University, Princeton NJ 08544, USA \and
+Springer Heidelberg, Tiergartenstr. 17, 69121 Heidelberg, Germany
+\email{lncs@springer.com}\\
+\url{http://www.springer.com/gp/computer-science/lncs} \and
+ABC Institute, Rupert-Karls-University Heidelberg, Heidelberg, Germany\\
+\email{\{abc,lncs\}@uni-heidelberg.de}}
+%
+\maketitle              % typeset the header of the contribution
+%
+\begin{abstract}
+LLM agents that use tools and persistent memory deliver personalized assistance but introduce a critical attack surface: adversaries can inject instructions via untrusted tool outputs (e.g., emails) and abuse exfiltration tools plus long-term memory to steal user data across sessions. We study persistent data exfiltration attacks where a malicious payload is stored in memory in one session and later triggers the agent to send the user's sensitive messages to an attacker when the user discusses finance, health, legal, tax, or identity. We instantiate an email assistant with four memory backends---explicit (ChatGPT-style), mem0 (agentic state-of-the-art), RAG, and a context sliding-window baseline---and four defenses: user-prompt-only indexing, no indexing after untrusted tools, length-limited memory, and a provably secure information-flow policy. We stress-test each configuration with OpenEvolve-based red-teaming: attacks are optimized on a single training instance per topic and evaluated on held-out test cases (different sessions and user phrasings) never seen during optimization. Despite this strict generalization setup, attack success reaches 100\% (Mem0), 94\% (Context), and 52\% total with 100\% max (RAG) without the provable defense, and remains high across multiple trigger sessions. The provable defense achieves 0\% exfiltration empirically; heuristic defenses only partly help (e.g., Mem0 still 12.5\% under no-untrusted-tools, limit-memory-length allows 33\% on RAG). We provide a formal non-interference proof for the provable defense and a utility analysis for security--utility tradeoffs.
+
+\keywords{LLM agents \and persistent memory \and prompt injection \and data exfiltration \and information-flow control \and red-teaming.}
+\end{abstract}
+%
+%
+%
+\section{Introduction}
+\subsection{Motivation and Problem}
+
+Large language model (LLM) agents that call tools and maintain persistent memory are increasingly deployed for email, calendars, and other personalized assistants. Tools that read external data (e.g., inbox) and tools that send data out (e.g., send\_email) create a natural exfiltration path. When that external data is untrusted---such as emails an adversary can send---indirect prompt injection can plant instructions that the agent later obeys. Persistent memory makes this threat worse: a single poisoned session can store an instruction that activates in a later session when the user asks about sensitive topics, causing the agent to exfiltrate the user's own message to the attacker. User queries about finance, health, legal, tax, or identity are especially dangerous because they often contain highly sensitive information (income, medical history, legal matters) that can be used for fraud, targeted phishing, or blackmail. Understanding how different memory backends and defenses behave under automated attack is therefore essential for secure agent design.
+
+\subsection{Related Work and Positioning}
+
+Indirect prompt injection via tool outputs has been studied in web and document settings (Greshake et al., 2023; Liu et al., 2023). Memory-augmented agents---explicit (e.g., ChatGPT-style), RAG, and agentic systems such as Mem0---are widely used for personalization. The combination of untrusted tool inputs, exfiltration tools, and persistent memory has not been systematically benchmarked under strong, automated red-teaming. We fill this gap with a concrete email-agent testbed, multiple memory backends, several defenses, and formal plus empirical security and utility evaluation.
+
+\subsection{Threat Model and Attack Goal}
+
+The adversary controls only the content of emails that the user receives. The agent has tools to read the inbox (untrusted source) and to send email (exfiltration sink). The attack goal is persistent data exfiltration: in a first session, the agent reads a malicious email that contains hidden instructions; those instructions are stored in the agent's persistent memory; in a later session, when the user asks about a sensitive topic (finance, health, legal, tax, or identity), the agent retrieves the poisoned memory and is induced to send the user's message---often containing private details---to an attacker-controlled address. We focus on trigger topics (finance, identity, legal, health, tax) because user messages in these contexts are especially likely to include information valuable to attackers.
+
+\subsection{Memory Backends}
+
+We evaluate four memory backends. (1) Explicit: user-directed, deterministic storage (e.g., ChatGPT-style ``remember this''); simple and inspectable. (2) Mem0: state-of-the-art agentic memory with semantic search and LLM-driven extraction; used by many production agents. (3) RAG: retrieval-augmented generation over chunked conversation history; common in document and long-context agents. (4) Context: a baseline that keeps a sliding window of recent conversation across sessions, with no separate retrieval layer. Each backend provides a different surface for poisoning and retrieval, and we test all under the same attack and defense conditions.
+
+\subsection{Defenses}
+
+We implement and compare four defenses. (1) User-prompt-only: only user messages are indexed into memory; agent-generated content (including tool outputs) is not stored. (2) No-untrusted-tools: once any untrusted tool (e.g., read\_inbox) is called in a session, memory indexing is disabled for the rest of that session. (3) Limit-memory-length: memory entries are truncated to a fixed length (e.g., 80 characters) to limit the amount of injectable instruction. (4) Provable policy: an information-flow control (IFC) defense that labels memory and session state as trusted (T) or untrusted (U); any memory written after reading untrusted data or after retrieving U-labeled memory is labeled U; the harness blocks any call to an exfiltration tool when the session is U. We give a formal non-interference proof (by contradiction) showing that under this policy, the two-session exfiltration attack cannot succeed: activation requires U-labeled memory in context, which forces the session to U, so the exfiltration tool is blocked. We also validate this defense empirically in our benchmark.
+
+\subsection{Experimental Setup}
+
+We build an email agent with read\_inbox, send\_email, and memory tools, and wire it to each of the four memory backends. We define persistent-exfiltration attack scenarios for five trigger topics (health, legal, tax, finance, identity), with multi-session test cases: insert attack email, user asks to read inbox (poisoning), start new session, user sends a sensitive message (e.g., detailed tax or health information), and we check whether the agent sends that message to the attacker. Crucially, we use OpenEvolve-style automated red-teaming (evolutionary search with MAP-Elites, LLM mutators, and a critic scorer; arxiv.org/abs/2510.09023) optimized on a single training instance per topic; the evolved attack is then evaluated on held-out test cases---different sessions (up to five trigger sessions per run) and different user phrasings---that were never seen during optimization. This strict train-on-one, test-on-many setup demonstrates generalization of the attack. Success is measured by whether the exfiltration email is sent with the user's message in the body.
+
+\subsection{Main Results}
+
+Under this setup, attack success is alarmingly high for popular memory backends without the provable defense: averaged across suites, we observe 100\% attack success for Mem0, 94.2\% for Context, and 51.7\% total (100\% max in at least one session) for RAG. Session-by-session analysis shows that vulnerability persists across multiple trigger sessions (e.g., Context/no-defense remains near or at 100\% from session 2 through session 5), so the threat is not limited to the first trigger. The provable (IFC) defense achieves 0\% exfiltration across all backends where evaluated and is both formally proven and empirically validated. Heuristic defenses reduce but do not eliminate success: e.g., No Untrusted Tools still allows 12.5\% total (62.5\% max) on Mem0; Limit Memory Length allows 32.5\% on RAG, 15\% on Mem0, and 6.7\% on Explicit; User Prompt Only leaves Mem0 at 15\% total (50\% max). Effectiveness thus depends on both trigger topic and memory backend. Example exfiltrated content includes full user messages with medical details, tax and income information (W-2, 1099, deductions), and legal/financial specifics---illustrating real-world impact.
+
+\subsection{Utility Analysis}
+
+To guide deployment choices, we provide a detailed utility evaluation in benign settings. We run standardized task suites: memory\_only, assistant\_responses, untrusted\_probe, untrusted\_send, disable\_send, memory\_tools, and long\_memory. For each defense and backend we report success rates (and failure modes) by task type. This allows agent builders to see where each defense hurts utility---e.g., which task types drop under no-untrusted-tools or limit\_memory\_length---and to make an informed security--utility tradeoff when selecting a defense.
+
+\subsection{Contributions Summary}
+
+We make the following contributions: (1) A concrete threat model and benchmark for persistent data exfiltration in memory-augmented, tool-using LLM agents, with trigger topics chosen for high sensitivity. (2) Implementation and evaluation of four memory backends (explicit, mem0, RAG, context) and four defenses (three heuristic, one provably secure). (3) OpenEvolve-based stress-testing with a strict generalization setup---optimization on a single training instance per topic, evaluation on held-out test cases---showing 100\% (Mem0), 94\% (Context), and 52\% total / 100\% max (RAG) attack success without the provable defense, and session-by-session evidence that attacks persist across multiple trigger sessions. (4) A provably secure IFC defense with a formal non-interference proof and 0\% exfiltration empirically. (5) A utility analysis by task type to support security--utility tradeoff decisions. Together, this gives practitioners a clear picture of the risks of persistent memory and exfiltration tools, and a path to provable security plus actionable guidance on heuristic defenses and utility cost.
+
+%
+\section{Threat Model}
+% To be expanded: formalize adversary capabilities, exfiltration goal, and multi-session attack.
+%
+\section{Memory Backends}
+% To be expanded: detail each backend (explicit, Mem0, RAG, context) and retrieval behavior.
+%
+\section{Defenses}
+% To be expanded: user-prompt-only, no-untrusted-tools, limit-memory-length, and provable IFC policy with non-interference proof.
+%
+\section{Experimental Setup}
+% To be expanded: email agent, attack scenarios, OpenEvolve red-teaming, train/test split, metrics.
+%
+\section{Results}
+% To be expanded: attack success by backend and defense, session-by-session analysis, empirical validation of provable defense.
+%
+\section{Utility Analysis}
+% To be expanded: benign task suites, success rates by task type and defense, security--utility tradeoffs.
+%
+\section{Conclusion}
+% To be expanded: summary of findings, limitations, and future work.
+%
+\begin{credits}
+\subsubsection{\ackname} This study was funded by X (grant number Y).
+
+\subsubsection{\discintname}
+The authors have no competing interests to declare that are relevant to the content of this article.
+\end{credits}
+%
+% ---- Bibliography ----
+%
+% BibTeX users should specify bibliography style 'splncs04'.
+% References will then be sorted and formatted in the correct style.
+%
+% \bibliographystyle{splncs04}
+% \bibliography{mybibliography}
+%
+\begin{thebibliography}{8}
+\bibitem{ref_greshake2023}
+Greshake, K. et al.: Not What You've Signed Up For: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection. In: Proceedings (2023)
+
+\bibitem{ref_liu2023}
+Liu, Y. et al.: Prompt injection attacks and defenses in LLM-integrated applications. In: Proceedings (2023)
+
+\bibitem{ref_openevolve}
+OpenEvolve / automated prompt injection. \url{https://arxiv.org/abs/2510.09023}, last accessed 2025/02/26
+\end{thebibliography}
+\end{document}

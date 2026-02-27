@@ -113,6 +113,9 @@ def main() -> int:
         else:
             base_dir = Path.cwd()
     attack_bench_base = base_dir / args.attack_bench_dir
+    # Mirrored stealth tree lives alongside the primary attack_bench directory.
+    # Example: data/benchmark/attack_bench_stealth with identical layout.
+    attack_bench_stealth_base = attack_bench_base.parent / f"{attack_bench_base.name}_stealth"
     categories_dir = SCRIPT_DIR / "categories"
     backend_definitions_path = SCRIPT_DIR / "backend_definitions.yaml"
 
@@ -202,15 +205,25 @@ def main() -> int:
             for defense in defenses:
                 # Layout: attack_bench/<split_N>/<topic>/<backend>/<defense>/<NN>.json
                 out_dir = attack_bench_base / split_subdir / topic_name / backend / defense
+                # Mirrored stealth layout: attack_bench_stealth/<split_N>/<topic>/<backend>/<defense>/<NN>.json
+                out_dir_stealth = attack_bench_stealth_base / split_subdir / topic_name / backend / defense
                 # For train_N splits we want exactly ONE train case per (topic, backend, defense).
                 # Clean out any existing JSON files so we don't keep stale 02/03/04 from older runs.
-                if split == "train" and out_dir.exists():
-                    for old in out_dir.glob("*.json"):
-                        try:
-                            old.unlink()
-                        except OSError:
-                            pass
+                if split == "train":
+                    if out_dir.exists():
+                        for old in out_dir.glob("*.json"):
+                            try:
+                                old.unlink()
+                            except OSError:
+                                pass
+                    if out_dir_stealth.exists():
+                        for old in out_dir_stealth.glob("*.json"):
+                            try:
+                                old.unlink()
+                            except OSError:
+                                pass
                 out_dir.mkdir(parents=True, exist_ok=True)
+                out_dir_stealth.mkdir(parents=True, exist_ok=True)
                 saved = []
                 for i in range(num_test):
                     try:
@@ -232,7 +245,10 @@ def main() -> int:
                         )
                         fname = f"{i + 1:02d}.json"
                         out_file = out_dir / fname
+                        out_file_stealth = out_dir_stealth / fname
                         with open(out_file, "w", encoding="utf-8") as f:
+                            json.dump(tc, f, indent=2, ensure_ascii=False)
+                        with open(out_file_stealth, "w", encoding="utf-8") as f:
                             json.dump(tc, f, indent=2, ensure_ascii=False)
                         saved.append(out_file)
                     except Exception as e:

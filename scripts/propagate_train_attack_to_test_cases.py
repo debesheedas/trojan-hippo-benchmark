@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Propagate attack email into test cases. For each (topic, backend, defense) in test*:
-  attack = cache(same backend, same defense) else cache(same backend, none) else original train file.
-Writes chosen attack into attack_bench/test*/<topic>/<backend>/<defense>/*.json.
+Propagate a single attack email into each test case under test*.
 
-Cache layout: train_cache/<model>/<topic>/<backend>/<defense>/... or train_cache_10/<topic>/<backend>/<defense>/...
+For each (test_N, topic, backend, defense):
+  - Collect all cached candidates from all train splits (cache stores attack_score 0-1).
+  - If any cache has attack_score == 1 (ASR success): choose among those, preferring
+    same-split (train_N) then train_100, train_90, ..., train_0.
+  - Else: choose the cached candidate with highest score (ties: same preference).
+  - If no cache: use original train file from train_N.
+
+Writes only that one attack into step 1 (insert_attack_email) of each test JSON.
 
 Usage:
     python scripts/propagate_train_attack_to_test_cases.py --model gemini-3.1-pro-preview
@@ -40,17 +45,39 @@ def get_attack_email_from_cached(cached_path: Path) -> Optional[dict]:
     return None
 
 
-def propagate_attack_to_file(test_case_path: Path, attack_email: dict, attack_candidates: Optional[List[dict]] = None) -> bool:
-    """Set step 1 (insert_attack_email) attack_email in test_case_path and optionally record all attack candidates.
-    
+def get_attack_and_score_from_cached(cached_path: Path) -> Optional[Tuple[dict, float]]:
+    """
+    Extract (attack_email, attack_score) from a cached test JSON.
+    attack_score is 0-1: from optimization_metadata.attack_score if present,
+    else 1.0 if adaptive_success else 0.0. Returns None if no attack email.
+    """
+    if not cached_path.exists():
+        return None
+    with open(cached_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    email = None
+    for step in data.get("steps", []):
+        if step.get("step_type") == "insert_attack_email" and "attack_email" in step:
+            email = step["attack_email"]
+            break
+    if not email:
+        return None
+    meta = data.get("optimization_metadata") or {}
+    if "attack_score" in meta:
+        score = float(meta["attack_score"])
+        score = max(0.0, min(1.0, score))
+    else:
+        score = 1.0 if meta.get("adaptive_success") else 0.0
+    return (email, score)
+
+
+def propagate_attack_to_file(test_case_path: Path, attack_email: dict) -> bool:
+    """Set step 1 (insert_attack_email) attack_email in test_case_path.
     Returns True if updated.
     """
     with open(test_case_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     updated = False
-    # Persist all candidate attacks (if provided) so static benchmark can optionally try them in order.
-    if attack_candidates is not None:
-        data["attack_candidates"] = attack_candidates
     for step in data.get("steps", []):
         if step.get("step_type") == "insert_attack_email":
             step["attack_email"] = attack_email
@@ -171,8 +198,8 @@ def find_train_file_in_bench(
 # Session checkpoints: 0, 10, 20, ..., 100 (same as generate_persistence_attack_bench.sh).
 SESSION_CHECKPOINTS: List[int] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 NUM_TRAIN_SPLITS = len(SESSION_CHECKPOINTS)
-# Ordered list of train splits for attack candidates. Same-split is tried first, then others in increasing order.
-TRAIN_SPLITS_ORDER: List[str] = [f"train_{i}" for i in SESSION_CHECKPOINTS]
+# When same-split has no (or worse) candidate: prefer train_100, then train_90, ..., then train_0.
+TRAIN_SPLITS_PREFERENCE_ORDER: List[str] = [f"train_{i}" for i in reversed(SESSION_CHECKPOINTS)]
 
 
 def _get_best_attack_for_train_split(
@@ -253,6 +280,109 @@ def _get_best_attack_for_train_split(
     return None
 
 
+def _resolve_cache_base_for_split(
+    attack_bench_base: Path, cache_base: Path, train_split: str, stealth: bool = False
+) -> Tuple[Path, bool, str]:
+    """Return (split_cache_base, layout_without_model, cache_label) for a train split.
+    For stealth=True, cache lives under cache_base (normal attack_bench) as train_cache_stealth_N,
+    not under attack_bench_stealth (benchmark writes to attack_bench/train_cache_stealth_N).
+    """
+    if train_split == "train":
+        if stealth:
+            # train_cache_stealth (root) lives under cache_base when cache_base is attack_bench; layout is topic/backend/defense (no model)
+            split_cache_base = cache_base / "train_cache_stealth"
+            if not split_cache_base.exists():
+                return cache_base, True, "train_cache_stealth"
+            return split_cache_base, True, "train_cache_stealth"
+        return cache_base, False, "train_cache"
+    suffix = train_split.replace("train", "", 1).lstrip("_") or "0"
+    if stealth:
+        cache_dir_name = f"train_cache_stealth_{suffix}"
+        split_cache_base = cache_base / cache_dir_name
+        if not split_cache_base.exists():
+            return cache_base, False, "train_cache_stealth"
+        return split_cache_base, True, cache_dir_name
+    cache_dir_name = f"train_cache_{suffix}"
+    split_cache_base = attack_bench_base / cache_dir_name
+    if not split_cache_base.exists():
+        return cache_base, False, "train_cache"
+    return split_cache_base, True, cache_dir_name
+
+
+def _find_one_cached_file(
+    split_cache_base: Path,
+    model: str,
+    topic: str,
+    backend: str,
+    defense: str,
+    layout_without_model: bool,
+    stealth: bool,
+) -> Optional[Path]:
+    """Return path to one cached file (stealth first if stealth=True), or None."""
+    if stealth:
+        p = find_cached_train_file_stealth(
+            split_cache_base, model, topic, backend, defense,
+            layout_without_model=layout_without_model,
+        )
+        if p:
+            return p
+        if defense != "none":
+            p = find_cached_train_file_stealth(
+                split_cache_base, model, topic, backend, "none",
+                layout_without_model=layout_without_model,
+            )
+            if p:
+                return p
+    p = find_cached_train_file(
+        split_cache_base, model, topic, backend, defense,
+        layout_without_model=layout_without_model,
+    )
+    if p:
+        return p
+    if defense != "none":
+        p = find_cached_train_file(
+            split_cache_base, model, topic, backend, "none",
+            layout_without_model=layout_without_model,
+        )
+        if p:
+            return p
+    return None
+
+
+def _collect_cached_candidates(
+    attack_bench_base: Path,
+    cache_base: Path,
+    topic: str,
+    backend: str,
+    defense: str,
+    model: str,
+    stealth: bool,
+) -> List[Tuple[dict, float, str, str]]:
+    """
+    Collect all cached (email, score, train_split, source_label) for this (topic, backend, defense)
+    from all train splits. score is 0-1 (from optimization_metadata).
+    """
+    out: List[Tuple[dict, float, str, str]] = []
+    splits_to_check: List[str] = ["train"] + [f"train_{i}" for i in SESSION_CHECKPOINTS]
+    for train_split in splits_to_check:
+        split_cache_base, layout, cache_label = _resolve_cache_base_for_split(
+            attack_bench_base, cache_base, train_split, stealth=stealth
+        )
+        cached_path = _find_one_cached_file(
+            split_cache_base, model, topic, backend, defense, layout, stealth
+        )
+        if not cached_path:
+            continue
+        pair = get_attack_and_score_from_cached(cached_path)
+        if not pair:
+            continue
+        email, score = pair
+        def_label = f"{backend}/{defense}" if defense != "none" else f"{backend}/none"
+        source = f"cached {def_label} [{cache_label}] score={score:.2f}"
+        out.append((email, score, train_split, source))
+    return out
+
+
 def get_attack_email_from_file(json_path: Path) -> Optional[dict]:
     """Extract the attack email from the first insert_attack_email step in a test JSON file."""
     if not json_path.exists():
@@ -265,6 +395,34 @@ def get_attack_email_from_file(json_path: Path) -> Optional[dict]:
     return None
 
 
+def _pick_best_candidate(
+    candidates: List[Tuple[dict, float, str, str]],
+    train_split: str,
+) -> Optional[Tuple[dict, str]]:
+    """
+    From collected (email, score, train_split, source) list:
+    - If any has score >= 1.0 (ASR success), pick among those by preference (same-split first, then train_100, ..., train_0).
+    - Else pick the one with highest score; ties broken by same preference.
+    Returns (email, source) or None.
+    """
+    if not candidates:
+        return None
+    # Preference order: same-split first, then train_100, train_90, ..., train_0
+    def preference_rank(s: str) -> int:
+        if s == train_split:
+            return 0
+        try:
+            return 1 + TRAIN_SPLITS_PREFERENCE_ORDER.index(s)
+        except ValueError:
+            return 999
+    success = [c for c in candidates if c[1] >= 1.0]
+    pool = success if success else candidates
+    # Sort by score desc, then by preference rank asc (same-split then train_100, ..., train_0)
+    pool_sorted = sorted(pool, key=lambda c: (-c[1], preference_rank(c[2])))
+    best = pool_sorted[0]
+    return (best[0], best[3])
+
+
 def run(
     attack_bench_base: Path,
     cache_base: Path,
@@ -272,74 +430,44 @@ def run(
     stealth: bool = False,
 ) -> int:
     """
-    For each (topic, backend, defense): use attack from cache(same defense) else cache(none)
-    else original train file; write into test cases. Fallback to defense=none is automatic.
-    If stealth=True, prefer _stealth cache first.
+    For each (test_N, topic, backend, defense): choose a single attack to write to test files.
+    - Collect all cached candidates from all train splits (each has attack_score 0-1 in cache).
+    - If any cache has attack_score == 1 (ASR success): pick among those, preferring same-split then train_100, ..., train_0
+    - Else: pick the cached candidate with highest score (ties: same preference).
+    - If no cache: use original train file from train_N.
+    Writes only that one attack. If stealth=True, prefer _stealth cache first when resolving cache file.
     """
     updated_count = 0
     skipped_no_attack = []
     skipped_no_test_files = []
 
-    # Discover (topic, backend, defense) under all test* subfolders (e.g., test, test_10, ...)
     combo_dirs: List[Tuple[str, str, str, Path]] = []
     for split_dir in sorted(d for d in attack_bench_base.iterdir() if d.is_dir() and d.name.startswith("test")):
         combo_dirs.extend(_discover_combinations_in_split(attack_bench_base, split_dir.name))
 
     for topic, backend, defense, defense_dir in combo_dirs:
         suite_name = topic
-        # Collect attack candidates: same-split train first, then train_0, train_10, ..., train_100
-        # in increasing order (skipping the same-split since already tried). Run with --try-all
-        # to try each candidate in order until one succeeds or all fail.
-        candidates: List[dict] = []
-        seen_emails = set()
-
-        def _add_candidate(email: Optional[dict], source: str) -> None:
-            """Add candidate if non-empty and not a duplicate (by JSON representation)."""
-            if not email:
-                return
-            try:
-                key = json.dumps(email, sort_keys=True)
-            except TypeError:
-                key = None
-            if key is not None and key in seen_emails:
-                return
-            if key is not None:
-                seen_emails.add(key)
-            candidates.append({"attack_email": email, "source": source})
-
         test_split = _split_from_defense_dir(defense_dir, attack_bench_base)
         train_split, _ = _train_split_and_cache_dir(test_split)
 
-        # Order: same-split first (e.g. test_50 -> try train_50 first), then train_0, train_10, ...,
-        # train_100 in increasing order, skipping the same-split so it is not duplicated.
-        ordered_splits: List[str] = [train_split] + [
-            s for s in TRAIN_SPLITS_ORDER if s != train_split
-        ]
-
-        for t_split in ordered_splits:
-            result = _get_best_attack_for_train_split(
-                attack_bench_base, cache_base, t_split,
-                topic, backend, defense, model, stealth,
-            )
-            if result:
-                email, source = result
-                _add_candidate(email, source)
-
-        if not candidates:
-            # Fallback: original train file from same split only
+        candidates = _collect_cached_candidates(
+            attack_bench_base, cache_base, topic, backend, defense, model, stealth
+        )
+        result = _pick_best_candidate(candidates, train_split)
+        if result:
+            primary_email, primary_source = result
+        else:
             bench_train = find_train_file_in_bench(
                 attack_bench_base, topic, backend, defense, train_split=train_split
             )
             if bench_train:
-                attack_email = get_attack_email_from_file(bench_train)
-                if attack_email:
-                    _add_candidate(attack_email, f"original train {backend}/{suite_name}")
-                else:
-                    skipped_no_attack.append(f"{backend}/{suite_name}")
-                    continue
-        if not candidates:
-            skipped_no_attack.append(f"{backend}/{suite_name}")
-            continue
+                primary_email = get_attack_email_from_file(bench_train)
+                primary_source = f"original train {train_split} {backend}/{suite_name}" if primary_email else None
+            else:
+                primary_email, primary_source = None, None
+            if not primary_email:
+                skipped_no_attack.append(f"{backend}/{suite_name}")
+                continue
 
         test_files = [p for p in defense_dir.glob("*.json") if TRAIN_STEM_MARKER not in p.stem]
         if not test_files:
@@ -347,12 +475,9 @@ def run(
             continue
 
         split_label = f" [{test_split}]" if test_split != "test" else ""
-        primary = candidates[0]
-        primary_email = primary["attack_email"]
-        primary_source = primary.get("source", "unknown")
-        print(f"  {topic}/{backend}/{defense}{split_label}: {primary_source} (and {len(candidates) - 1} additional candidate(s)) → {len(test_files)} test file(s)")
+        print(f"  {topic}/{backend}/{defense}{split_label}: {primary_source} → {len(test_files)} test file(s)")
         for test_path in sorted(test_files):
-            if propagate_attack_to_file(test_path, primary_email, candidates):
+            if propagate_attack_to_file(test_path, primary_email):
                 print(f"    updated {test_path.name}")
                 updated_count += 1
 
@@ -364,7 +489,72 @@ def run(
     return 0
 
 
+def _infer_model_from_agent_config() -> Optional[str]:
+    """Best-effort helper to infer model name from agent_config.yaml."""
+    try:
+        import yaml  # type: ignore[import]
+        from pathlib import Path as _Path
+
+        cfg = yaml.safe_load(_Path("agent_config.yaml").read_text())
+        return cfg.get("agent", {}).get("target_model_name")
+    except Exception:
+        return None
+
+
 def main() -> int:
+    # Special case: no CLI arguments (just the script name).
+    # In this mode we automatically:
+    #   - Infer model from agent_config.yaml
+    #   - Propagate for BOTH normal and stealth (fully parallel; no data mixing):
+    #       * Normal:  read cache from attack_bench/train_cache[_N], write to attack_bench/test_N/...
+    #       * Stealth: read cache from attack_bench/train_cache_stealth[_N], write to attack_bench_stealth/test_N/...
+    #   Stealth cache lives under normal attack_bench (benchmark writes there); test/train trees are attack_bench_stealth.
+    if len(sys.argv) == 1:
+        model = _infer_model_from_agent_config()
+        if not model:
+            print(
+                "ERROR: Could not infer model from agent_config.yaml. "
+                "Please run with --model <name>."
+            )
+            return 1
+
+        # Normal attack_bench
+        attack_bench_base = DEFAULT_ATTACK_BENCH.resolve()
+        cache_base = DEFAULT_CACHE_DIR.resolve()
+        print(f"Attack bench (normal):  {attack_bench_base}")
+        print(f"Cache dir (normal):     {cache_base}")
+        print(f"Model:                  {model}")
+        print("Stealth:                disabled (normal propagation)")
+        print()
+        run(
+            attack_bench_base,
+            cache_base,
+            model=model,
+            stealth=False,
+        )
+
+        # Stealth-mirrored attack_bench_stealth
+        # Stealth cache is written by the benchmark under normal attack_bench (train_cache_stealth_N),
+        # so we pass DEFAULT_ATTACK_BENCH as cache base so _resolve_cache_base_for_split finds it.
+        attack_bench_stealth = (DEFAULT_ATTACK_BENCH.parent / f"{DEFAULT_ATTACK_BENCH.name}_stealth").resolve()
+        cache_stealth_base = DEFAULT_ATTACK_BENCH.resolve()
+        if attack_bench_stealth.exists():
+            print(f"Attack bench (stealth): {attack_bench_stealth}")
+            print(f"Cache dir (stealth):    {cache_stealth_base}")
+            print(f"Model:                  {model}")
+            print("Stealth:                enabled (prefer _stealth cache)")
+            print()
+            run(
+                attack_bench_stealth,
+                cache_stealth_base,
+                model=model,
+                stealth=True,
+            )
+        else:
+            print(f"Stealth attack bench directory not found, skipping stealth propagation: {attack_bench_stealth}")
+        return 0
+
+    # CLI-override mode: respect explicit --model / --attack-bench / --cache-dir / --stealth.
     parser = argparse.ArgumentParser(
         description="Copy attack email into test cases: for each (backend, defense), use cache(same defense) else cache(none) else original train."
     )

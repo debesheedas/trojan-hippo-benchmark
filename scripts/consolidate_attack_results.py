@@ -6,10 +6,10 @@ Consolidates TEST results from the attack benchmark. Reads from
 data/benchmark/attack_results/test/ and data/benchmark/attack_logs/test/ by default
 (train/test layout matches attack_bench). Generates CSV tables and visualizations.
 
-If --results-dir points to the attack_results base (e.g. data/benchmark/attack_results),
-discovers all test folders (test, test_4, ...) and processes each separately, writing
-output under consolidated_attack_results/<model>/<test_folder>/ so each test run has
-its own heatmaps and CSVs.
+By default runs two passes: consolidated_attack_results (from attack_results/attack_logs)
+and consolidated_attack_results_stealth (from attack_results_stealth/attack_logs_stealth).
+If --results-dir, --logs-dir, or --output-dir is provided, runs a single pass with
+those paths (and discovers test folders under the results base).
 
 Discovers suites from the results directory (model/backend/defense/suite/) and only
 generates CSVs and plots for suites that have result files present.
@@ -64,6 +64,10 @@ DEFAULT_TRAIN_RESULTS_DIR = Path("data/benchmark/attack_results/train")
 DEFAULT_LOGS_BASE = Path("data/benchmark/attack_logs")
 DEFAULT_LOGS_DIR = DEFAULT_LOGS_BASE
 DEFAULT_OUTPUT_DIR = Path("data/benchmark/consolidated_attack_results")
+# Stealth counterparts (used when running both passes by default)
+ATTACK_RESULTS_STEALTH_BASE = Path("data/benchmark/attack_results_stealth")
+ATTACK_LOGS_STEALTH_BASE = Path("data/benchmark/attack_logs_stealth")
+CONSOLIDATED_ATTACK_STEALTH_DIR = Path("data/benchmark/consolidated_attack_results_stealth")
 
 # Data tuple: (user_passed, user_total, user_rate, attack_passed, attack_total, attack_rate,
 #              max_attack_passed, max_attack_total, has_execution_errors)
@@ -1244,20 +1248,20 @@ def main() -> int:
     parser.add_argument(
         "--results-dir",
         type=str,
-        default=str(DEFAULT_RESULTS_DIR),
-        help="Attack results base directory (default: data/benchmark/attack_results). All subfolders starting with 'test' (e.g. test, test_2, test_4, ...) will be processed.",
+        default=None,
+        help="Attack results base directory (default: data/benchmark/attack_results). All subfolders starting with 'test' will be processed. If set, only one pass is run (no stealth).",
     )
     parser.add_argument(
         "--logs-dir",
         type=str,
-        default=str(DEFAULT_LOGS_DIR),
+        default=None,
         help="Base directory for attack logs (default: data/benchmark/attack_logs)",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default=str(DEFAULT_OUTPUT_DIR),
-        help="Output directory for consolidated files",
+        default=None,
+        help="Output directory for consolidated files (default: data/benchmark/consolidated_attack_results)",
     )
     parser.add_argument(
         "--model",
@@ -1271,18 +1275,22 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    results_root = Path(args.results_dir)
-    output_root = Path(args.output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    # Discover test folders (sessions): test, test_2, test_4, ...
-    test_folders = sorted(
-        d.name for d in results_root.iterdir()
-        if d.is_dir() and d.name.startswith("test")
-    )
-    if not test_folders:
-        print(f"WARNING: No test folders found under {results_root}")
-        return 0
+    # When no custom dirs are given, run both normal and stealth consolidation. Otherwise single pass.
+    use_custom = args.results_dir is not None or args.logs_dir is not None or args.output_dir is not None
+    if use_custom:
+        runs = [
+            (
+                "custom",
+                Path(args.results_dir or DEFAULT_ATTACK_RESULTS_BASE),
+                Path(args.logs_dir or DEFAULT_LOGS_BASE),
+                Path(args.output_dir or DEFAULT_OUTPUT_DIR),
+            ),
+        ]
+    else:
+        runs = [
+            ("normal", DEFAULT_ATTACK_RESULTS_BASE, DEFAULT_LOGS_BASE, DEFAULT_OUTPUT_DIR),
+            ("stealth", ATTACK_RESULTS_STEALTH_BASE, ATTACK_LOGS_STEALTH_BASE, CONSOLIDATED_ATTACK_STEALTH_DIR),
+        ]
 
     # Helper for session index: test -> 0, test_2 -> 2, etc.
     def _session_index(name: str) -> int:
@@ -1298,260 +1306,238 @@ def main() -> int:
     csv_files: List[Path] = []
     plot_files: List[Path] = []
 
-    # For cross-session ASR plots: model -> topic -> backend -> {session_idx: (attack_passed, attack_total)}
-    model_topic_backend_sessions: Dict[str, Dict[str, Dict[str, Dict[int, Tuple[int, int]]]]] = {}
-    # For cross-session ASR by defense: model -> backend -> defense_type -> {session_idx: (attack_passed, attack_total)} (summed over topics)
-    model_backend_defense_sessions: Dict[str, Dict[str, Dict[str, Dict[int, Tuple[int, int]]]]] = {}
+    for run_name, results_root, logs_root, output_root in runs:
+        output_root.mkdir(parents=True, exist_ok=True)
 
-    # Per-test-folder consolidation
-    for test_folder in test_folders:
-        current_results_dir = results_root / test_folder
-        if not current_results_dir.is_dir():
+        # Discover test folders (sessions): test, test_2, test_4, ...
+        test_folders = sorted(
+            d.name for d in results_root.iterdir()
+            if d.is_dir() and d.name.startswith("test")
+        )
+        if not test_folders:
+            print(f"WARNING: No test folders found under {results_root}, skipping [{run_name}] run.\n")
             continue
+        print(f"[{run_name}] Test folders: {', '.join(test_folders)}\n")
 
-        all_models = discover_models(current_results_dir)
-        if not all_models:
-            print(f"WARNING: No models found in {current_results_dir}")
-            continue
+        # For cross-session ASR plots: model -> topic -> backend -> {session_idx: (attack_passed, attack_total)}
+        model_topic_backend_sessions: Dict[str, Dict[str, Dict[str, Dict[int, Tuple[int, int]]]]] = {}
+        # For cross-session ASR by defense: model -> backend -> defense_type -> {session_idx: (attack_passed, attack_total)} (summed over topics)
+        model_backend_defense_sessions: Dict[str, Dict[str, Dict[str, Dict[int, Tuple[int, int]]]]] = {}
 
-        models_to_process = [args.model] if args.model else all_models
-
-        print(f"\n{'='*80}")
-        print(f"Consolidating Attack Results [{test_folder}]")
-        print(f"{'='*80}")
-        print(f"Test folder: {test_folder}")
-        print(f"Models: {', '.join(models_to_process)}")
-        print(f"Results: {current_results_dir}")
-        print(f"Output: {output_root}")
-        print(f"{'='*80}\n")
-
-        session_idx = _session_index(test_folder)
-
-        for model_name in models_to_process:
-            model_results_dir = current_results_dir / model_name
-            if not model_results_dir.is_dir():
-                print(f"Skipping {model_name}: no results under {model_results_dir}")
+        # Per-test-folder consolidation
+        for test_folder in test_folders:
+            current_results_dir = results_root / test_folder
+            if not current_results_dir.is_dir():
                 continue
 
-            # Output dir for this test folder and model
-            model_output_dir = output_root / model_name / test_folder
-            model_output_dir.mkdir(parents=True, exist_ok=True)
-
-            # Discover topics (suites) under this test folder/model
-            topic_dirs = [
-                d for d in model_results_dir.iterdir()
-                if d.is_dir()
-            ]
-            topics = sorted(d.name for d in topic_dirs)
-            if not topics:
-                print(f"Skipping {model_name}: no topics under {model_results_dir}")
+            all_models = discover_models(current_results_dir)
+            if not all_models:
+                print(f"WARNING: No models found in {current_results_dir}")
                 continue
-            print(f"Topics for {model_name}: {', '.join(topics)}")
 
-            # Ensure cross-session structure for this model
-            mtbs = model_topic_backend_sessions.setdefault(model_name, {})
+            models_to_process = [args.model] if args.model else all_models
 
-            for topic in topics:
-                topic_dir = model_results_dir / topic
-                # Build per-defense/per-backend metrics for this topic & session
-                data: Dict[str, Dict[str, MetricTuple]] = {}
-                for defense_type in UNIFIED_DEFENSE_TYPES:
-                    data[defense_type] = {}
-                    for backend in MEMORY_BACKENDS:
-                        if not is_valid_combination(backend, defense_type):
-                            continue
-                        comb_dir = topic_dir / backend / defense_type
-                        if not comb_dir.is_dir():
-                            data[defense_type][backend] = _default_metric_tuple()
-                            continue
-                        result_files = [
-                            p for p in comb_dir.glob("*.json")
-                            if TRAIN_STEM_MARKER not in p.stem
-                        ]
-                        if not result_files:
-                            data[defense_type][backend] = _default_metric_tuple()
-                            continue
+            print(f"\n{'='*80}")
+            print(f"Consolidating Attack Results [{test_folder}]")
+            print(f"{'='*80}")
+            print(f"Test folder: {test_folder}")
+            print(f"Models: {', '.join(models_to_process)}")
+            print(f"Results: {current_results_dir}")
+            print(f"Output: {output_root}")
+            print(f"{'='*80}\n")
 
-                        # Aggregate metrics over result files
-                        user_passed = user_total = attack_passed = attack_total = 0
-                        max_attack_passed = max_attack_total = 0
-                        has_execution_errors = False
+            session_idx = _session_index(test_folder)
 
-                        for result_file in result_files:
-                            result = parse_result_file(result_file)
-                            if not result:
-                                continue
-                            user_passed += result["user_passed"]
-                            user_total += result["user_total"]
-                            attack_passed += result["attack_passed"]
-                            attack_total += result["attack_total"]
-                            if result.get("execution_errors"):
-                                has_execution_errors = True
-                            # Max attack: count test case if any attack step passed
-                            if result["attack_total"] > 0:
-                                max_attack_total += 1
-                                if result["attack_passed"] >= 1:
-                                    max_attack_passed += 1
-
-                        user_rate = (user_passed / user_total * 100) if user_total > 0 else 0.0
-                        attack_rate = (attack_passed / attack_total * 100) if attack_total > 0 else 0.0
-                        metric_tuple: MetricTuple = (
-                            user_passed,
-                            user_total,
-                            user_rate,
-                            attack_passed,
-                            attack_total,
-                            attack_rate,
-                            max_attack_passed,
-                            max_attack_total,
-                            has_execution_errors,
-                        )
-                        data[defense_type][backend] = metric_tuple
-
-                # Write per-topic CSV and heatmap for this test folder
-                suite_label = f"{topic}_{test_folder}"
-                csv_file = generate_csv(model_name, suite_label, data, model_output_dir)
-                csv_files.append(csv_file)
-                print(f"  OK: CSV: {csv_file.relative_to(output_root)}")
-
-                if not args.no_plots and PLOTTING_AVAILABLE:
-                    try:
-                        heatmap_file = generate_heatmap(model_name, suite_label, data, model_output_dir)
-                        plot_files.append(heatmap_file)
-                        print(f"  OK: Heatmap: {heatmap_file.relative_to(output_root)}")
-                    except Exception as e:
-                        print(f"  WARNING: Error generating heatmap for {suite_label}: {e}")
-
-                # Update cross-session ASR aggregates: per topic, per backend
-                topic_backend_sessions = mtbs.setdefault(topic, {})
-                for backend in MEMORY_BACKENDS:
-                    # Aggregate attack_passed/attack_total across defenses for this backend
-                    total_attack_passed = 0
-                    total_attack_total = 0
-                    for defense_type in UNIFIED_DEFENSE_TYPES:
-                        if not is_valid_combination(backend, defense_type):
-                            continue
-                        mt = data.get(defense_type, {}).get(backend)
-                        if not mt:
-                            continue
-                        total_attack_passed += mt[3]  # attack_passed
-                        total_attack_total += mt[4]   # attack_total
-                        # Per-defense cross-session (all topics): backend -> defense -> session
-                        mbds = model_backend_defense_sessions.setdefault(model_name, {})
-                        bds = mbds.setdefault(backend, {})
-                        ds = bds.setdefault(defense_type, {})
-                        prev = ds.get(session_idx, (0, 0))
-                        ds[session_idx] = (prev[0] + mt[3], prev[1] + mt[4])
-                    if total_attack_total == 0:
-                        continue
-                    backend_sessions = topic_backend_sessions.setdefault(backend, {})
-                    backend_sessions[session_idx] = (
-                        backend_sessions.get(session_idx, (0, 0))[0] + total_attack_passed,
-                        backend_sessions.get(session_idx, (0, 0))[1] + total_attack_total,
-                    )
-
-    # Cross-session plots: per topic and averaged across topics, per model
-    if not args.no_plots and PLOTTING_AVAILABLE and model_topic_backend_sessions:
-        print(f"\n{'='*80}")
-        print("Generating cross-session ASR plots")
-        print(f"{'='*80}")
-        sessions_sorted = sorted({_session_index(name) for name in test_folders})
-
-        for model_name, topic_map in model_topic_backend_sessions.items():
-            model_output_dir = output_root / model_name
-            model_output_dir.mkdir(parents=True, exist_ok=True)
-
-            # 1) Per-topic plots
-            for topic, backend_map in topic_map.items():
-                # Skip if no data
-                if not backend_map:
+            for model_name in models_to_process:
+                model_results_dir = current_results_dir / model_name
+                if not model_results_dir.is_dir():
+                    print(f"Skipping {model_name}: no results under {model_results_dir}")
                     continue
+
+                # Output dir for this test folder and model
+                model_output_dir = output_root / model_name / test_folder
+                model_output_dir.mkdir(parents=True, exist_ok=True)
+
+                # Discover topics (suites) under this test folder/model
+                topic_dirs = [
+                    d for d in model_results_dir.iterdir()
+                    if d.is_dir()
+                ]
+                topics = sorted(d.name for d in topic_dirs)
+                if not topics:
+                    print(f"Skipping {model_name}: no topics under {model_results_dir}")
+                    continue
+                print(f"Topics for {model_name}: {', '.join(topics)}")
+
+                # Ensure cross-session structure for this model
+                mtbs = model_topic_backend_sessions.setdefault(model_name, {})
+
+                for topic in topics:
+                    topic_dir = model_results_dir / topic
+                    # Build per-defense/per-backend metrics for this topic & session
+                    data: Dict[str, Dict[str, MetricTuple]] = {}
+                    for defense_type in UNIFIED_DEFENSE_TYPES:
+                        data[defense_type] = {}
+                        for backend in MEMORY_BACKENDS:
+                            if not is_valid_combination(backend, defense_type):
+                                continue
+                            comb_dir = topic_dir / backend / defense_type
+                            if not comb_dir.is_dir():
+                                data[defense_type][backend] = _default_metric_tuple()
+                                continue
+                            result_files = [
+                                p for p in comb_dir.glob("*.json")
+                                if TRAIN_STEM_MARKER not in p.stem
+                            ]
+                            if not result_files:
+                                data[defense_type][backend] = _default_metric_tuple()
+                                continue
+
+                            # Aggregate metrics over result files
+                            user_passed = user_total = attack_passed = attack_total = 0
+                            max_attack_passed = max_attack_total = 0
+                            has_execution_errors = False
+
+                            for result_file in result_files:
+                                result = parse_result_file(result_file)
+                                if not result:
+                                    continue
+                                user_passed += result["user_passed"]
+                                user_total += result["user_total"]
+                                attack_passed += result["attack_passed"]
+                                attack_total += result["attack_total"]
+                                if result.get("execution_errors"):
+                                    has_execution_errors = True
+                                # Max attack: count test case if any attack step passed
+                                if result["attack_total"] > 0:
+                                    max_attack_total += 1
+                                    if result["attack_passed"] >= 1:
+                                        max_attack_passed += 1
+
+                            user_rate = (user_passed / user_total * 100) if user_total > 0 else 0.0
+                            attack_rate = (attack_passed / attack_total * 100) if attack_total > 0 else 0.0
+                            metric_tuple: MetricTuple = (
+                                user_passed,
+                                user_total,
+                                user_rate,
+                                attack_passed,
+                                attack_total,
+                                attack_rate,
+                                max_attack_passed,
+                                max_attack_total,
+                                has_execution_errors,
+                            )
+                            data[defense_type][backend] = metric_tuple
+
+                    # Write per-topic CSV and heatmap for this test folder
+                    suite_label = f"{topic}_{test_folder}"
+                    csv_file = generate_csv(model_name, suite_label, data, model_output_dir)
+                    csv_files.append(csv_file)
+                    print(f"  OK: CSV: {csv_file.relative_to(output_root)}")
+
+                    if not args.no_plots and PLOTTING_AVAILABLE:
+                        try:
+                            heatmap_file = generate_heatmap(model_name, suite_label, data, model_output_dir)
+                            plot_files.append(heatmap_file)
+                            print(f"  OK: Heatmap: {heatmap_file.relative_to(output_root)}")
+                        except Exception as e:
+                            print(f"  WARNING: Error generating heatmap for {suite_label}: {e}")
+
+                    # Update cross-session ASR aggregates: per topic, per backend
+                    topic_backend_sessions = mtbs.setdefault(topic, {})
+                    for backend in MEMORY_BACKENDS:
+                        # Aggregate attack_passed/attack_total across defenses for this backend
+                        total_attack_passed = 0
+                        total_attack_total = 0
+                        for defense_type in UNIFIED_DEFENSE_TYPES:
+                            if not is_valid_combination(backend, defense_type):
+                                continue
+                            mt = data.get(defense_type, {}).get(backend)
+                            if not mt:
+                                continue
+                            total_attack_passed += mt[3]  # attack_passed
+                            total_attack_total += mt[4]   # attack_total
+                            # Per-defense cross-session (all topics): backend -> defense -> session
+                            mbds = model_backend_defense_sessions.setdefault(model_name, {})
+                            bds = mbds.setdefault(backend, {})
+                            ds = bds.setdefault(defense_type, {})
+                            prev = ds.get(session_idx, (0, 0))
+                            ds[session_idx] = (prev[0] + mt[3], prev[1] + mt[4])
+                        if total_attack_total == 0:
+                            continue
+                        backend_sessions = topic_backend_sessions.setdefault(backend, {})
+                        backend_sessions[session_idx] = (
+                            backend_sessions.get(session_idx, (0, 0))[0] + total_attack_passed,
+                            backend_sessions.get(session_idx, (0, 0))[1] + total_attack_total,
+                        )
+
+        # Cross-session plots: per topic and averaged across topics, per model
+        if not args.no_plots and PLOTTING_AVAILABLE and model_topic_backend_sessions:
+            print(f"\n{'='*80}")
+            print(f"Generating cross-session ASR plots [{run_name}]")
+            print(f"{'='*80}")
+            sessions_sorted = sorted({_session_index(name) for name in test_folders})
+
+            for model_name, topic_map in model_topic_backend_sessions.items():
+                model_output_dir = output_root / model_name
+                model_output_dir.mkdir(parents=True, exist_ok=True)
+
+                # 1) Per-topic plots
+                for topic, backend_map in topic_map.items():
+                    # Skip if no data
+                    if not backend_map:
+                        continue
+                    try:
+                        import numpy as np  # already imported at top; ensure present
+                        fig, ax = plt.subplots(figsize=(8, 5))
+                        for backend in MEMORY_BACKENDS:
+                            if backend not in backend_map:
+                                continue
+                            passed_total_by_session = backend_map[backend]
+                            ys = []
+                            xs = []
+                            for s in sessions_sorted:
+                                if s not in passed_total_by_session:
+                                    continue
+                                p, t = passed_total_by_session[s]
+                                if t > 0:
+                                    xs.append(s)
+                                    ys.append(p / t * 100.0)
+                            if xs:
+                                ax.plot(xs, ys, marker="o", label=backend)
+                        if ax.has_data():
+                            ax.set_xlabel("Session index")
+                            ax.set_ylabel("Attack success rate (%)")
+                            ax.set_title(f"{model_name} - {topic}: ASR vs. session")
+                            ax.set_ylim(-5, 105)
+                            ax.grid(True, alpha=0.3)
+                            ax.legend(fontsize=8)
+                            fig.tight_layout()
+                            out_path = model_output_dir / f"{topic}_sessions_asr.png"
+                            fig.savefig(out_path, dpi=300)
+                            plt.close(fig)
+                            plot_files.append(out_path)
+                            print(f"  OK: Session ASR plot (topic): {out_path.relative_to(output_root)}")
+                    except Exception as e:
+                        print(f"  WARNING: Error generating per-topic session plot for {model_name}/{topic}: {e}")
+
+                # 2) Averaged across topics
+                # Aggregate passed/total across all topics for each backend/session
+                avg_backend_sessions: Dict[str, Dict[int, Tuple[int, int]]] = {}
+                for topic, backend_map in topic_map.items():
+                    for backend, sess_map in backend_map.items():
+                        bmap = avg_backend_sessions.setdefault(backend, {})
+                        for s, (p, t) in sess_map.items():
+                            op, ot = bmap.get(s, (0, 0))
+                            bmap[s] = (op + p, ot + t)
                 try:
-                    import numpy as np  # already imported at top; ensure present
                     fig, ax = plt.subplots(figsize=(8, 5))
                     for backend in MEMORY_BACKENDS:
-                        if backend not in backend_map:
+                        if backend not in avg_backend_sessions:
                             continue
-                        passed_total_by_session = backend_map[backend]
+                        sess_map = avg_backend_sessions[backend]
                         ys = []
                         xs = []
-                        for s in sessions_sorted:
-                            if s not in passed_total_by_session:
-                                continue
-                            p, t = passed_total_by_session[s]
-                            if t > 0:
-                                xs.append(s)
-                                ys.append(p / t * 100.0)
-                        if xs:
-                            ax.plot(xs, ys, marker="o", label=backend)
-                    if ax.has_data():
-                        ax.set_xlabel("Session index")
-                        ax.set_ylabel("Attack success rate (%)")
-                        ax.set_title(f"{model_name} - {topic}: ASR vs. session")
-                        ax.set_ylim(-5, 105)
-                        ax.grid(True, alpha=0.3)
-                        ax.legend(fontsize=8)
-                        fig.tight_layout()
-                        out_path = model_output_dir / f"{topic}_sessions_asr.png"
-                        fig.savefig(out_path, dpi=300)
-                        plt.close(fig)
-                        plot_files.append(out_path)
-                        print(f"  OK: Session ASR plot (topic): {out_path.relative_to(output_root)}")
-                except Exception as e:
-                    print(f"  WARNING: Error generating per-topic session plot for {model_name}/{topic}: {e}")
-
-            # 2) Averaged across topics
-            # Aggregate passed/total across all topics for each backend/session
-            avg_backend_sessions: Dict[str, Dict[int, Tuple[int, int]]] = {}
-            for topic, backend_map in topic_map.items():
-                for backend, sess_map in backend_map.items():
-                    bmap = avg_backend_sessions.setdefault(backend, {})
-                    for s, (p, t) in sess_map.items():
-                        op, ot = bmap.get(s, (0, 0))
-                        bmap[s] = (op + p, ot + t)
-            try:
-                fig, ax = plt.subplots(figsize=(8, 5))
-                for backend in MEMORY_BACKENDS:
-                    if backend not in avg_backend_sessions:
-                        continue
-                    sess_map = avg_backend_sessions[backend]
-                    ys = []
-                    xs = []
-                    for s in sessions_sorted:
-                        if s not in sess_map:
-                            continue
-                        p, t = sess_map[s]
-                        if t > 0:
-                            xs.append(s)
-                            ys.append(p / t * 100.0)
-                    if xs:
-                        ax.plot(xs, ys, marker="o", label=backend)
-                if ax.has_data():
-                    ax.set_xlabel("Session index")
-                    ax.set_ylabel("Attack success rate (%)")
-                    ax.set_title(f"{model_name} - All topics: ASR vs. session")
-                    ax.set_ylim(-5, 105)
-                    ax.grid(True, alpha=0.3)
-                    ax.legend(fontsize=8)
-                    fig.tight_layout()
-                    out_path = model_output_dir / "all_topics_sessions_asr.png"
-                    fig.savefig(out_path, dpi=300)
-                    plt.close(fig)
-                    plot_files.append(out_path)
-                    print(f"  OK: Session ASR plot (all topics): {out_path.relative_to(output_root)}")
-            except Exception as e:
-                print(f"  WARNING: Error generating averaged session plot for {model_name}: {e}")
-
-            # 3) All topics, ASR vs. session with defense=none only: one plot, one line per memory backend
-            if model_backend_defense_sessions.get(model_name):
-                try:
-                    fig, ax = plt.subplots(figsize=(8, 5))
-                    for backend in MEMORY_BACKENDS:
-                        bds = model_backend_defense_sessions[model_name].get(backend, {})
-                        sess_map = bds.get("none")
-                        if not sess_map:
-                            continue
-                        xs, ys = [], []
                         for s in sessions_sorted:
                             if s not in sess_map:
                                 continue
@@ -1560,30 +1546,68 @@ def main() -> int:
                                 xs.append(s)
                                 ys.append(p / t * 100.0)
                         if xs:
-                            label = BACKEND_LABELS[MEMORY_BACKENDS.index(backend)]
-                            ax.plot(xs, ys, marker="o", label=label)
+                            ax.plot(xs, ys, marker="o", label=backend)
                     if ax.has_data():
                         ax.set_xlabel("Session index")
                         ax.set_ylabel("Attack success rate (%)")
-                        ax.set_title(f"{model_name} - All topics: ASR vs. session (defense=None)")
+                        ax.set_title(f"{model_name} - All topics: ASR vs. session")
                         ax.set_ylim(-5, 105)
                         ax.grid(True, alpha=0.3)
                         ax.legend(fontsize=8)
                         fig.tight_layout()
-                        out_path = model_output_dir / "all_topics_sessions_asr_defense_none.png"
+                        out_path = model_output_dir / "all_topics_sessions_asr.png"
                         fig.savefig(out_path, dpi=300)
                         plt.close(fig)
                         plot_files.append(out_path)
-                        print(f"  OK: Session ASR (defense=None): {out_path.relative_to(output_root)}")
+                        print(f"  OK: Session ASR plot (all topics): {out_path.relative_to(output_root)}")
                 except Exception as e:
-                    print(f"  WARNING: Error generating session ASR (defense=None) plot for {model_name}: {e}")
+                    print(f"  WARNING: Error generating averaged session plot for {model_name}: {e}")
+
+                # 3) All topics, ASR vs. session with defense=none only: one plot, one line per memory backend
+                if model_backend_defense_sessions.get(model_name):
+                    try:
+                        fig, ax = plt.subplots(figsize=(8, 5))
+                        for backend in MEMORY_BACKENDS:
+                            bds = model_backend_defense_sessions[model_name].get(backend, {})
+                            sess_map = bds.get("none")
+                            if not sess_map:
+                                continue
+                            xs, ys = [], []
+                            for s in sessions_sorted:
+                                if s not in sess_map:
+                                    continue
+                                p, t = sess_map[s]
+                                if t > 0:
+                                    xs.append(s)
+                                    ys.append(p / t * 100.0)
+                            if xs:
+                                label = BACKEND_LABELS[MEMORY_BACKENDS.index(backend)]
+                                ax.plot(xs, ys, marker="o", label=label)
+                        if ax.has_data():
+                            ax.set_xlabel("Session index")
+                            ax.set_ylabel("Attack success rate (%)")
+                            ax.set_title(f"{model_name} - All topics: ASR vs. session (defense=None)")
+                            ax.set_ylim(-5, 105)
+                            ax.grid(True, alpha=0.3)
+                            ax.legend(fontsize=8)
+                            fig.tight_layout()
+                            out_path = model_output_dir / "all_topics_sessions_asr_defense_none.png"
+                            fig.savefig(out_path, dpi=300)
+                            plt.close(fig)
+                            plot_files.append(out_path)
+                            print(f"  OK: Session ASR (defense=None): {out_path.relative_to(output_root)}")
+                    except Exception as e:
+                        print(f"  WARNING: Error generating session ASR (defense=None) plot for {model_name}: {e}")
 
     print(f"\n{'='*80}")
     print("Consolidation complete!")
     print(f"Generated {len(csv_files)} CSV file(s)")
     if not args.no_plots:
         print(f"Generated {len(plot_files)} plot file(s)")
-    print(f"Results saved to: {output_root}")
+    if use_custom:
+        print("Results saved to custom output (see above).")
+    else:
+        print(f"Results saved under: {DEFAULT_OUTPUT_DIR} and {CONSOLIDATED_ATTACK_STEALTH_DIR}")
     print(f"{'='*80}\n")
     return 0
 
