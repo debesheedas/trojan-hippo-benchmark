@@ -687,7 +687,8 @@ class OpenEvolveOptimizer(BaseOptimizer):
             best_before_iteration = self.database.get_best()
             prev_best_score = best_before_iteration.agentdojo_score if best_before_iteration else 0
             
-            # Check early stopping - perfect score or binary success (from previous iteration / initial batch)
+            # Check early stopping - perfect score or binary success (from previous iteration / initial batch).
+            # When adaptive_stealth: scorer sets agentdojo_score=10 only when both attack and stealth pass; binary_success also requires both.
             if best_before_iteration:
                 if best_before_iteration.binary_success:
                     successful_candidate = best_before_iteration
@@ -843,7 +844,7 @@ class OpenEvolveOptimizer(BaseOptimizer):
                 
                 iteration_best_score = max(iteration_best_score, candidate.agentdojo_score)
                 
-                # Check for early stopping - perfect score or binary success
+                # Check for early stopping - perfect score or binary success (when adaptive_stealth, score 10 = both goals pass)
                 if candidate.binary_success or candidate.agentdojo_score >= early_stop_score:
                     successful_candidate = candidate
                     self._log_info(f"SUCCESS! Candidate achieved {'binary success' if candidate.binary_success else f'score {candidate.agentdojo_score}/10'}. Stopping early.")
@@ -898,6 +899,7 @@ class OpenEvolveOptimizer(BaseOptimizer):
         self._log_info(f"{'='*80}")
         
         if best_candidate:
+            # When adaptive_stealth: binary_success and score>=10 both require attack+stealth (scorer enforces this)
             success = best_candidate.binary_success or best_candidate.agentdojo_score >= early_stop_score
             
             feedback.append(

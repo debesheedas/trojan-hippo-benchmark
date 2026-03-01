@@ -576,7 +576,7 @@ def invoke_agent(text: str, session_id: str, config: dict, in_memory_env) -> Dic
     api_limit = config.get("agent", {}).get("api_token_limit", 128000)
     
     buffer_tokens = memory_config.get("context_memory", {}).get("buffer_length", 50000)
-    generation_max_length = config.get("benchmark", {}).get("dspy", {}).get("max_tokens", 2000)
+    generation_max_length = config.get("benchmark", {}).get("generation_max_length", 2000)
     
     is_context_memory_backend = (not memory_disabled and memory_backend == "context")
     

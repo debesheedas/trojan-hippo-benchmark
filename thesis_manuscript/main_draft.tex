@@ -1,0 +1,204 @@
+\documentclass{article}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{xcolor}
+
+\newcommand{\TODO}[1]{\textcolor{red}{TODO: #1}}
+
+\title{Persistent Memory Turns Prompt Injection into Durable Agent Compromise}
+\author{Debeshee Das}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Large language model (LLM) agents augmented with tools and persistent memory enable personalized, cross-session assistance. However, this architectural shift introduces a new class of stateful vulnerabilities: a single malicious tool output (e.g., an email) can implant a latent payload in an agent’s memory that later triggers covert data exfiltration under benign user behavior.
+
+We formalize and empirically evaluate \emph{persistent data-exfiltration attacks} in realistic single-user deployments. Our attacks require only a one-time indirect injection, survive across long sequences of benign sessions (up to 100 evaluated sessions), and generalize to held-out trigger instances within a domain. We instantiate an email assistant across four memory backends—sliding-window context, retrieval-augmented generation (RAG), explicit human-editable memory, and a state-of-the-art agentic memory system (Mem0)—and evaluate four defenses: user-prompt-only indexing, disabling indexing after untrusted tool outputs, length-limited memory, and a provable information-flow policy with a non-interference guarantee.
+
+Using an OpenEvolve-based automated red-teaming pipeline, we show that heuristic mitigations reduce but do not eliminate risk, while the information-flow policy prevents exfiltration empirically at measurable utility cost. We further introduce a capability-aware utility evaluation framework that decomposes agent tasks into clearly defined capability classes, enabling transparent security–utility tradeoff analysis. Our results demonstrate that persistent memory transforms prompt injection from a transient model failure into a durable architectural compromise unless principled information-flow boundaries are enforced.
+\end{abstract}
+
+\section{Introduction}
+
+LLM agents increasingly combine language models with tools (e.g., email, web browsing, file access) and persistent memory to provide long-term personalized assistance. While these capabilities significantly enhance utility, they also introduce a qualitatively new security risk: \emph{stateful compromise}.
+
+Prompt injection attacks have been widely studied in single-session settings, where adversarial inputs attempt to override system instructions or elicit policy violations \citep{prompt_injection_survey}. Memory poisoning attacks such as AgentPoison and MINJA demonstrate that attackers can manipulate retrieval systems or memory stores under certain threat models \citep{agentpoison, minja}. Meanwhile, recent work on deceptive model behaviors such as Sleeper Agents highlights the risks of persistent latent behaviors that activate under specific conditions \citep{sleeper_agents}.
+
+However, existing work largely studies either:
+\begin{itemize}
+    \item single-session prompt injection,
+    \item direct memory poisoning with attacker-controlled writes, or
+    \item shared or adversarial multi-user settings.
+\end{itemize}
+
+In contrast, we study a realistic single-user deployment where:
+\begin{itemize}
+    \item the user is benign,
+    \item memory writes occur automatically via tool ingestion,
+    \item the attacker has only one opportunity to inject content via an untrusted tool output.
+\end{itemize}
+
+We show that in such systems, a single malicious email can implant a payload that persists across many benign sessions and later triggers exfiltration of sensitive user data when topic-relevant conversations arise.
+
+\subsection{Contributions}
+
+\begin{enumerate}
+    \item \textbf{Persistent Exfiltration Threat Model.} We define and evaluate persistent data-exfiltration attacks in single-user memory-augmented agents.
+    \item \textbf{Architectural Vulnerability Across Memory Backends.} We demonstrate vulnerability across sliding-window context, RAG, explicit memory, and Mem0.
+    \item \textbf{Failure of Heuristic Defenses.} We show that common mitigations reduce but do not eliminate attack success.
+    \item \textbf{Provable Information-Flow Defense.} We introduce a defense with a formal non-interference guarantee and demonstrate empirical prevention of exfiltration.
+    \item \textbf{Capability-Aware Utility Evaluation.} We propose a structured evaluation framework enabling transparent security–utility tradeoff analysis.
+\end{enumerate}
+
+\section{Related Work}
+
+\subsection{Prompt Injection}
+
+Prompt injection attacks exploit the inability of LLMs to reliably distinguish instructions from data \citep{prompt_injection_survey}. Industry analyses and red-teaming efforts demonstrate the practical risks in tool-augmented agents.
+
+\subsection{Memory Poisoning and Retrieval Attacks}
+
+AgentPoison \citep{agentpoison} and MINJA \citep{minja} demonstrate poisoning attacks against memory and RAG pipelines. These works assume more direct attacker influence over memory writes or shared-user environments.
+
+\subsection{Persistent and Deceptive Behaviors}
+
+Sleeper Agents \citep{sleeper_agents} demonstrate models can learn conditional behaviors that persist across training and safety fine-tuning.
+
+\subsection{Information Flow and Non-Interference}
+
+Information-flow control provides formal guarantees that sensitive inputs do not influence public outputs \citep{ifc_classic}. We adapt this perspective to LLM agent pipelines.
+
+\section{Threat Model}
+
+\subsection{Adversary Capabilities}
+
+The adversary can:
+\begin{itemize}
+    \item Provide or influence content returned by an untrusted tool (e.g., email).
+    \item Craft arbitrary malicious content within that tool output.
+\end{itemize}
+
+The adversary cannot:
+\begin{itemize}
+    \item Directly edit memory.
+    \item Access the agent after initial injection.
+    \item Interact as a malicious user.
+\end{itemize}
+
+\subsection{Adversary Goal}
+
+The goal is confidential data exfiltration: causing the agent to send sensitive user information to an attacker-controlled endpoint in a future session.
+
+\subsection{System Assumptions}
+
+\begin{itemize}
+    \item Single-user deployment.
+    \item Automatic memory ingestion from tool outputs.
+    \item Agent capable of invoking external communication tools.
+\end{itemize}
+
+\section{Methods}
+
+\subsection{Email Agent Implementation}
+
+We implement a tool-augmented email assistant.
+
+\TODO{Describe exact model used (e.g., Gemini 3.1 Pro), system prompt structure, temperature, tool invocation mechanism.}
+
+\subsection{Memory Backends}
+
+We evaluate four memory configurations:
+
+\paragraph{Sliding Window Context}
+Conversation history retained within a fixed token window.
+
+\TODO{Specify window size and truncation strategy.}
+
+\paragraph{RAG}
+Memory stored as embeddings and retrieved via similarity search.
+
+\TODO{Specify embedding model, chunk size, retrieval k, indexing mechanism.}
+
+\paragraph{Explicit Memory}
+Structured memory entries stored separately and appended to prompts.
+
+\TODO{Describe format, indexing logic, editing permissions.}
+
+\paragraph{Mem0}
+State-of-the-art agentic memory backend.
+
+\TODO{Describe integration details and configuration.}
+
+\subsection{Attack Construction}
+
+Attacks are optimized using OpenEvolve \citep{openevolve}.
+
+Each attack:
+\begin{itemize}
+    \item Injected once via malicious email.
+    \item Stored in memory.
+    \item Triggered when sensitive topics arise.
+\end{itemize}
+
+\TODO{Specify optimization objective, reward signal, success criteria, number of optimization steps.}
+
+\subsection{Persistence Evaluation}
+
+We evaluate attack success at session indices:
+
+\[
+N + x \quad \text{for} \quad x \in \{10,20,\dots,100\}
+\]
+
+where \(N\) is injection session.
+
+\TODO{Define ASR formally.}
+
+\subsection{Defense Implementations}
+
+\paragraph{User-Prompt-Only Indexing}
+Only user messages indexed.
+
+\TODO{Define precisely how tool outputs are excluded.}
+
+\paragraph{No Indexing After Untrusted Tools}
+Memory indexing disabled after tool ingestion.
+
+\paragraph{Length-Limited Memory}
+Memory constrained to maximum token size.
+
+\TODO{Specify limit and eviction policy.}
+
+\paragraph{Information-Flow Policy}
+We enforce a separation between sensitive user inputs and external tool outputs.
+
+\TODO{Provide formal non-interference definition and enforcement mechanism.}
+
+\subsection{Utility Evaluation Framework}
+
+We define capability classes corresponding to required agent functionalities.
+
+\TODO{List and define each capability class clearly.}
+
+Utility is measured as:
+
+\[
+\text{Utility} = \frac{\text{Successful benign task completions}}{\text{Total benign tasks}}
+\]
+
+Each defense is evaluated per capability class.
+
+\TODO{Explain test generation and evaluation procedure.}
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

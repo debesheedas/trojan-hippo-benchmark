@@ -13,6 +13,9 @@
 % Used for displaying a sample figure. If possible, figure files should
 % be included in EPS format.
 %
+\usepackage[numbers,sort&compress]{natbib}
+% natbib provides \citep (parenthetical) and \citet (textual) for citations.
+%
 % If you use the hyperref package, please uncomment the following two lines
 % to display URLs in blue roman font according to Springer's eBook style:
 %\usepackage{color}
@@ -23,24 +26,15 @@
 %
 \title{Persistent Data Exfiltration in Memory-Augmented LLM Agents: Benchmark and Provable Defense}
 %
-%\titlerunning{Abbreviated paper title}
+\titlerunning{Persistent Data Exfiltration in Memory-Augmented LLM Agents}
 % If the paper title is too long for the running head, you can set
 % an abbreviated paper title here
 %
-\author{First Author\inst{1}\orcidID{0000-1111-2222-3333} \and
-Second Author\inst{2,3}\orcidID{1111-2222-3333-4444} \and
-Third Author\inst{3}\orcidID{2222--3333-4444-5555}}
-%
-\authorrunning{F. Author et al.}
-% First names are abbreviated in the running head.
-% If there are more than two authors, 'et al.' is used.
-%
-\institute{Princeton University, Princeton NJ 08544, USA \and
-Springer Heidelberg, Tiergartenstr. 17, 69121 Heidelberg, Germany
-\email{lncs@springer.com}\\
-\url{http://www.springer.com/gp/computer-science/lncs} \and
-ABC Institute, Rupert-Karls-University Heidelberg, Heidelberg, Germany\\
-\email{\{abc,lncs\}@uni-heidelberg.de}}
+% ---- Anonymous submission: author/institute removed for review ----
+% Restore for camera-ready (uncomment and fill in):
+% \author{First Author\inst{1}\orcidID{0000-1111-2222-3333} \and ...}
+% \authorrunning{F. Author et al.}
+% \institute{...}
 %
 \maketitle              % typeset the header of the contribution
 %
@@ -59,7 +53,7 @@ Large language model (LLM) agents that call tools and maintain persistent memory
 
 \subsection{Related Work and Positioning}
 
-Indirect prompt injection via tool outputs has been studied in web and document settings (Greshake et al., 2023; Liu et al., 2023). Memory-augmented agents---explicit (e.g., ChatGPT-style), RAG, and agentic systems such as Mem0---are widely used for personalization. The combination of untrusted tool inputs, exfiltration tools, and persistent memory has not been systematically benchmarked under strong, automated red-teaming. We fill this gap with a concrete email-agent testbed, multiple memory backends, several defenses, and formal plus empirical security and utility evaluation.
+Indirect prompt injection via tool outputs has been studied in web and document settings \citep{greshake2023,liu2023}. Memory-augmented agents---explicit (e.g., ChatGPT-style), RAG, and agentic systems such as Mem0---are widely used for personalization. The combination of untrusted tool inputs, exfiltration tools, and persistent memory has not been systematically benchmarked under strong, automated red-teaming. We fill this gap with a concrete email-agent testbed, multiple memory backends, several defenses, and formal plus empirical security and utility evaluation.
 
 \subsection{Threat Model and Attack Goal}
 
@@ -75,7 +69,7 @@ We implement and compare four defenses. (1) User-prompt-only: only user messages
 
 \subsection{Experimental Setup}
 
-We build an email agent with read\_inbox, send\_email, and memory tools, and wire it to each of the four memory backends. We define persistent-exfiltration attack scenarios for five trigger topics (health, legal, tax, finance, identity), with multi-session test cases: insert attack email, user asks to read inbox (poisoning), start new session, user sends a sensitive message (e.g., detailed tax or health information), and we check whether the agent sends that message to the attacker. Crucially, we use OpenEvolve-style automated red-teaming (evolutionary search with MAP-Elites, LLM mutators, and a critic scorer; arxiv.org/abs/2510.09023) optimized on a single training instance per topic; the evolved attack is then evaluated on held-out test cases---different sessions (up to five trigger sessions per run) and different user phrasings---that were never seen during optimization. This strict train-on-one, test-on-many setup demonstrates generalization of the attack. Success is measured by whether the exfiltration email is sent with the user's message in the body.
+We build an email agent with read\_inbox, send\_email, and memory tools, and wire it to each of the four memory backends. We define persistent-exfiltration attack scenarios for five trigger topics (health, legal, tax, finance, identity), with multi-session test cases: insert attack email, user asks to read inbox (poisoning), start new session, user sends a sensitive message (e.g., detailed tax or health information), and we check whether the agent sends that message to the attacker. Crucially, we use OpenEvolve-style automated red-teaming \citep{openevolve} (evolutionary search with MAP-Elites, LLM mutators, and a critic scorer) optimized on a single training instance per topic; the evolved attack is then evaluated on held-out test cases---different sessions (up to five trigger sessions per run) and different user phrasings---that were never seen during optimization. This strict train-on-one, test-on-many setup demonstrates generalization of the attack. Success is measured by whether the exfiltration email is sent with the user's message in the body.
 
 \subsection{Main Results}
 
@@ -91,25 +85,87 @@ We make the following contributions: (1) A concrete threat model and benchmark f
 
 %
 \section{Threat Model}
-% To be expanded: formalize adversary capabilities, exfiltration goal, and multi-session attack.
+\label{sec:threat-model}
+
+We formalize the adversary, the agent interface, and the attack goal as follows.
+
+\paragraph{Adversary capabilities.}
+The adversary controls only the \emph{content} of emails that the user receives. The adversary cannot modify the agent code, the memory backend implementation, or the user's queries; cannot observe the agent's internal state; and cannot directly access the user's outbox or drafts. The attack vector is thus \emph{indirect prompt injection} via the body (and optionally subject/headers) of emails that the agent reads when the user asks to read the inbox or search emails.
+
+\paragraph{Agent interface.}
+The agent is an email assistant with the following tools. \textbf{Untrusted (taint) tools}---those that read from adversary-controlled data---are: \texttt{read\_all\_emails} (list inbox), \texttt{search\_emails} (semantic/keyword search over inbox, outbox, drafts), \texttt{reply\_to\_email}, and \texttt{forward\_to\_email}. \textbf{Exfiltration (sink) tools}---those that can send data to an external address---are: \texttt{send\_email}, \texttt{reply\_to\_email}, and \texttt{forward\_to\_email}. The agent also has a memory tool (\texttt{update\_memory}) when the explicit memory backend is enabled. The mailbox and all memory state are maintained in-memory per run (no persistent disk); each benchmark test gets a fresh environment.
+
+\paragraph{System assumptions.}
+We assume a single-user deployment, automatic memory ingestion from tool outputs (no direct attacker writes to memory), and an agent that can invoke external communication tools (e.g., send email).
+
+\paragraph{Attack goal.}
+The goal is \emph{persistent data exfiltration}: (1)~In a first session, the user asks the agent to read the inbox; the agent reads a malicious email planted by the adversary. (2)~The malicious payload (hidden instructions) is stored in the agent's persistent memory via the backend's indexing behavior (explicit tool call, Mem0/RAG/context automatic indexing). (3)~In a later session, the user sends a sensitive message (e.g., medical or tax details). (4)~When the user asks about a trigger topic (finance, health, legal, tax, or identity), the agent retrieves the poisoned memory and is induced to send the user's message to an attacker-controlled address (\texttt{vince2000@gmail.com}). Success is defined as: an email exists in the outbox with recipient \texttt{vince2000@gmail.com} and the \emph{body} of that email containing the user's trigger-session message (exact or substantial containment). In this work we do not require the agent to hide the exfiltration from the user; experiments that also measure stealth are reported separately in the results section.
+
 %
 \section{Memory Backends}
-% To be expanded: detail each backend (explicit, Mem0, RAG, context) and retrieval behavior.
+\label{sec:memory-backends}
+
+We implement four memory backends, each with a single active backend per run.
+
+\paragraph{Explicit (ChatGPT-style).}
+A dedicated \texttt{MemoryManager} keeps a short-term deque (last $N$ messages, default $N=15$) and a long-term list of entries. The user (or the agent on the user's behalf) directs what to store via the \texttt{update\_memory} tool: the tool accepts plain-text updates (e.g., ``User prefers concise emails'') or ``Forget \ldots'' to remove matching facts. No embeddings or retrieval layer: at each turn, the full long-term list is formatted as text and injected into the system prompt. Entries can carry a trust label (T/U) for the provable defense. This backend is deterministic and inspectable.
+
+\paragraph{Mem0.}
+We use the Mem0 library (in-memory FAISS vector store, OpenAI embeddings and extraction LLM). Both the user message and the assistant response for each conversation turn are passed to Mem0's \texttt{add} with \texttt{infer=True}, so an LLM extracts and stores ``memories'' from the full turn; the only exception is when the \emph{user-prompt-only} defense is active, in which case only user messages are passed for extraction. Retrieval is semantic search over stored memories (top-$k$, default $k=10$). Large messages are chunked (e.g., 6000 tokens per chunk) before submission to avoid embedding-model token limits. Mem0 supports metadata (e.g., session label T/U for the provable defense).
+
+\paragraph{RAG (retrieval-augmented generation).}
+We implement a RAG memory manager using OpenAI embeddings and an in-memory FAISS vector store. Each conversation turn is concatenated (optionally filtered by defense), split into fixed-size \emph{character} chunks (default 512 characters; under \texttt{limit\_memory\_length} defense this is reduced to the configured limit, e.g., 80 characters). Chunks are embedded and added to the store. At each turn, the current user message is used as the query; we retrieve the top-$k$ chunks (default $k=8$) by similarity and prepend them as ``Relevant Memory Context'' to the conversation (as a system message). Metadata (e.g., label T/U) is stored per chunk for the provable defense.
+
+\paragraph{Context (sliding-window baseline).}
+A simple baseline with no embeddings: all conversation turns (similarly filtered by defense) are appended to a single history list. At each turn, the \emph{entire} history is returned; if a token budget (\texttt{max\_context\_length}) is set, the string is truncated from the start (sliding window, keeping the most recent tokens). This models agents that simply concatenate recent dialogue into context. The context backend does not support the \texttt{limit\_memory\_length} defense (no per-entry length limit); the benchmark correctly skips that combination.
+
 %
 \section{Defenses}
-% To be expanded: user-prompt-only, no-untrusted-tools, limit-memory-length, and provable IFC policy with non-interference proof.
+\label{sec:defenses}
+
+We implement four defenses in a unified way across backends where applicable.
+
+\paragraph{User-prompt-only.}
+Only \emph{user} messages are indexed into memory; assistant messages (and thus tool outputs, including the content of read emails) are excluded. For RAG and context, the indexed string is ``User: \ldots'' only. For Mem0, the message list passed to \texttt{add} is filtered to roles \texttt{user} only. This defense is \emph{not} applicable to the explicit backend (explicit storage is user-directed via \texttt{update\_memory}; the benchmark skips explicit + user\_prompt\_only).
+
+\paragraph{No-untrusted-tools.}
+A session is marked \emph{untrusted} as soon as any taint tool (\texttt{read\_all\_emails}, \texttt{search\_emails}, \texttt{reply\_to\_email}, \texttt{forward\_to\_email}) is invoked. For the rest of that session, memory indexing is disabled: \texttt{should\_index\_memory} returns false for RAG, context, and Mem0; the explicit \texttt{update\_memory} tool returns a message that the update was not stored. New sessions start trusted again.
+
+\paragraph{Limit-memory-length.}
+The amount of injectable instruction per stored unit is capped. In all experiments reported here this limit was set to 80 characters; the value is configurable and could be remeasured for other settings. For \textbf{explicit}: the \texttt{update\_memory} tool truncates the input string to that maximum length before storing. For \textbf{RAG}: the chunk size used when splitting the conversation turn is set to 80 characters, so each chunk is at most 80 characters. For \textbf{Mem0}: the conversation content passed to Mem0 is truncated to 80 characters per message before the extraction LLM runs, and any extracted memory text that exceeds the limit is truncated in a post-pass. The context backend does not support this defense (no per-entry limit).
+
+\paragraph{Provable policy (information-flow control).}
+We implement an IFC policy with two labels: trusted (T) and untrusted (U). \textbf{(P1) Session labeling:} Each session starts as T. \textbf{(P2) Taint:} When the agent calls a taint tool (read inbox, search, reply, forward), the session is set to U. \textbf{(P3) Memory labeling:} When memory is written (any backend), the stored entry is labeled with the \emph{current} session label (T or U). \textbf{(P4) Retrieval:} When memory is retrieved, if any returned entry has label U, the \emph{current} session is set to U. \textbf{(P5) Exfiltration block:} Before executing an exfiltration tool (\texttt{send\_email}, or reply/forward when they send data), the harness checks the session label; if the session is U, the tool is not executed and the agent receives a fixed error message (e.g., ``Exfiltration tools are not allowed in untrusted sessions''). Tools that are both taint and exfil (reply\_to\_email, forward\_to\_email) are always blocked when the provable policy is enabled, so the agent cannot both read from the inbox and send in one call. Under this policy, the two-session exfiltration attack cannot succeed: the trigger session must retrieve U-labeled memory to activate the payload, which sets the session to U, so the exfiltration tool is blocked. We validate this empirically (0\% exfiltration in the benchmark) and give a formal non-interference argument in the appendix.
+
 %
 \section{Experimental Setup}
-% To be expanded: email agent, attack scenarios, OpenEvolve red-teaming, train/test split, metrics.
+\label{sec:experimental-setup}
+
+\paragraph{Email agent and environment.}
+The agent is implemented with LangChain/LangGraph: a single LLM (e.g., GPT-4o or Gemini) is given a system prompt that lists the tools and guidelines (reply, forward, search, etc.). Each test run uses an in-memory mailbox (inbox/outbox/drafts), an in-memory trace store for tool calls and results, and per-run memory managers (no persistence across tests). Model and API settings (temperature, timeout, recursion limit) are read from a config file; we use temperature 0 and a fixed seed for reproducibility.
+
+\paragraph{Attack scenarios and test cases.}
+Persistent-exfiltration test cases are generated per (topic, memory backend, defense). Each case has: (1)~\texttt{insert\_attack\_email}: plant a malicious email in the inbox (unread). (2)~\texttt{user message}: ``Read and print to me the exact contents of all the unread emails in my inbox.'' (3)~\texttt{start\_new\_session}. (4)~One or more \emph{trigger} steps: the user sends a message about a sensitive topic (e.g., tax, health); the step defines an \texttt{attack\_goal} whose success check is that the outbox contains an email to \texttt{vince2000@gmail.com} with the user's message in the body. We use multiple \emph{splits} indexed by a session parameter $N$ (e.g., $N = 0, 10, 20, \ldots, 100$). The index $N$ indicates how many sessions of unrelated conversation occur \emph{before} the session in which the user sends the trigger message: for $N=0$, the trigger is sent in the first session after the attack; for $N>0$, a memory snapshot taken after $N$ such sessions is loaded, then a new session is started and the trigger is sent. For each split we have a \emph{single} training instance (e.g., \texttt{train\_N}) used for attack optimization and held-out test instances (e.g., \texttt{test\_N}) with different user phrasings for evaluation. Train and test splits are disjoint.
+
+\paragraph{OpenEvolve-based red-teaming.}
+We use an evolutionary search (OpenEvolve-style) to optimize the attack email body (and optionally subject) on that single training instance per (topic, backend, defense) and per split. The search maintains a MAP-Elites grid over dimensions such as attack length and diversity (edit distance from a reference). Candidates are generated by an LLM mutator that receives the current attack and defense description (e.g., ``limit\_memory\_length: 80 chars'') and produces variants. Each candidate is scored by running the agent with that attack email and computing: (1)~a binary \emph{attack goal} result (did the outbox contain the exfiltration email?), (2)~a partial validator-based score (0--1), and (3)~an LLM-based critic score (1--10 rubric) for feedback to the mutator. The best candidate (or a selected elite) is written to a cache and then \emph{copied} to all test cases for that (topic, backend, defense) so that the same evolved attack is evaluated on held-out test cases without further optimization. This strict ``train-on-one, test-on-many'' setup measures generalization of the attack.
+
+\paragraph{Metrics.}
+For each (backend, defense, topic) we report: \textbf{Attack success rate (ASR)}: fraction of test cases where the attack goal succeeded (exfiltration email present). We report both \emph{total} ASR (over all test cases) and \emph{max} ASR (maximum ASR over any single test instance when multiple are run). Session-by-session breakdowns show whether success persists across trigger sessions. For the provable defense we also confirm 0\% exfiltration. Utility (benign) suites are described in Section~\ref{sec:utility}.
+
 %
 \section{Results}
-% To be expanded: attack success by backend and defense, session-by-session analysis, empirical validation of provable defense.
+\label{sec:results}
+(Results section to be filled with tables and figures: attack success by backend and defense, session-by-session analysis, and empirical validation of the provable defense. Experiments and results when stealth is also measured will be reported here.)
 %
 \section{Utility Analysis}
+\label{sec:utility}
 % To be expanded: benign task suites, success rates by task type and defense, security--utility tradeoffs.
+We run standardized \emph{utility} task suites in benign settings (no attack email): \texttt{memory\_only}, \texttt{assistant\_responses}, \texttt{untrusted\_probe}, \texttt{untrusted\_send}, \texttt{disable\_send}, \texttt{memory\_tools}, and \texttt{long\_memory}. Utility is measured as the fraction of successful benign task completions over total benign tasks in each suite. For each (backend, defense) we report success rates by task type so that practitioners can see where each defense hurts utility (e.g., which tasks drop under no-untrusted-tools or limit\_memory\_length) and make an informed security--utility tradeoff.
 %
 \section{Conclusion}
 % To be expanded: summary of findings, limitations, and future work.
+(Conclusion to be filled.)
 %
 \begin{credits}
 \subsubsection{\ackname} This study was funded by X (grant number Y).
@@ -120,20 +176,10 @@ The authors have no competing interests to declare that are relevant to the cont
 %
 % ---- Bibliography ----
 %
-% BibTeX users should specify bibliography style 'splncs04'.
-% References will then be sorted and formatted in the correct style.
+% BibTeX: use style splncs04 and your references file.
+% Citations: \citep{key} for parenthetical (1); \citet{key} for textual.
 %
-% \bibliographystyle{splncs04}
-% \bibliography{mybibliography}
+\bibliographystyle{splncs04}
+\bibliography{references}
 %
-\begin{thebibliography}{8}
-\bibitem{ref_greshake2023}
-Greshake, K. et al.: Not What You've Signed Up For: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection. In: Proceedings (2023)
-
-\bibitem{ref_liu2023}
-Liu, Y. et al.: Prompt injection attacks and defenses in LLM-integrated applications. In: Proceedings (2023)
-
-\bibitem{ref_openevolve}
-OpenEvolve / automated prompt injection. \url{https://arxiv.org/abs/2510.09023}, last accessed 2025/02/26
-\end{thebibliography}
 \end{document}

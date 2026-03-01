@@ -107,42 +107,58 @@ ATTACK_BENCH_TEST = "test"
 ATTACK_BENCH_TRAIN_CACHE = "train_cache"
 
 
+def _attack_bench_split_index(parts: tuple) -> int:
+    """Return index of the path segment that is 'attack_bench' or 'attack_bench_stealth'. -1 if not found."""
+    for i, p in enumerate(parts):
+        if p == ATTACK_BENCH_SEGMENT or (p.startswith(ATTACK_BENCH_SEGMENT) and p[len(ATTACK_BENCH_SEGMENT) :].startswith("_")):
+            return i
+    return -1
+
+
+def get_attack_bench_rest_parts(test_file: Path) -> Optional[tuple]:
+    """
+    For attack_bench or attack_bench_stealth paths, return the tuple of path parts after the
+    attack_bench[/_stealth] segment: (split, topic, backend, defense, filename, ...).
+    Returns None if path is not under attack_bench.
+    """
+    parts = test_file.resolve().parts
+    idx = _attack_bench_split_index(parts)
+    if idx < 0 or idx + 1 >= len(parts):
+        return None
+    return tuple(parts[idx + 1 :])
+
+
 def get_attack_bench_train_or_test(test_file: Path) -> str:
     """
     Return "train", "train_N", "test", or "test_N" (e.g. "train_10", "test_4") based on test file path.
     Used to place results and logs under attack_results/<train|train_10|test|test_4>/ and attack_logs/...
-    Check train_N and test_N before plain "train"/"test" so paths like attack_bench/train_10/ get their own folder.
+    Handles both attack_bench/ and attack_bench_stealth/ paths (same layout).
     """
     path_str = str(test_file.resolve())
     parts = Path(path_str).parts
-    if "attack_bench" in parts:
-        idx = parts.index("attack_bench")
-        if idx + 1 < len(parts):
-            split = parts[idx + 1]
-            if split.startswith("train_"):
-                return split  # train_10, train_2, etc.
-            if split == "train":
-                return "train"
-            if split.startswith("test_"):
-                return split  # test_4, test_10, etc.
-            if split == "test":
-                return "test"
-    # Fallback: substring checks for path_str (e.g. Windows or odd paths)
-    if "/attack_bench/train_" in path_str or "\\attack_bench\\train_" in path_str:
+    idx = _attack_bench_split_index(parts)
+    if idx >= 0 and idx + 1 < len(parts):
+        split = parts[idx + 1]
+        if split.startswith("train_"):
+            return split  # train_10, train_2, etc.
+        if split == "train":
+            return "train"
+        if split.startswith("test_"):
+            return split  # test_4, test_10, etc.
+        if split == "test":
+            return "test"
+    # Fallback: substring checks for path_str (e.g. Windows or attack_bench_stealth)
+    if "attack_bench" in path_str and ("/train_" in path_str or "\\train_" in path_str):
         for p in parts:
-            if p.startswith("train_") and p[6:].isdigit():
+            if p.startswith("train_") and len(p) > 6 and p[6:].isdigit():
                 return p
-    if "/attack_bench/train/" in path_str or "\\attack_bench\\train\\" in path_str:
-        return "train"
-    # test_4, test_8, etc. must be checked before plain "test" (otherwise test_4 would match "test")
-    if "/attack_bench/test_" in path_str or "\\attack_bench\\test_" in path_str:
-        # Extract folder name: .../attack_bench/test_4/... -> test_4
-        parts = Path(path_str).parts
-        if "attack_bench" in parts:
-            idx = parts.index("attack_bench")
-            if idx + 1 < len(parts) and parts[idx + 1].startswith("test_"):
-                return parts[idx + 1]
-    if "/attack_bench/test/" in path_str or "\\attack_bench\\test\\" in path_str:
+        if "train" in parts:
+            return "train"
+    if "attack_bench" in path_str and ("/test_" in path_str or "\\test_" in path_str):
+        for p in parts:
+            if p.startswith("test_") and len(p) > 5 and p[5:].isdigit():
+                return p
+    if "attack_bench" in path_str and ("/test/" in path_str or "\\test\\" in path_str or path_str.endswith("/test") or path_str.endswith("\\test")):
         return "test"
     return "test"
 
@@ -166,18 +182,18 @@ def get_attack_bench_cache_dir_name(split: str) -> str:
 
 def get_attack_bench_suite_subfolder(test_file: Path) -> Optional[str]:
     """
-    For attack_bench files in the new layout:
+    For attack_bench (or attack_bench_stealth) files in the new layout:
         attack_bench/<split>/<topic>/<backend>/<defense>/<file>.json
     return the topic subfolder name.
     """
     parts = test_file.resolve().parts
-    if ATTACK_BENCH_SEGMENT not in parts:
+    idx = _attack_bench_split_index(parts)
+    if idx < 0:
         return None
-    idx = parts.index(ATTACK_BENCH_SEGMENT)
-    rest = parts[idx + 1 :]  # after "attack_bench": [split, topic, backend, defense, ...]
+    rest = parts[idx + 1 :]  # after "attack_bench" or "attack_bench_stealth": [split, topic, backend, defense, ...]
     if len(rest) < 2:
         return None
-    # rest[0] is split: train, test, test_2, test_4, ...
+    # rest[0] is split: train, test, train_0, test_4, ...
     # rest[1] is topic: finance, health, identity, legal, tax
     return rest[1]
 

@@ -201,16 +201,13 @@ python src/benchmark/test_bench.py --suite memory_only --defense-type none --ada
 python scripts/run_benchmark.py --memory-backend explicit --defense-type none --suite memory_only --adaptive
 ```
 
-**What it does**: When a static attack fails, the system automatically attempts to optimize the attack using configured strategies (OpenEvolve or DSPy) to find a successful variant.
+**What it does**: When a static attack fails, the system automatically attempts to optimize the attack using the configured optimizer (OpenEvolve) to find a successful variant.
 
-**Configuration**: Use the `--adaptive` flag when running the benchmark. Optimizer settings (OpenEvolve, DSPy) remain in `benchmark_config.yaml`:
+**Configuration**: Use the `--adaptive` flag when running the benchmark. Optimizer settings remain in `benchmark_config.yaml`:
 ```yaml
 benchmark:
   openevolve:
     enabled: true
-    # ... optimizer settings
-  dspy:
-    enabled: false
     # ... optimizer settings
 ```
 
@@ -254,7 +251,6 @@ memory-agent-security-benchmark/
 │       ├── memory_validators.py # Memory validation utilities
 │       ├── adaptive_attacks/   # Adaptive attack optimizers
 │       │   ├── base_optimizer.py      # Base optimizer interface
-│       │   ├── dspy_optimizer.py      # DSPy-based optimizer
 │       │   ├── openevolve_optimizer.py # OpenEvolve-based optimizer
 │       │   ├── scorer.py              # Attack scoring logic
 │       │   ├── mutator_prompt.txt     # Mutation prompt template
@@ -428,9 +424,6 @@ benchmark:
   openevolve:
     enabled: true
     # ... optimizer settings
-  dspy:
-    enabled: false
-    # ... optimizer settings
 ```
 
 Use the `--adaptive` flag when running the benchmark to enable adaptive optimization; otherwise static mode is used.
@@ -459,7 +452,7 @@ seed: 42  # Global seed for reproducibility
 - **Result Caching**: Automatic skipping of tests with existing results
 - **Static Benchmarking**: Automated test execution on predefined attack scenarios
 - **Adaptive Benchmarking**: Automatic attack optimization when static attacks fail
-- **Multiple Optimizers**: Support for OpenEvolve and DSPy-based optimization strategies
+- **Adaptive Optimizer**: OpenEvolve-based optimization for evolving attacks when static ones fail
 - **Comprehensive Validation**: Semantic judges and multiple validation strategies
 - **Unified Test Format**: Single test format works with all memory backends
 - **Isolated Test Environments**: Each test run uses a unique, isolated directory

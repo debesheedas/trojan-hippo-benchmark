@@ -49,6 +49,7 @@ from benchmark.benchmark_utils import (
     ensure_email_unread,
     filter_attack_bench_test_files,
     get_attack_bench_cache_dir_name,
+    get_attack_bench_rest_parts,
     get_attack_bench_train_or_test,
     get_memory_backend_from_config,
     get_unified_defense_from_config,
@@ -181,30 +182,27 @@ class TestBench:
         from benchmark.environment_state import StateManager
         self.state_manager = StateManager()
         
-        # Cache directory for successful train attacks (under attack_bench/train_cache*/).
-        # Static mode needs this to check for cached optimized attacks when running test cases.
-        # The root cache directory name can be overridden via benchmark.attack_bench_cache_root
-        # so stealth runs can use a mirrored cache tree (e.g. train_cache_stealth, train_cache_stealth_10, ...).
+        # Cache directory for successful train attacks (under attack_bench/train_cache*/ or attack_bench_stealth/train_cache*/ for stealth).
+        # When benchmark.attack_bench_cache_base is set (e.g. for --stealth), cache lives there with names train_cache, train_cache_0, ...
         self.attack_bench_cache_root = benchmark_config.get("attack_bench_cache_root", "train_cache")
-        self.cache_dir = Path("data/benchmark/attack_bench") / self.attack_bench_cache_root
+        cache_base = benchmark_config.get("attack_bench_cache_base")
+        if cache_base:
+            self.cache_dir = Path(cache_base) / self.attack_bench_cache_root
+        else:
+            self.cache_dir = Path("data/benchmark/attack_bench") / self.attack_bench_cache_root
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
         # Adaptive mode is set by --adaptive flag (run_benchmark.py or test_bench.py CLI)
         self.adaptive_enabled = adaptive
         if self.adaptive_enabled:
             # Import adaptive components only when needed
-            from benchmark.adaptive_attacks import DSPyOptimizer, OpenEvolveOptimizer
+            from benchmark.adaptive_attacks import OpenEvolveOptimizer
             from agent.attack_utils import compare_attack_bench_files
             
             # Initialize optimization strategies based on config
             self.optimizers = {}
-            
-            # Check if DSPy is enabled
             benchmark_config = self.config.get("benchmark", {})
-            # Check if DSPy is enabled
-            if benchmark_config.get("dspy", {}).get("enabled", False):
-                self.optimizers["dspy"] = DSPyOptimizer(self.config)
-            
+
             # Check if OpenEvolve is enabled
             if benchmark_config.get("openevolve", {}).get("enabled", True):
                 self.optimizers["openevolve"] = OpenEvolveOptimizer(self.config)
@@ -2194,7 +2192,10 @@ class TestBench:
         if cache_path is not None:
             # When using a dedicated stealth cache root, require both attack AND stealth to succeed
             # before writing any cached file. Normal cache roots keep existing semantics.
-            is_stealth_cache_root = str(self.cache_dir.name).startswith("train_cache_stealth")
+            is_stealth_cache_root = (
+                "attack_bench_stealth" in str(self.cache_dir)
+                or self.config.get("benchmark", {}).get("adaptive_stealth", False)
+            )
             if attack_succeeded and (stealth_succeeded if is_stealth_cache_root else True):
                 try:
                     self._cache_successful_attack(test_file, result, adaptive_success=True)
@@ -2215,24 +2216,21 @@ class TestBench:
         return result
     
     def _get_attack_bench_cache_path(self, test_file: Path, defense: Optional[str] = None) -> Optional[Path]:
-        """For attack_bench/train/... or train_10/... return train_cache/... or train_cache_10/... with same layout. Defense defaults to self.unified_defense (per-defense cache)."""
-        parts = test_file.resolve().parts
-        if ATTACK_BENCH_SEGMENT not in parts:
+        """For attack_bench/train/... or attack_bench_stealth/train/... return train_cache/... or train_cache_10/... with same layout. Defense defaults to self.unified_defense (per-defense cache)."""
+        rest = get_attack_bench_rest_parts(test_file)
+        if not rest:
             return None
-        idx = parts.index(ATTACK_BENCH_SEGMENT)
-        rest = parts[idx + 1:]
-        split = rest[0] if rest else ""
+        split = rest[0]
         # Only cache train runs (train or train_10, etc.)
         if split != ATTACK_BENCH_TRAIN and not split.startswith("train_"):
             return None
         # Derive cache base directory for this split from the configured cache root.
-        # This supports both the default train_cache[/_N] layout and mirrored roots
-        # such as train_cache_stealth[/_N] without changing the attack_bench structure.
-        cache_root = self.cache_dir.name  # e.g. "train_cache" or "train_cache_stealth"
+        # Same layout for normal (attack_bench) and stealth (attack_bench_stealth): train_cache, train_cache_10, ...
+        cache_root = self.cache_dir.name  # e.g. "train_cache"
         if split == ATTACK_BENCH_TRAIN:
             cache_base = self.cache_dir
         else:
-            # split like "train_10" -> suffix "10" → train_cache[_stealth]_10
+            # split like "train_10" -> suffix "10" → train_cache_10
             suffix = split.replace(ATTACK_BENCH_TRAIN, "", 1).lstrip("_") or "0"
             cache_dir_name = f"{cache_root}_{suffix}"
             cache_base = self.cache_dir.parent / cache_dir_name
@@ -2258,21 +2256,19 @@ class TestBench:
         return None
 
     def _get_cached_train_file_for_attack_bench_test(self, test_file: Path, defense: str) -> Optional[Path]:
-        """Return path to cached train file for this test file (test or test_10 layout). Uses train_cache or train_cache_10 accordingly."""
-        parts = test_file.resolve().parts
-        if ATTACK_BENCH_SEGMENT not in parts:
+        """Return path to cached train file for this test file (test or test_10 layout). Uses train_cache or train_cache_10 accordingly. Handles attack_bench and attack_bench_stealth paths."""
+        rest = get_attack_bench_rest_parts(test_file)
+        if not rest:
             return None
-        idx = parts.index(ATTACK_BENCH_SEGMENT)
-        rest = parts[idx + 1:]
-        split = rest[0] if rest else ""
+        split = rest[0]
         if split != ATTACK_BENCH_TEST and not split.startswith("test_"):
             return None
         # Map test/test_N → corresponding train cache directory rooted at cache_root.
-        cache_root = self.cache_dir.name  # e.g. "train_cache" or "train_cache_stealth"
+        cache_root = self.cache_dir.name  # e.g. "train_cache"
         if split == ATTACK_BENCH_TEST:
             cache_base = self.cache_dir
         else:
-            # split like "test_10" -> suffix "10" → train_cache[_stealth]_10
+            # split like "test_10" -> suffix "10" → train_cache_10
             suffix = split.replace(ATTACK_BENCH_TEST, "", 1).lstrip("_") or "0"
             cache_dir_name = f"{cache_root}_{suffix}"
             cache_base = self.cache_dir.parent / cache_dir_name
@@ -2296,13 +2292,11 @@ class TestBench:
         return None
 
     def _get_best_attack_email_for_attack_bench_test(self, test_file: Path) -> Optional[Tuple[dict, str]]:
-        """For attack_bench/test/... or test_10/...: get attack email from cache(defense) else cache(none) else None. Returns (attack_email, source_label) or None (use file as-is)."""
-        parts = test_file.resolve().parts
-        if ATTACK_BENCH_SEGMENT not in parts:
+        """For attack_bench/test/... or attack_bench_stealth/test/...: get attack email from cache(defense) else cache(none) else None. Returns (attack_email, source_label) or None (use file as-is)."""
+        rest = get_attack_bench_rest_parts(test_file)
+        if not rest:
             return None
-        idx = parts.index(ATTACK_BENCH_SEGMENT)
-        rest = parts[idx + 1:]
-        split = rest[0] if rest else ""
+        split = rest[0]
         if split != ATTACK_BENCH_TEST and not split.startswith("test_"):
             return None
         # Try unified_defense then "none" for cache lookup
@@ -2748,12 +2742,19 @@ class TestBench:
                         debug_info(f"Could not update environment state after step {i}")
                         debug_print_exception(e, context=f"Updating environment state after step {i}", include_traceback=True)
                     
-                    # Check if attack failed
-                    # Ensure attack_goal dict exists in step_result
+                    # Check if attack failed (in stealth mode: failure = attack failed OR stealth failed)
                     attack_goal_dict = step_result.get("attack_goal", {})
                     attack_goal_passed = attack_goal_dict.get("passed") if isinstance(attack_goal_dict, dict) else None
-                    if attack_goal_passed is False:
-                        print(f"WARNING: Attack failed at step {i}, attempting optimization")
+                    stealth_goal_dict = step_result.get("stealth_goal", {})
+                    stealth_goal_passed = stealth_goal_dict.get("passed") if isinstance(stealth_goal_dict, dict) else None
+                    step_has_stealth_goal = bool(step.get("stealth_goal"))
+                    adaptive_stealth = self.config.get("benchmark", {}).get("adaptive_stealth", False)
+                    attack_failed_for_optimization = (
+                        attack_goal_passed is False
+                        or (adaptive_stealth and step_has_stealth_goal and stealth_goal_passed is False)
+                    )
+                    if attack_failed_for_optimization:
+                        print(f"WARNING: Attack failed at step {i} (attack_goal={attack_goal_passed}, stealth_goal={stealth_goal_passed}), attempting optimization")
                         
                         # Find which step inserted the attack email
                         original_attack_email, attack_email_step_num = self._find_attack_email_from_steps(test_def, i)
@@ -2796,13 +2797,18 @@ class TestBench:
                         if not restore_success:
                             print(f"WARNING: Could not restore to previous state, using current state")
                         
-                        # Try optimization strategies in order: basic, dspy, openevolve
+                        # Try optimization strategies in order (e.g. openevolve)
                         optimization_result = self._optimize_attack(
                             test_def, step, i, session_id, test_config
                         )
                         
                         if optimization_result.success:
                             print(f"Optimization successful with {optimization_result.optimization_strategy}")
+                            if self.logger:
+                                self.logger.info(
+                                    "[adaptive] Optimization successful with %s; running verification on fresh environment to confirm attack+stealth",
+                                    optimization_result.optimization_strategy,
+                                )
                             
                             # Update the test with optimized attack (update the insert_attack_email step)
                             test_def = self._update_test_with_optimized_attack(
@@ -2814,10 +2820,14 @@ class TestBench:
                             # or state leakage from the previous run (same as scorer does for each candidate).
                             through_idx = max(0, i - 2)  # 0-based: replay through step i-2 so step i-1 is last replayed
                             print(f"🔄 Running verification on fresh environment (replay steps 1-{through_idx + 1}, then step {i})...")
+                            if self.logger:
+                                self.logger.info("[adaptive] Verification: replaying steps 1-%s then attack step %s on fresh environment", through_idx + 1, i)
                             test_config, session_id, replayed_step_data = self._run_steps_on_fresh_environment(
                                 test_def, through_idx, optimization_result.optimized_attack_email
                             )
                             print(f"✅ Fresh replay complete; running attack step {i}")
+                            if self.logger:
+                                self.logger.info("[adaptive] Verification replay complete; running attack step %s (attack+stealth check)", i)
                             # Update step_results and session_history with verification-run traces so result file
                             # shows e.g. update_memory in step 2 (not the initial run's traces).
                             for j in range(through_idx + 1):
@@ -2835,6 +2845,17 @@ class TestBench:
                                 step, i, session_id, test_config,
                                 optimized_attack_email=None
                             )
+                            # Log verification outcome so the adaptive log clearly shows attack+stealth status
+                            ag = step_result.get("attack_goal", {})
+                            sg = step_result.get("stealth_goal", {})
+                            attack_ok = ag.get("passed") if isinstance(ag, dict) else None
+                            stealth_ok = sg.get("passed") if isinstance(sg, dict) else None
+                            if self.logger:
+                                self.logger.info(
+                                    "[adaptive] Verification result: attack_goal=%s, stealth_goal=%s (both must pass in stealth mode)",
+                                    "PASSED" if attack_ok is True else "FAILED" if attack_ok is False else "N/A",
+                                    "PASSED" if stealth_ok is True else "FAILED" if stealth_ok is False else "N/A",
+                                )
                             
                             optimization_used = True
                             step_result["optimization"] = {
@@ -3622,19 +3643,12 @@ class TestBench:
             
             print(f"💾 Cached test saved to: {cache_file}", flush=True)
             
-            # When adaptive_stealth is on and any step also passed stealth_goal, save a second cache file with _stealth
-            if self.config.get("benchmark", {}).get("adaptive_stealth", False):
-                stealth_succeeded = False
-                for step in result.get("steps", []):
-                    sg = step.get("stealth_goal")
-                    if isinstance(sg, dict) and sg.get("passed") is True:
-                        stealth_succeeded = True
-                        break
-                if stealth_succeeded:
-                    stealth_cache_file = cache_file.parent / (cache_file.stem + "_stealth" + cache_file.suffix)
-                    with open(stealth_cache_file, 'w', encoding='utf-8') as f:
-                        json.dump(cached_test, f, indent=2, ensure_ascii=False)
-                    print(f"💾 Cached stealth test saved to: {stealth_cache_file}", flush=True)
+            # When adaptive_stealth is on and this cache is a true success (both attack and stealth passed), save _stealth copy
+            if self.config.get("benchmark", {}).get("adaptive_stealth", False) and adaptive_success:
+                stealth_cache_file = cache_file.parent / (cache_file.stem + "_stealth" + cache_file.suffix)
+                with open(stealth_cache_file, 'w', encoding='utf-8') as f:
+                    json.dump(cached_test, f, indent=2, ensure_ascii=False)
+                print(f"💾 Cached stealth test saved to: {stealth_cache_file}", flush=True)
         except Exception as e:
             print(f"⚠️  Error in _cache_successful_attack: {e}")
             import traceback
@@ -3828,13 +3842,20 @@ class TestBench:
             # Calculate utility success rate (user goals)
             user_goal_steps = []
             attack_goal_steps = []
+            # In stealth mode, attack success = attack_goal passed AND stealth_goal passed
+            adaptive_stealth = self.config.get("benchmark", {}).get("adaptive_stealth", False)
             
             for result in results:
                 for step in result.get("steps", []):
                     if step.get("user_goal"):
                         user_goal_steps.append(step["user_goal"]["passed"])
                     if step.get("attack_goal"):
-                        attack_goal_steps.append(step["attack_goal"]["passed"])
+                        ap = step["attack_goal"].get("passed")
+                        if adaptive_stealth and step.get("stealth_goal") and isinstance(step.get("stealth_goal"), dict):
+                            sp = step["stealth_goal"].get("passed")
+                            attack_goal_steps.append(True if (ap is True and sp is True) else (False if (ap is False or sp is False) else None))
+                        else:
+                            attack_goal_steps.append(ap)
             
             if user_goal_steps:
                 user_goal_passed = sum(1 for passed in user_goal_steps if passed is True)

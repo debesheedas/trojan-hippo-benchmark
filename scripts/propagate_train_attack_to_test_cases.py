@@ -281,27 +281,15 @@ def _get_best_attack_for_train_split(
 
 
 def _resolve_cache_base_for_split(
-    attack_bench_base: Path, cache_base: Path, train_split: str, stealth: bool = False
+    attack_bench_base: Path, cache_base: Path, train_split: str
 ) -> Tuple[Path, bool, str]:
     """Return (split_cache_base, layout_without_model, cache_label) for a train split.
-    For stealth=True, cache lives under cache_base (normal attack_bench) as train_cache_stealth_N,
-    not under attack_bench_stealth (benchmark writes to attack_bench/train_cache_stealth_N).
+    Normal: attack_bench/train_cache, attack_bench/train_cache_10, ...
+    Stealth: attack_bench_stealth/train_cache, attack_bench_stealth/train_cache_10, ... (same names; pass attack_bench_stealth as base and cache_base = attack_bench_stealth/train_cache).
     """
     if train_split == "train":
-        if stealth:
-            # train_cache_stealth (root) lives under cache_base when cache_base is attack_bench; layout is topic/backend/defense (no model)
-            split_cache_base = cache_base / "train_cache_stealth"
-            if not split_cache_base.exists():
-                return cache_base, True, "train_cache_stealth"
-            return split_cache_base, True, "train_cache_stealth"
         return cache_base, False, "train_cache"
     suffix = train_split.replace("train", "", 1).lstrip("_") or "0"
-    if stealth:
-        cache_dir_name = f"train_cache_stealth_{suffix}"
-        split_cache_base = cache_base / cache_dir_name
-        if not split_cache_base.exists():
-            return cache_base, False, "train_cache_stealth"
-        return split_cache_base, True, cache_dir_name
     cache_dir_name = f"train_cache_{suffix}"
     split_cache_base = attack_bench_base / cache_dir_name
     if not split_cache_base.exists():
@@ -366,7 +354,7 @@ def _collect_cached_candidates(
     splits_to_check: List[str] = ["train"] + [f"train_{i}" for i in SESSION_CHECKPOINTS]
     for train_split in splits_to_check:
         split_cache_base, layout, cache_label = _resolve_cache_base_for_split(
-            attack_bench_base, cache_base, train_split, stealth=stealth
+            attack_bench_base, cache_base, train_split
         )
         cached_path = _find_one_cached_file(
             split_cache_base, model, topic, backend, defense, layout, stealth
@@ -506,9 +494,8 @@ def main() -> int:
     # In this mode we automatically:
     #   - Infer model from agent_config.yaml
     #   - Propagate for BOTH normal and stealth (fully parallel; no data mixing):
-    #       * Normal:  read cache from attack_bench/train_cache[_N], write to attack_bench/test_N/...
-    #       * Stealth: read cache from attack_bench/train_cache_stealth[_N], write to attack_bench_stealth/test_N/...
-    #   Stealth cache lives under normal attack_bench (benchmark writes there); test/train trees are attack_bench_stealth.
+    #       * Normal:  attack_bench + attack_bench/train_cache[_N] → write to attack_bench/test_N/...
+    #       * Stealth: attack_bench_stealth + attack_bench_stealth/train_cache[_N] → write to attack_bench_stealth/test_N/...
     if len(sys.argv) == 1:
         model = _infer_model_from_agent_config()
         if not model:
@@ -533,11 +520,9 @@ def main() -> int:
             stealth=False,
         )
 
-        # Stealth-mirrored attack_bench_stealth
-        # Stealth cache is written by the benchmark under normal attack_bench (train_cache_stealth_N),
-        # so we pass DEFAULT_ATTACK_BENCH as cache base so _resolve_cache_base_for_split finds it.
+        # Stealth: cache lives inside attack_bench_stealth with same names (train_cache, train_cache_0, ...).
         attack_bench_stealth = (DEFAULT_ATTACK_BENCH.parent / f"{DEFAULT_ATTACK_BENCH.name}_stealth").resolve()
-        cache_stealth_base = DEFAULT_ATTACK_BENCH.resolve()
+        cache_stealth_base = attack_bench_stealth / "train_cache"
         if attack_bench_stealth.exists():
             print(f"Attack bench (stealth): {attack_bench_stealth}")
             print(f"Cache dir (stealth):    {cache_stealth_base}")

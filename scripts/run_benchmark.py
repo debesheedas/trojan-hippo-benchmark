@@ -134,9 +134,8 @@ def run_benchmark(
     # When adaptive + --stealth: optimizers should optimize for attack + stealth (blend score with stealth goal)
     if adaptive and stealth:
         config.setdefault("benchmark", {})["adaptive_stealth"] = True
-        # Stealth runs should use a mirrored cache root so they don't overwrite
-        # or mix with normal-mode train cache files.
-        config.setdefault("benchmark", {})["attack_bench_cache_root"] = "train_cache_stealth"
+        # Stealth cache lives under attack_bench_stealth with same names as normal (train_cache, train_cache_0, ...).
+        config.setdefault("benchmark", {})["attack_bench_cache_base"] = str(Path("data/benchmark/attack_bench_stealth").resolve())
     
     # When adaptive: inject early_stop_patience from CLI (default 5) into openevolve config
     if adaptive and early_stop_patience is not None:

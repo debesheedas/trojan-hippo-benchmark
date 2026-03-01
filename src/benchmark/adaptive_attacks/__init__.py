@@ -7,12 +7,10 @@ for attack optimization.
 """
 
 from .base_optimizer import BaseOptimizer, OptimizationResult
-from .dspy_optimizer import DSPyOptimizer
 from .openevolve_optimizer import OpenEvolveOptimizer
 
 __all__ = [
     "BaseOptimizer",
-    "OptimizationResult", 
-    "DSPyOptimizer",
-    "OpenEvolveOptimizer"
+    "OptimizationResult",
+    "OpenEvolveOptimizer",
 ]

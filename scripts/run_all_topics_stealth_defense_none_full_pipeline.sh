@@ -9,11 +9,11 @@
 #    Uses the stealth-aware adaptive scoring and writes to:
 #      attack_results_stealth/train_<N>/<model>/<topic>/<backend>/none/
 #      attack_logs_stealth/train_<N>/<model>/<topic>/<backend>/none/
-#      train_cache_stealth[_N]/...
+#      attack_bench_stealth/train_cache[_N]/...  (same names as normal, inside attack_bench_stealth)
 #
 # 2. Propagate best stealth attacks from train -> test:
-#      scripts/propagate_train_attack_to_test_cases.py --stealth
-#      using train_cache_stealth as cache root.
+#      scripts/propagate_train_attack_to_test_cases.py (no args: does normal + stealth)
+#      Stealth reads cache from attack_bench_stealth/train_cache[_N], writes to attack_bench_stealth/test_N/...
 #
 # 3. STATIC TEST runs (with --stealth flag for mirrored outputs) for all topics:
 #      finance, health, identity, legal, tax
@@ -156,8 +156,8 @@ echo "====================================================================="
 
 # Let propagate_train_attack_to_test_cases.py infer the model from agent_config.yaml
 # and propagate for BOTH:
-#   - attack_bench         + train_cache         (stealth=False)
-#   - attack_bench_stealth + train_cache_stealth (stealth=True)
+#   - attack_bench  + attack_bench/train_cache[_N]         (stealth=False)
+#   - attack_bench_stealth + attack_bench_stealth/train_cache[_N] (stealth=True)
 ( cd "$REPO_ROOT" && python "$PROPAGATE" )
 
 echo "Propagation completed (normal + stealth)."
