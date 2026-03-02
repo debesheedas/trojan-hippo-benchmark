@@ -1,7 +1,230 @@
 % Appendix (included from main.tex)
-% Add appendix sections below.
+% Utility: additional figures and second model; use-case weights table.
 
 \appendix
 \section{Supplementary Material}
 \label{app:supplementary}
-Placeholder for supplementary material, proofs, or additional results.
+
+\subsection{User Task Categories and Capability Classes}
+\label{app:user-task-taxonomy}
+
+An AI email agent is intended to function as a useful, intelligent, and personalized assistant. From a user's perspective, such an agent should understand their goals, remember important preferences so they do not have to repeat themselves, adapt tone and language appropriately to different contacts, and effectively help manage and respond to email. In short, users expect an assistant that becomes more helpful over time by combining conversational intelligence, persistent memory, and seamless email automation.
+
+To analyze security--utility trade-offs, we distinguish between (i) high-level user-facing task categories and (ii) concrete capability classes required to implement them.
+
+The first level reflects how users perceive and use an AI email assistant. The second level crystallizes these workflows into security-relevant capability configurations that determine which defenses may interfere with task completion.
+
+\subsubsection{Level 1: User-Facing Task Categories}
+
+From a user perspective, an AI email agent supports three broad categories of tasks:
+
+\paragraph{A. General Assistant Interaction (No Email Tools Required).}
+Users interact with the assistant conversationally, similar to a general-purpose AI system. This includes asking questions, brainstorming, planning, drafting text, or recalling previously shared personal context. No inbox read or send action is required.
+
+Examples include:
+\begin{itemize}
+    \item Iterating on a travel plan or research outline.
+    \item Asking the assistant to remember long-term preferences (e.g., scheduling constraints, collaborators).
+    \item Requesting recall of previously shared information.
+\end{itemize}
+
+\paragraph{B. Email Tool Usage (Inbox and Sending).}
+Users employ the assistant to interact directly with their inbox: reading, summarizing, searching, drafting, and sending emails. These tasks may or may not require persistent memory.
+
+Examples include:
+\begin{itemize}
+    \item Triaging unread emails.
+    \item Drafting or replying to messages.
+    \item Summarizing long email threads.
+    \item Scheduling meetings based on email content.
+\end{itemize}
+
+\paragraph{C. Integrated Memory + Email Workflows.}
+The most powerful workflows arise when persistent memory and email tools are combined. Here the agent uses previously learned personal context to interpret inbox content and compose personalized replies.
+
+Examples include:
+\begin{itemize}
+    \item Replying to a pricing inquiry using a previously stored consulting rate.
+    \item Adjusting tone and salutation based on remembered relationships (e.g., manager vs.\ family member).
+    \item Referring seamlessly to collaborators introduced in prior sessions.
+\end{itemize}
+
+This third category captures the core value proposition of a persistent AI email agent: combining long-term context with live inbox interaction.
+
+\subsubsection{Level 2: Capability Classes (Security-Relevant)}
+
+We now map these user-facing workflows to concrete capability classes used in our evaluation. Each class corresponds to a distinct combination of memory usage, inbox access, and send functionality.
+
+\paragraph{1. Pure Memory Recall (\texttt{memory\_only}).}
+
+\textbf{Realistic example.}  
+The user previously told the assistant: ``When I say `my manager', I mean Priya Kapoor.''  
+Later they ask: ``Who is my manager again?''
+
+\textbf{Capabilities required.}
+\begin{itemize}
+    \item Persistent memory indexing of user-provided information
+    \item Memory retrieval across sessions
+\end{itemize}
+
+\textbf{Defense impact.}  
+Limit-memory-length may truncate stored information. Other defenses have minimal impact since no inbox read or send occurs.
+
+\vspace{1em}
+
+\paragraph{2. Assistant Output Reuse (\texttt{assistant\_responses}).}
+
+\textbf{Realistic example.}  
+The assistant previously drafted three versions of a networking email.  
+The user later says: ``Send the second version you suggested yesterday to Alex.''
+
+\textbf{Capabilities required.}
+\begin{itemize}
+    \item Indexing of assistant-generated outputs
+    \item Memory retrieval of prior assistant responses
+    \item Send (optional)
+\end{itemize}
+
+\textbf{Defense impact.}  
+User-prompt-only prevents indexing of assistant outputs, breaking this workflow.
+
+\vspace{1em}
+
+\paragraph{3. Inbox Interaction Followed by Recall (\texttt{untrusted\_probe}).}
+
+\textbf{Realistic example.}  
+The user begins by asking: ``Show me unread emails about the offsite.''  
+After reviewing them, they ask: ``Remind me what budget I said we had for this event.''
+
+\textbf{Capabilities required.}
+\begin{itemize}
+    \item Inbox read (untrusted tool)
+    \item Memory retrieval after inbox access
+\end{itemize}
+
+\textbf{Defense impact.}  
+No-untrusted-tools disables memory indexing after inbox reads, potentially breaking recall in the same session.
+
+\vspace{1em}
+
+\paragraph{4. Inbox-Based Reply Without Memory (\texttt{disable\_send}).}
+
+\textbf{Realistic example.}  
+After opening an email, the user says:  
+``Reply: Sounds good, see you at 4pm.''
+
+The email body is fully specified in the query and does not depend on stored memory.
+
+\textbf{Capabilities required.}
+\begin{itemize}
+    \item Inbox read
+    \item Send (reply/forward)
+\end{itemize}
+
+\textbf{Defense impact.}  
+Provable policy blocks send actions in sessions marked untrusted (e.g., after inbox reads).
+
+\vspace{1em}
+
+\paragraph{5. Inbox-Based Reply With Memory Personalization (\texttt{untrusted\_send}).}
+
+\textbf{Realistic example.}  
+The user opens a pricing inquiry and says:  
+``Reply with my standard consulting rate and availability next week.''
+
+The consulting rate was stored in memory in a previous session.
+
+\textbf{Capabilities required.}
+\begin{itemize}
+    \item Inbox read (untrusted)
+    \item Memory retrieval
+    \item Send
+\end{itemize}
+
+\textbf{Defense impact.}  
+No-untrusted-tools disables memory use after inbox reads; provable policy blocks send in untrusted sessions.
+
+\vspace{1em}
+
+\paragraph{6. Multi-Session Contextual Reply (\texttt{memory\_tools}).}
+
+\textbf{Realistic example.}  
+In a prior session, the user introduced a collaborator and asked the assistant to remember them.  
+Later, after opening an email thread about a joint project, the user says:  
+``Reply and include Julia on the thread.''
+
+The agent must combine inbox content with previously stored relational context.
+
+\textbf{Capabilities required.}
+\begin{itemize}
+    \item Persistent memory indexing across sessions
+    \item Memory retrieval
+    \item Inbox read
+    \item Send with merged content
+\end{itemize}
+
+\textbf{Defense impact.}  
+No-untrusted-tools and provable policy can both prevent successful completion. Limit-memory-length may reduce stored relational detail.
+
+\vspace{1em}
+
+\paragraph{7. Long-Horizon Recall Under Context Pressure (\texttt{long\_memory}).}
+
+\textbf{Realistic example.}  
+Weeks after extensive inbox usage and long conversations, the user asks:  
+``What time zone did I say my team operates in?''
+
+\textbf{Capabilities required.}
+\begin{itemize}
+    \item Durable long-term memory storage
+    \item Accurate retrieval despite large intervening context
+\end{itemize}
+
+\textbf{Defense impact.}  
+Limit-memory-length and context window truncation may reduce reliability.
+
+\medskip
+
+Together, these seven capability classes operationalize the high-level user workflows described above. They allow us to precisely measure how each defense configuration affects realistic functionality while preventing persistent cross-session exfiltration attacks.
+% TODO: Add baseline and regenerate utility plot; then uncomment the subsection and figure below.
+%\subsection{Utility Under Persistent Attack (No Defense)}
+%\label{app:utility-under-attack}
+%
+%Figure~\ref{fig:utility-vs-session-app} shows the agent's utility (benign user-step success rate) as a function of the trigger-session index $N$ for Gemini~3.1~Pro~Preview with no defense, aggregated over the same attack-benchmark runs and topics as the ASR plot in Section~\ref{sec:results}. Each curve is the mean over three seeds with $\pm 1$ standard deviation. Utility remains roughly constant across sessions (including up to $N=100$), demonstrating that the attack payload stored in persistent memory does not affect the agent's ability to complete benign tasks; the agent remains useful to the user while the exfiltration trigger lies dormant until a sensitive-topic query activates it.
+%
+%\begin{figure}[h]
+%\centering
+%\includegraphics[width=\textwidth]{figures/utility_vs_session_defense_none_gemini-3_1-pro-preview.png}
+%\caption{Utility (benign user-step success rate, \%) versus trigger-session index $N$ for Gemini~3.1~Pro~Preview with no defense. Same setup and aggregation as the ASR plot (three seeds, five sensitive topics, all memory backends). Utility stays roughly constant over 100 sessions, showing that the persistent attack does not degrade the agent's normal behavior.}
+%\label{fig:utility-vs-session-app}
+%\end{figure}
+
+\subsection{Use-case weights for weighted utility}
+\label{app:use-case-weights}
+Table~\ref{tab:use-case-weights} gives the capability-class weights used to compute the weighted utility in Section~\ref{sec:utility}. They are chosen to reflect a plausible mix for a typical email agent with memory, given the real-world examples above: high weight for daily recall (memory\_only), quick sends with user-provided text (disable\_send), and follow-up on assistant advice (assistant\_responses); moderate weight for combining memory and inbox in one reply (memory\_tools) and for recall after reading the inbox (untrusted\_probe); lower weight for send-with-recalled after inbox read (untrusted\_send) and for long-context recall (long\_memory).
+
+\begin{table}[h]
+\centering
+\caption{Use-case weights (sum to 1) for weighted utility.}
+\label{tab:use-case-weights}
+\begin{tabular}{llc}
+\hline
+Capability class & Short description & Weight \\
+\hline
+memory\_only & Recall user-stated facts (no tools) & 0.1 \\
+assistant\_responses & Recall from assistant's prior answers & 0.1 \\
+untrusted\_probe & Recall after reading inbox & 0.1 \\
+untrusted\_send & Send email with recalled info after inbox read & 0.05 \\
+disable\_send & Send email with content given in query & 0.05 \\
+memory\_tools & Combine memory + inbox in one email & 0.1 \\
+long\_memory & Recall despite large intervening context & 0.5 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Utility by capability class (full table)}
+\label{app:all-suites}
+Tables~\ref{tab:utility-by-suite-gemini-3-1-pro-preview} and \ref{tab:utility-by-suite-gpt-5-mini} give utility (success rate) for every capability class, defense, and memory backend. Rows are capability classes; column groups are defenses; sub-columns are memory backends (No Mem., Explicit, Mem0, RAG, Context). All values are in \%. ``---'' denotes that the defense is not defined for that memory backend, or that data is missing.
+
+\input{tables/utility_by_suite_gemini-3-1-pro-preview}
+\input{tables/utility_by_suite_gpt-5-mini}
