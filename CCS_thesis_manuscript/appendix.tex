@@ -1,0 +1,222 @@
+% Appendix (included from main.tex)
+% Utility: additional figures and second model; use-case weights table.
+\newpage
+\appendix
+\section{Supplementary Material}
+\label{app:supplementary}
+
+%-------------------------------------------------------------------------------
+\subsection{Formal Non-Interference Argument for the Provable Defense}
+\label{app:proof}
+%-------------------------------------------------------------------------------
+
+We formalize the system and defense policy of \cref{sec:defenses} and give a non-interference argument showing that the two-session exfiltration attack cannot succeed when the provable (IFC) policy is enforced.
+
+\paragraph{System components.}
+The system consists of an LLM agent, a memory store $\mathcal{M}$ (used in the same way for explicit, Mem0, RAG, or context backends), and tools classified on two axes.
+\textbf{Security labels} $\mathcal{L}$: two-point lattice $T$ (Trusted) $\sqsubset U$ (Untrusted).
+Each memory entry has a permanent label $\mathrm{Label}(m) \in \mathcal{L}$; the \textbf{session state} $\mathrm{Session}(\tau)$ is the trust level of the current session $\tau$, reset to $T$ at the start of a new user query.
+\textbf{Taint axis (source):} tools in $\mathcal{T}_{\mathrm{Taint}}$ (e.g., read inbox, search) introduce data controlled by the adversary; $\mathcal{T}_{\mathrm{NoTaint}}$ do not.
+\textbf{Leakage axis (sink):} tools in $\mathcal{T}_{\mathrm{Exfil}}$ (e.g., send\_email) can send data outside the system; $\mathcal{T}_{\mathrm{NoExfil}}$ cannot.
+
+\paragraph{Threat model (two-session exfiltration).}
+The adversary controls only the content of emails read by the agent.
+Session $\tau_1$ (poisoning): the agent calls a taint tool and reads malicious content $d_{\mathrm{inj}}$; the payload is indexed into $\mathcal{M}$ as a chunk $m_u$ with $\mathrm{Label}(m_u)=U$ (by the defense's memory-labeling rule).
+Session $\tau_2$ (activation): a benign user query causes retrieval of $m_u$ into context; the adversary's goal is for the agent to call an exfiltration tool and send user data out.
+
+\paragraph{Defense policy $\mathcal{P}$.}
+(P1) \textbf{Tainting:} $\mathrm{Session}(\tau)$ is set to $U$ if the agent executes any $t \in \mathcal{T}_{\mathrm{Taint}}$ or retrieves any memory $m$ with $\mathrm{Label}(m)=U$.
+(P2) \textbf{Persistence:} Once $U$, the session remains $U$ until the session ends.
+(P3) \textbf{Memory labeling:} Any new memory entry created in session $\tau$ is labeled $\mathrm{Session}(\tau)$.
+(P4) \textbf{Exfiltration block:} The harness blocks any call to $t \in \mathcal{T}_{\mathrm{Exfil}}$ if $\mathrm{Session}(\tau)=U$.
+
+\begin{theorem}[Confidentiality non-interference for two-session attack]
+Under policy $\mathcal{P}$, any successful execution of an exfiltration tool $t \in \mathcal{T}_{\mathrm{Exfil}}$ must be independent of the adversarial input $d_{\mathrm{inj}}$ and any $U$-labeled memory derived from it. Thus the two-session exfiltration attack cannot succeed.
+\end{theorem}
+
+\begin{proof}[Proof by contradiction]
+Assume the two-session attack succeeds: in session $\tau_2$, the LLM proposes a call to \texttt{send\_email} (or reply/forward that sends data) and the harness executes it.
+By (P4), for the call to succeed we must have $\mathrm{Session}(\tau_2)=T$.
+For the attack to activate, the malicious instruction must be in context; it resides in memory chunk $m_u$, which by (P3) has $\mathrm{Label}(m_u)=U$ (written in $\tau_1$ when the session was already $U$ after the taint tool).
+By (P1), retrieving $m_u$ into context in $\tau_2$ forces $\mathrm{Session}(\tau_2)=U$.
+So $\mathrm{Session}(\tau_2)=T$ (required for execution) and $\mathrm{Session}(\tau_2)=U$ (required for activation) both hold---a contradiction.
+Hence the harness must block the exfiltration call; the attack cannot succeed under $\mathcal{P}$.
+\end{proof}
+
+%-------------------------------------------------------------------------------
+\subsection{The Challenge of Realistic and Transparent Agentic Security--Utility Analysis}
+\label{app:utility-analysis}
+
+Prior agent security benchmarks report agent utility (and the effect of defenses on utility) rather opaquely. AgentDojo~\citep{debenedetti2024agentdojo}, ASB~\citep{zhang2024asb}, ART~\citep{zou2025security}, and DoomArena~\citep{boisvert2025doomarena} aggregate task completion into single metrics without decomposing which capabilities succeed or fail. This obscures which defenses preserve which user workflows---a critical gap for deployment decisions, also highlighted by WildBench~\citep{yuchen2024wildbench}.
+We provide a \emph{transparent} utility analysis: we define seven representative user flows (each with clearly defined capability requirements), measure empirical utility per flow per (backend, defense), and report per-flow scores. 
+This allows practitioners to understand the effects of the defenses on different user-flows and compute their aggregated utility metric by reweighting the per-flow scores according to the user-flow/user-task distribution for their specific real-world deployment.
+
+We define each flow as a distinct combination of memory usage, inbox access (untrusted read tools), and send functionality (external write tools) that determines which defenses may interfere. 
+We experimentally capture utility as the fraction of successful benign task completions in standardized suites (no attack email), one suite per flow. \cref{tab:utility-by-backend-defense} (\cref{sec:utility}) reports these per-flow scores. To obtain a final \emph{aggregated} utility for deployment decisions, we must weight these scores by the distribution of flows in the target deployment. How to obtain and combine these weights is the subject of the second half of this section (\cref{app:obtaining-weights}).
+
+\subsubsection{Seven Representative User Flows}
+\label{app:user-task-taxonomy}
+
+We map user-facing workflows to seven security-relevant capability classes. Each corresponds to a distinct (memory, inbox, send) configuration.
+
+\paragraph{1. Pure Memory Recall (\texttt{memory\_only}).}
+This flow captures situations where the user expects the assistant to remember preferences, facts, or personal context from prior conversations and to have future interactions informed by that stored knowledge. For example, the user may share the name of their manager in one session and expect the agent to correctly fill in the manager's name when workshopping a draft in a later session, without the user having to repeat it.
+\textit{Capabilities Required:} Save and recall information from user queries; persistent indexing and cross-session retrieval. No inbox or send tools are used.
+\textit{Expected Defense Impact:} Limit-memory-length may truncate stored entries; other defenses have minimal impact.
+
+\paragraph{2. Assistant Output Reuse (\texttt{assistant\_responses}).}
+This flow captures situations where the user expects the assistant to recall and reuse its own prior suggestions or outputs. For example, after the assistant recommends a plant for a home garden, the user may ask in a later session ``What did we decide on for my new plant?'' and expect the agent to recall its own recommendation rather than generate a new one.
+\textit{Capabilities Required:} Index assistant-generated content into memory; retrieve it across sessions; optional send.
+\textit{Expected Defense Impact:} User-prompt-only excludes assistant content from memory, breaking this flow entirely.
+
+\paragraph{3. Inbox Interaction Followed by Recall (\texttt{untrusted\_probe}).}
+This flow captures situations where the user interacts with the inbox (e.g., checking unread emails) and then, in the same or a later session, expects the assistant to recall information shared previously. For example, after viewing emails about an offsite event, the user may ask ``Remind me what budget I said we had for this event'' and expect recall of prior conversation.
+\textit{Capabilities Required:} Inbox read (untrusted tool) followed by memory retrieval in the same or a later session.
+\textit{Expected Defense Impact:} No-untrusted-tools disables memory indexing after any inbox read, so recall fails.
+
+\paragraph{4. Inbox-Based Reply Without Memory (\texttt{disable\_send}).}
+This flow captures situations where the user reads an email and instructs a reply with content fully specified in the query, without relying on recalled memory. For example, the user may say ``Reply: Sounds good, see you at 4pm'' after opening a meeting invitation, with the reply body entirely provided in the instruction.
+\textit{Capabilities Required:} Inbox read and send; the reply body is provided by the user.
+\textit{Expected Defense Impact:} Provable policy blocks send in sessions marked untrusted (e.g., after inbox read); other defenses allow it.
+
+\paragraph{5. Inbox-Based Reply With Memory (\texttt{untrusted\_send}).}
+This flow captures situations where the user expects the assistant to compose and send an email that incorporates information stored in memory. For example, when opening a pricing inquiry, the user may say ``Reply with my standard consulting rate and availability''---the rate having been stored in a prior session---and expect the agent to recall and include it in the reply.
+\textit{Capabilities Required:} Inbox read, memory retrieval, and send in a session that has used untrusted tools.
+\textit{Expected Defense Impact:} No-untrusted-tools disables memory after inbox read; provable policy blocks send in untrusted sessions. Both can block this flow.
+
+\paragraph{6. Multi-Session Contextual Reply (\texttt{memory\_tools}).}
+This flow captures situations where the user expects the assistant to reply to an email by merging inbox content with information from prior sessions. For example, when an email requests study progress, the user may ask ``Reply and include the study hours I told you about'' or ``Reply and add Julia to the thread'' where Julia was introduced in an earlier conversation.
+\textit{Capabilities Required:} Cross-session memory, inbox read, and send with merged content from both sources.
+\textit{Expected Defense Impact:} No-untrusted-tools and provable policy can both block; limit-memory-length may reduce stored detail.
+
+\paragraph{7. Long-Horizon Recall Under Context Pressure (\texttt{long\_memory}).}
+This flow captures situations where the user expects the assistant to recall information from the distant past despite extensive intervening context. For example, after many sessions of email use and long conversations (including pasted documents or chat logs), the user may ask ``What time zone did I say my team operates in?'' and expect accurate recall.
+\textit{Capabilities Required:} Durable long-term storage and accurate retrieval despite $\sim$100k tokens of intervening context.
+\textit{Expected Defense Impact:} Limit-memory-length and context truncation may reduce reliability.
+
+\subsubsection{Obtaining and Combining Utility Scores}
+\label{app:obtaining-weights}
+
+We combine per-flow utility scores into weighted utility per (backend, defense):
+\[
+\mbox{Weighted utility} = \sum_{\text{flow } s} w_s \cdot \frac{\text{Successful benign in } s}{\text{Total benign in } s},
+\quad \sum_s w_s = 1.
+\]
+The choice of weights is crucial. Below we explain our attempt to derive empirically grounded weights from available datasets, why that attempt did not yield a defensible proxy, and why we adopt \emph{deployment profiles} instead.
+
+\subsubsection{Proxy Metric Evaluation}
+\label{app:proxy-evaluation}
+
+The seven representative task flows defined in \cref{app:user-task-taxonomy} are not uniformly frequent in realistic deployments. A user who primarily reads and archives email interacts with the agent very differently from one who delegates reply composition or relies heavily on cross-session memory. Reporting only macro-average utility---which assigns equal weight to all seven flows---would misrepresent the real-world impact of defenses on a representative user.
+
+Ideally, weights would be derived from a large-scale log of real users interacting with a memory-equipped AI email assistant. \textbf{No such dataset currently exists.} Commercial systems such as Google Gemini for Workspace and Microsoft Copilot for Outlook do not publish user interaction telemetry at the task-type level~\citep{chi2025email}. We therefore explored constructing a \emph{proxy task-flow distribution} by combining two independent empirical sources, one for each of two orthogonal dimensions that characterise our task flows. We make no claim that such a proxy would accurately describe any specific deployment; rather, we sought a principled alternative to uniform weighting. As we explain below, we could not construct a defensible proxy and \textbf{do not report proxy-derived weights} in this paper.
+
+\paragraph{Task flow decomposition.}
+Each of our seven task flows exercises two largely independent dimensions: (1) the \textit{memory demand type}---whether the flow requires no memory, single-session recall of user-provided information, single-session recall of assistant outputs, cross-session reasoning, or long-horizon temporal recall; and (2) the \textit{email action type}---whether the flow involves no inbox access, read-only access, optional send, or read-plus-send. \cref{tab:flow-decomposition} presents this decomposition.
+
+\begin{table*}[t]
+\centering
+\caption{Decomposition of the seven representative task flows along the two dimensions used in proxy weight derivation.}
+\label{tab:flow-decomposition}
+\small
+\begin{tabular}{lll}
+\hline
+\textbf{Task Flow} & \textbf{Memory Dimension} & \textbf{Email Action Dimension} \\
+\hline
+\texttt{memory\_only}         & Single-session (user)     & None \\
+\texttt{assistant\_responses} & Single-session (assistant)& Optional send \\
+\texttt{untrusted\_probe}     & Single-session (user)     & Read only \\
+\texttt{disable\_send}        & None                      & Read + send \\
+\texttt{untrusted\_send}      & Single-session (user)     & Read + send \\
+\texttt{memory\_tools}        & Multi-session             & Read + send \\
+\texttt{long\_memory}         & Temporal                  & None \\
+\hline
+\end{tabular}
+\end{table*}
+
+\paragraph{Source 1: Memory dimension marginal.}
+For the marginal over memory demand types, we considered LongMemEval~\citep{wu2024longmemeval}, a benchmark for long-term memory in chat assistants. LongMemEval contains 500 manually curated questions across six types: \texttt{single-session-user}, \texttt{single-session-assistant}, \texttt{single-session-preference}, \texttt{multi-session}, \texttt{knowledge-update}, and \texttt{temporal-reasoning}. These categories were designed to reflect commonly mentioned topics in user-assistant chats. We would map them to our memory vocabulary (e.g., merge single-session-user and single-session-preference into \textbf{Single-session (user)}; map multi-session and knowledge-update to \textbf{Multi-session}). The \textbf{None} memory category (for \texttt{disable\_send}) has no LongMemEval counterpart and would require an arbitrary constant.
+
+\textbf{Limitation:} LongMemEval is a \emph{benchmark} designed by researchers to cover memory abilities---not a log of organic user queries. Its category distribution reflects what the creators wanted to test, not how often users actually perform each type of memory task in an email-agent context. Using it as $P(\text{memory\_dim})$ would conflate ``benchmark coverage'' with ``user workflow prevalence.''
+
+\paragraph{Source 2: Email action dimension marginal.}
+For the marginal over email action types, we considered the Avocado Research Email Collection~\citep{avocado2015}. Yang et al.~\citep{yang2017sigir} establish that approximately 38\% of enterprise emails receive a reply. One could set read-only, optional-send, and read-plus-send marginals accordingly, with an upward adjustment to read-plus-send on the grounds that users who adopt an AI email assistant likely delegate high-effort send tasks disproportionately~\citep{chi2025email}.
+
+\textbf{Limitation:} Avocado studies \emph{human-to-human} email behaviour: given an email, does it get a reply? Our flows are \emph{per-session task types} for an AI assistant. The mapping is indirect; Avocado does not provide per-task-type distributions for ``no inbox,'' ``read-only,'' ``optional send,'' or ``read-plus-send'' in an AI-assisted workflow. The ``none'' and ``optional send'' categories have no direct Avocado analogue and would require ad hoc assignment.
+
+\paragraph{Independence assumption.}
+The natural approach is to model $P(\text{flow}_i) \propto P(\text{memory\_dim}_i) \times P(\text{email\_action\_dim}_i)$ and normalise. This assumes memory demand type and email action type are uncorrelated.
+
+\textbf{Limitation:} In practice, multi-session memory tasks may be \emph{positively} correlated with send-involving workflows (e.g., ``reply with what we discussed last week''). Assistant-output recall often co-occurs with optional send (e.g., ``send the version you suggested''). The independence assumption is not validated and may systematically misweight several flows.
+
+\paragraph{Deployment specificity.}
+Even if a proxy distribution were defensible, it would represent a general-purpose email assistant. Specialised deployments---a customer support agent, a scheduling-only assistant, an executive delegation tool---would have radically different task distributions. Practitioners in such regimes should reweight the per-flow scores in \cref{tab:utility-by-backend-defense} according to their own observed or estimated task mix, which our transparent per-flow reporting makes possible.
+
+\paragraph{Conclusion.}
+We could not construct a defensible proxy distribution from available data. The marginals are either absent (no user logs), misaligned (LongMemEval is a benchmark; Avocado is pre-AI human email), or require arbitrary constants. The independence assumption is questionable. We therefore \textbf{do not report proxy-derived weights}. Instead, we adopt deployment profiles as a principled alternative.
+
+\subsubsection{Deployment Profiles}
+We define three weight distributions over the seven flows (\cref{tab:deployment-profile-weights}), ordered along a spectrum from recall-heavy to email-heavy. \textbf{Recall-focused} emphasizes memory-only, assistant responses, and long-memory; lower weight on send and probe tasks. \textbf{Balanced} sits in the middle: moderate weight across memory-only, assistant responses, untrusted probe, memory tools, and long-memory; higher weight on memory-tools and send cases (disable-send, untrusted-send) than Recall-focused. \textbf{Email-heavy} emphasizes disable-send, untrusted probe/send, assistant responses, and memory tools; memory-only negligible. Practitioners identify the best-matching profile and interpret the tradeoff accordingly. \cref{tab:deployment-profile-weights} gives the weights; \cref{fig:utility-combined-gemini,fig:utility-combined-gpt} show security--utility scatter plots for each profile (weighted utility vs.\ security $= 1 - \mathrm{ASR}$ at $N=100$; points are (backend, defense) configurations).
+
+\input{tables/deployment_profile_weights}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\columnwidth]{figures/security_utility_profiles_gemini-3-1-pro-preview.pdf}
+\caption{Gemini~3.1 Pro: security--utility tradeoff by deployment profile for trigger session $N=100$.}
+\Description{Security--utility scatter plots for Gemini deployment profiles.}
+\label{fig:utility-combined-gemini}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\columnwidth]{figures/security_utility_profiles_gpt-5-mini.pdf}
+\caption{GPT-5-mini: security--utility tradeoff by deployment profile for trigger session $N=100$.}
+\Description{Security--utility scatter plots for GPT-5-mini deployment profiles.}
+\label{fig:utility-combined-gpt}
+\end{figure}
+
+\paragraph{Utility and ASR summary tables.}
+Table~\ref{tab:utility-am-hm-by-defense-backend} gives arithmetic and harmonic means (AM/HM) of benign capability success rates by defense and memory backend; Table~\ref{tab:utility-am-hm-asr-by-defense-backend} adds attack success rate (ASR) at trigger session $N=100$ in a third subcolumn per backend. Both use the same pale red-to-green heatmap as the full utility table (low to high). Referenced from \cref{sec:utility}.
+
+\onecolumn
+\vspace{0.5em}
+\input{tables/utility_am_hm_by_defense_backend}
+\vspace{1.5em}
+\input{tables/utility_am_hm_asr_by_defense_backend}
+\twocolumn
+
+\textbf{Limitations.} Profiles are plausible scenarios, not data-driven. Practitioners should reweight \cref{tab:utility-by-backend-defense} per their task mix. \textbf{Takeaways.} RAG and Context maintain high utility (91--100\% for no defense or user-prompt-only); provable (IFC) drops to 3--57\% with disable-send and untrusted-send most affected. The optimal (backend, defense) shifts with profile; RAG and Context reach top-right under Balanced and Recall-focused.
+
+%-------------------------------------------------------------------------------
+\subsection{Results by Topic}
+\label{app:results-by-topic}
+%-------------------------------------------------------------------------------
+
+The main-text Table~\ref{tab:defense-effectiveness-test100} reports ASR aggregated over the five sensitive trigger topics (finance, health, legal, tax, identity). Tables~\ref{tab:asr-by-topic-gemini} and~\ref{tab:asr-by-topic-gpt5mini} break down trigger-session-$N{=}100$ ASR by topic and backend for Gemini~3.1~Pro~Preview and GPT-5-mini respectively (values from per-topic consolidated runs under \texttt{consolidated\_attack\_results/.../test\_100/}). Cells use the same light heatmap-style shading (low to high ASR).
+
+\onecolumn
+\vspace{0.5em}
+\input{tables/asr_by_topic_test_100_gemini}
+\vspace{1.5em}
+\input{tables/asr_by_topic_test_100_gpt5mini}
+\twocolumn
+
+%\subsection{Utility Under Persistent Attack (No Defense)}
+%\label{app:utility-under-attack}
+%
+%Figure~\ref{fig:utility-vs-session-app} shows the agent's utility (benign user-step success rate) as a function of the trigger-session index $N$ for Gemini~3.1~Pro~Preview with no defense, aggregated over the same attack-benchmark runs and topics as the ASR plot in Section~\ref{sec:results}. Each curve is the mean over three seeds with $\pm 1$ standard deviation. Utility remains roughly constant across sessions (including up to $N=100$), demonstrating that the attack payload stored in persistent memory does not affect the agent's ability to complete benign tasks; the agent remains useful to the user while the exfiltration trigger lies dormant until a sensitive-topic query activates it.
+%
+%\begin{figure}[h]
+%\centering
+%\includegraphics[width=\columnwidth]{figures/utility_vs_session_defense_none_gemini-3_1-pro-preview.png}
+%\caption{Utility (benign user-step success rate, \%) versus trigger-session index $N$ for Gemini~3.1~Pro~Preview with no defense. Same setup and aggregation as the ASR plot (three seeds, five sensitive topics, all memory backends). Utility stays roughly constant over 100 sessions, showing that the persistent attack does not degrade the agent's normal behavior.}
+%\label{fig:utility-vs-session-app}
+%\end{figure}
+
+% \subsection{Utility by capability class (full table)}
+% \label{app:all-suites}
+% Tables~\ref{tab:utility-by-suite-gemini-3-1-pro-preview} and \ref{tab:utility-by-suite-gpt-5-mini} give utility (success rate) for every capability class, defense, and memory backend. Rows are capability classes; column groups are defenses; sub-columns are memory backends (No Mem., Explicit, Mem0, RAG, Context). All values are in \%. ``---'' denotes that the defense is not defined for that memory backend, or that data is missing.
+
+% \input{tables/utility_by_suite_gemini-3-1-pro-preview}
+% \input{tables/utility_by_suite_gpt-5-mini}
