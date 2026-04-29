@@ -2,21 +2,21 @@
 """
 Attack Results Consolidation Script with CSV and Plots
 
-Consolidates TEST results from the attack benchmark. Reads from
-data/benchmark/attack_results/test/ and data/benchmark/attack_logs/test/ by default
-(train/test layout matches attack_bench). Generates CSV tables and visualizations.
+Consolidates TEST results from the attack benchmark.
 
-By default runs two passes: consolidated_attack_results (from attack_results/attack_logs)
-and consolidated_attack_results_stealth (from attack_results_stealth/attack_logs_stealth).
-If --results-dir, --logs-dir, or --output-dir is provided, runs a single pass with
-those paths (and discovers test folders under the results base).
+Default (no arguments): Discovers all test splits (test_0, test_10, ..., test_100) under
+data/benchmark/attack_results/, consolidates all models and topics in each split, and writes
+to data/benchmark/consolidated_attack_results/<model>/<split>/ (e.g. gpt-5-mini/test_100/).
+Inside each split folder: per-topic CSVs and heatmaps, plus an average_heatmap.png and
+average_summary.csv (and all_suites_combined.csv) combining all topics for that split.
+Cross-session plots (all splits, ASR vs session) live in consolidated_attack_results/<model>/.
+Also runs a second pass for attack_results_stealth/ -> consolidated_attack_results_stealth/.
 
-Discovers suites from the results directory (model/backend/defense/suite/) and only
-generates CSVs and plots for suites that have result files present.
+Use --model to limit to one model. Use --results-dir/--logs-dir/--output-dir for a single
+custom pass.
 
 Usage:
-    python scripts/consolidate_attack_results.py
-    python scripts/consolidate_attack_results.py --results-dir data/benchmark/attack_results
+    python scripts/consolidate_attack_results.py                    # all splits, all models -> <model>/<split>/
     python scripts/consolidate_attack_results.py --model gpt-4o-mini
     python scripts/consolidate_attack_results.py --no-plots
 """
@@ -497,15 +497,12 @@ def generate_csv(
                         row.append("-")
                         continue
                     t = data[defense_type].get(backend, _default_metric_tuple())
-                    has_errors = t[8]
                     total = t[total_idx]
                     if metric_name == "Max Attack":
                         rate = (t[6] / t[7] * 100) if t[7] > 0 else 0.0
                     else:
                         rate = t[rate_idx]
-                    if has_errors:
-                        row.append("ERR")
-                    elif total > 0:
+                    if total > 0:
                         row.append(f"{rate:.1f}%")
                     else:
                         row.append("-")
@@ -1117,9 +1114,7 @@ def generate_combined_csv(
                             row.append("-")
                             continue
                         t = data[defense_type].get(backend, _default_metric_tuple())
-                        if t[8]:
-                            row.append("ERR")
-                        elif t[total_idx] > 0:
+                        if t[total_idx] > 0:
                             rate = (t[6] / t[7] * 100) if (rate_idx == 6 and total_idx == 7) else t[rate_idx]
                             row.append(f"{rate:.1f}%")
                         else:
@@ -1156,21 +1151,16 @@ def generate_average_summary_csv(
                         row.append("-")
                         continue
                     rates = []
-                    has_any_errors = False
                     for suite_name in all_data.keys():
                         if (defense_type in all_data[suite_name]
                                 and backend in all_data[suite_name][defense_type]):
                             t = all_data[suite_name][defense_type][backend]
-                            if t[8]:
-                                has_any_errors = True
-                            elif t[total_idx] > 0:
+                            if t[total_idx] > 0:
                                 if rate_idx == 6 and total_idx == 7:
                                     rates.append((t[6] / t[7] * 100) if t[7] > 0 else 0.0)
                                 else:
                                     rates.append(t[rate_idx])
-                    if has_any_errors:
-                        row.append("ERR")
-                    elif rates:
+                    if rates:
                         row.append(f"{sum(rates) / len(rates):.1f}%")
                     else:
                         row.append("-")
@@ -1326,6 +1316,9 @@ def main() -> int:
     csv_files: List[Path] = []
     plot_files: List[Path] = []
 
+    if not args.no_plots and not PLOTTING_AVAILABLE:
+        print("WARNING: Heatmaps will be skipped (matplotlib and/or seaborn not installed). Install with: pip install matplotlib seaborn\n")
+
     for run_name, results_root, logs_root, output_root in runs:
         output_root.mkdir(parents=True, exist_ok=True)
 
@@ -1337,6 +1330,7 @@ def main() -> int:
         if not test_folders:
             print(f"WARNING: No test folders found under {results_root}, skipping [{run_name}] run.\n")
             continue
+        print(f"[{run_name}] Consolidating all test splits -> {output_root}/<model>/<split>/")
         print(f"[{run_name}] Test folders: {', '.join(test_folders)}\n")
 
         # For cross-session ASR plots: model -> topic -> backend -> {session_idx: (attack_passed, attack_total)}
@@ -1374,7 +1368,7 @@ def main() -> int:
                     print(f"Skipping {model_name}: no results under {model_results_dir}")
                     continue
 
-                # Output dir for this test folder and model
+                # Output dir: model then split (consolidated_attack_results/<model>/<split>/)
                 model_output_dir = output_root / model_name / test_folder
                 model_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1391,6 +1385,8 @@ def main() -> int:
 
                 # Ensure cross-session structure for this model
                 mtbs = model_topic_backend_sessions.setdefault(model_name, {})
+                # Accumulate per-topic data for this split so we can generate average heatmap & CSV
+                all_suites_data: Dict[str, Dict[str, Dict[str, MetricTuple]]] = {}
 
                 for topic in topics:
                     topic_dir = model_results_dir / topic
@@ -1463,6 +1459,9 @@ def main() -> int:
                         except Exception as e:
                             print(f"  WARNING: Error generating heatmap for {suite_label}: {e}")
 
+                    # Accumulate for per-split average heatmap and CSV
+                    all_suites_data[topic] = data
+
                     # Update cross-session ASR aggregates: per topic, per backend
                     topic_backend_sessions = mtbs.setdefault(topic, {})
                     for backend in MEMORY_BACKENDS:
@@ -1490,6 +1489,31 @@ def main() -> int:
                             backend_sessions.get(session_idx, (0, 0))[0] + total_attack_passed,
                             backend_sessions.get(session_idx, (0, 0))[1] + total_attack_total,
                         )
+
+                # Per-split: average heatmap and average CSV (all topics combined for this split)
+                if all_suites_data:
+                    try:
+                        avg_csv = generate_average_summary_csv(
+                            model_name, all_suites_data, model_output_dir
+                        )
+                        csv_files.append(avg_csv)
+                        print(f"  OK: Average CSV: {avg_csv.relative_to(output_root)}")
+                        combined_csv = generate_combined_csv(
+                            model_name, all_suites_data, model_output_dir
+                        )
+                        csv_files.append(combined_csv)
+                        print(f"  OK: Combined CSV: {combined_csv.relative_to(output_root)}")
+                    except Exception as e:
+                        print(f"  WARNING: Error generating average/combined CSV for {test_folder}: {e}")
+                    if not args.no_plots and PLOTTING_AVAILABLE:
+                        try:
+                            avg_heatmap = generate_average_heatmap(
+                                model_name, all_suites_data, model_output_dir
+                            )
+                            plot_files.append(avg_heatmap)
+                            print(f"  OK: Average heatmap: {avg_heatmap.relative_to(output_root)}")
+                        except Exception as e:
+                            print(f"  WARNING: Error generating average heatmap for {test_folder}: {e}")
 
         # Cross-session plots: per topic and averaged across topics, per model
         if not args.no_plots and PLOTTING_AVAILABLE and model_topic_backend_sessions:

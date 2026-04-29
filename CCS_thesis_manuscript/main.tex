@@ -15,6 +15,9 @@
 \usepackage[capitalize]{cleveref}
 \usepackage{float}
 \usepackage{balance}
+\makeatletter
+
+\makeatother
 %% RdYlGn-style heatmap: red -> orange -> yellow -> green (smooth, muted)
 \definecolor{hmred}{RGB}{220,120,120}
 \definecolor{hmorange}{RGB}{255,200,130}
@@ -144,24 +147,25 @@
 %%
 \begin{abstract}
   Persistent memory transforms LLM agents from stateless assistants into systems that
-  remember users across sessions -- \emph{and} into a qualitatively new attack surface.
-  We introduce the \emph{Trojan Hippocampus} attack: an adversary who can inject content
-  via a single untrusted tool call (e.g., a crafted email) plants a persistent payload in
+  remember users across sessions, but also introduces a new attack surface.
+  We introduce the \emph{Trojan Hippocampus} attack: an adversary can inject content
+  via a single untrusted tool call (e.g., a crafted email) to plant a persistent payload in
   an agent's long-term memory that lies dormant across arbitrarily many benign sessions,
   activating only when the user discusses sensitive topics -- finance, health, legal matters,
   taxes, or identity numbers -- to silently exfiltrate high-value personal data.
   Unlike prior memory poisoning work, our attacker requires no direct write access to the
   memory store, operating entirely through realistic indirect prompt injection channels.
   We instantiate this attack on an email assistant across four memory backends -- explicit
-  tool memory, agentic memory (\texttt{mem0}), RAG, and sliding-window context -- and
+  tool memory, agentic memory (\texttt{mem0}~\cite{chhikara2025mem0}), RAG, and sliding-window context -- and
   evaluate four memory system-level defenses including a provably secure information-flow
   control policy.
   Attack success rates reach 100\% on the undefended baseline and remain high across
   arbitrarily many trigger sessions, even against the latest frontier safety-aligned models from
   OpenAI and Google. 
-  The proposed defenses reduce ASR to 0--5\%, but their utility cost varies substantially by user-flow and capabilities required.  
-  We provide a novel and transparent capability-aware security--utility analysis and the first dynamic red-teaming
-  benchmark, with adaptive attacks optimized by OpenEvolve on unseen held-out sessions, for persistent memory defenses.
+  The proposed defenses reduce ASR to 0--5\%, but their utility cost varies by user-flow and capabilities required.  
+  We evaluate attacks and defenses using a novel capability-aware security/utility analysis, building the first adaptive
+  benchmark for persistent memory defenses, using dynamic attacks optimized by 
+  OpenEvolve~\cite{openevolve}.
 \end{abstract}
 
 %   \begin{CCSXML}
@@ -196,34 +200,35 @@
 \label{sec:intro}
 
 %% ── Deployment context ──────────────────────────────────────────────────────
-Persistent, cross-session memory is fast becoming a defining feature of frontier AI agents.
+Persistent cross-session memory has become a defining feature of frontier AI agents.
 ChatGPT~\citep{openai2024memory}, Gemini Advanced~\citep{google2024gemini}, and
-Claude~\citep{anthropic2025memory,anthropic2026import} all now remember user preferences,
-projects, and personal context across sessions, enabling a class of personalized,
+Claude~\citep{anthropic2025memory,anthropic2026import} all now remember user preferences and personal context across sessions, enabling a class of personalized,
 long-horizon assistance that stateless models cannot provide.
-The commercial incentives are clear, and the proliferation of persistent memory is rapid.
+The commercial incentives are clear\footnote{A personal travel assistant 
+that remembers a user's seat preferences, frequent flyer numbers, dietary 
+restrictions, and preferred hotel chains can book an entire trip from a 
+single instruction---``book me my usual for the London trip next Tuesday''---
+without the user specifying any of these details anew.}, and the proliferation of persistent memory is rapid.
 
 %% ── The threat setup (general, no specific attack revealed yet) ─────────────
-What has not kept pace is security.
-When an adversary can plant instructions inside the content being read -- a technique
-known as indirect prompt injection~\citep{greshake2023not} -- an AI agent equipped with \texttt{read} 
-and \texttt{write} tools, can be made to exfiltrate data to the attacker.
+Unfortunately, what has not kept up with these agentic capabilities, is security.
+Adversaries can plant instructions inside the model's context -- a technique
+known as indirect prompt injection~\citep{greshake2023not} -- leading AI agents equipped with \texttt{read} 
+and \texttt{write} tools to exfiltrate data to the attacker.
 Persistent memory compounds that risk: an injected instruction need not execute immediately, 
 but can be stored deceitfully (Trojan Horse) in the agent's long-term memory (Hippocampus) and lie dormant across many routine sessions, 
 activating only when the user discusses something sensitive (Trojan Hippocampus).
 
 
-This attack pattern has been demonstrated repeatedly against major deployed systems.
-The most direct instantiations involve injecting false memories that establish persistent,
-cross-session exfiltration channels: \emph{SpAIware} demonstrated this on ChatGPT's
-desktop app~\citep{rehberger2024spaiware,morsy2025spaiware}, a follow-on disclosure
+Prior work has demonstrated that injected malicious memories can establish persistent exfiltration channels in major deployed systems. 
+\emph{SpAIware} demonstrated this on ChatGPT's
+desktop app~\citep{rehberger2024spaiware,morsy2025spaiware}. A follow-on disclosure
 exfiltrated a user's entire stored memory and chat history via a crafted
 URL~\citep{rehberger2025chathistory}, and Palo~Alto Networks Unit~42 independently
 confirmed that indirect injection can poison long-term agent memory with persistent
 behaviors~\citep{unit42_2025_memory}.
-The threat has since grown in sophistication: \emph{ZombieAgent} showed the exfiltration
-channel can be made self-propagating, with new sessions infected by previously compromised
-ones~\citep{radware2026zombieagent}; and on Gemini Advanced, \emph{delayed tool
+Following these works, \emph{ZombieAgent} showed that persistent exfiltration
+channels can be connected to all additional personal data sources like Inbox, Drive, connected to the user's ChatGPT~\citep{radware2026zombieagent}; and on Gemini Advanced, \emph{delayed tool
 invocation} plants a memory update that activates only when the user types a common
 response word -- causing the model to treat an attacker-supplied instruction as a
 user-requested memory change~\citep{rehberger2025gemini,goodin2025gemini}.
@@ -234,7 +239,7 @@ and widespread}.
 
 
 %% ── Why stakes are high ─────────────────────────────────────────────────────
-Why the stakes are high: the information at risk is not incidental, and the scale of exposure makes this extremely urgent.
+The stakes are high: both the scale and sensitivity of the information at risk make addressing these attacks extremely urgent.
 ChatGPT alone reached 700 million weekly as of July 2025~\citep{openai2024affective}, 
 56\% of American adults now use AI tools~\citep{brookings2025aisurvey}, and 52\% of consumers globally feel comfortable
 relying on personal AI assistants for everyday tasks~\citep{zendesk2025survey}.
@@ -242,18 +247,16 @@ People share extremely sensitive information with their AI assistants: 49\% of L
 self-reported mental health conditions use them for therapeutic support~\citep{rousmaniere2025mentalhealth},
 and a joint OpenAI--MIT Media Lab study of nearly 40 million interactions found over
 one million users showing signs of emotional attachment~\citep{openai2024affective}.
-When that memory is compromised, the attacker receives the user's own words -- intimate details, income,
-medical history, legal correspondence, relationship crises -- shared with the candor of a
-trusted confidant, and highly exploitable for phishing, fraud, or blackmail at a specificity no
+When that memory is compromised, the attacker learns private information about the user's 
+intimate details, income, medical history, legal correspondence, which can be exploited for phishing, fraud, or blackmail at a specificity no
 generic data breach can replicate.
 
 %% ── Research gap ────────────────────────────────────────────────────────────
-Yet no systematic study has realistically characterized the attack surface that persistent 
+Despite these risks, no systematic study has realistically characterized the attack surface that persistent 
 memory introduces, nor evaluated defenses against it.
 Which memory backend is most vulnerable to persistent exfiltration, and by how much?
-Which defenses reduce risk without crippling utility, and does the answer depend on the 
-memory backend?
-Do these evaluations become obsolete as frontier models evolve?
+What are possible defenses, how effective are they and how do they affect utility?
+% Do these evaluations become obsolete as frontier models evolve?
 The security community has built strong foundations in prompt-injection defenses and 
 evaluation frameworks~\citep{greshake2023indirect,debenedetti2024agentdojo,zhang2024asb,zou2025art,boisvert2025doomarena},
 but persistent memory is a new architectural primitive that introduces a threat dimension 
@@ -275,23 +278,21 @@ surface of modern agents despite state-of-the-art safety alignment.
 defenses, comprising:
 \begin{enumerate}
   \item \textit{A spectrum of defenses with capability-aware, deployment-dependent 
-  evaluation.} Four system-level defenses spanning from lightweight heuristic filters to a 
-  provably secure information-flow control (IFC) policy reduce ASR to 0--5\% in most 
-  configurations. A user-flow based transparent 
-  security--utility analysis shows that no single defense is universally optimal, providing 
-  the first principled methodology for defense selection under explicit security--utility 
-  tradeoffs.
-  \item \textit{A dynamic automated red-teaming benchmark.} The first dynamic benchmark 
-  for persistent memory attacks, using OpenEvolve-style~\citep{openevolve} automated 
-  red-teaming to generate adaptive attack variants against deployed defenses, enabling 
-  continuous adversarial stress-testing beyond any fixed evaluation suite.
+  evaluation.} Four system-level defenses---from lightweight heuristic filters to a
+  provably secure information-flow control (IFC) policy---reduce ASR to 0--5\% in most
+  configurations. A transparent, user-flow-based security--utility analysis shows how the defenses preserve utility under different deployment scenarios, and provides a principled methodology for defense
+  selection under explicit security--utility tradeoffs.
+  \item \textit{A dynamic automated red-teaming benchmark.} We introduce the first
+  dynamic benchmark for persistent memory attacks, using OpenEvolve-style~\citep{openevolve}
+  automated red-teaming to generate adaptive attack variants against deployed defenses and
+  enable continuous adversarial stress-testing beyond any fixed evaluation suite.
 \end{enumerate}
 
 
 \begin{figure*}[t]
   \includegraphics[width=\textwidth]{figures/attack-flow.pdf}
   \caption{\textbf{The Trojan Hippocampus attack flow.} \textbf{Phase 1 (Ingestion):} The 
-  attacker sends a crafted email containing hidden malicious instructions -- here, to 
+  attacker sends an email containing hidden malicious instructions -- here, to 
   exfiltrate any message in which the user discusses tax. When the user asks their agent to 
   read emails, the payload is silently written into the agent's long-term memory store. 
   \textbf{Phase 2 (Dormancy and Delayed Exfiltration):} The payload lies dormant across an arbitrary number of benign 
@@ -395,9 +396,9 @@ On evaluation, current security-utility frameworks aggregate metrics across task
 masking per-capability defense impact and ignoring how task distributions shift across
 deployment profiles~\citep{zhang2024asb}.
 Beyond metric design, all major benchmarks rely on fixed attack sets that risk obsolescence
-as models evolve~\citep{pan2025beyond,zhou2025autoredteamer,ferrag2025promptinjections}.
-Our framework addresses both gaps: a capability-aware, deployment-profile-weighted
-security--utility analysis, and the first dynamic red-teaming benchmark for persistent
+as models evolve~\citep{pan2026beyond,zhou2025autoredteamer,ferrag2025promptinjections}.
+Our framework addresses both gaps: a capability-aware, deployment-dependent 
+security/utility analysis, and the first dynamic red-teaming benchmark for persistent
 memory defenses.
 
 
@@ -462,7 +463,7 @@ attacker-controlled destination (e.g., an email address, a URL), the attacker
 receives it. Intermediate steps of the attack like injection processing, and blocking are otherwise
 indistinguishable to the attacker.
 
-\subsection{Attack Scenario: Trojen Hippocampus Persistent Memory Exfiltration}
+\subsection{Attack Scenario: Trojan Hippocampus Persistent Memory Exfiltration}
 
 The attack class we study is a specific and uniquely dangerous instantiation
 of indirect injection that is \emph{only possible in agents with persistent
@@ -488,7 +489,7 @@ precisely when the user shares \emph{maximally sensitive} information, making
 the exfiltrated content directly exploitable for fraud, phishing, or
 blackmail; (2)~a single successful injection compromises an \emph{indefinite
 number of future sessions} until the poisoned entry is removed; and
-(3)~depending on the memory backend, stored poisonedcontents are not directly
+(3)~depending on the memory backend, stored poisoned contents are not directly
 observable to the user---vector stores and RAG-based backends, for instance,
 offer no interface through which a user could inspect or audit what has been
 indexed---meaning the malicious payload can persist silently without the user
@@ -514,9 +515,9 @@ adversary to operate exclusively through the agent's untrusted tools.
 We instantiate the threat model of Section~\ref{sec:threat-model} in an
 \emph{personal assistant and email assistant}: an LLM-based chat assistant that also reads, composes, and sends
 email on a user's behalf.
-In this setting, \textbf{taint sources} are \texttt{read\_inbox},
+In this setting, \textbf{taint or untrusted sources} are \texttt{read\_inbox},
 \texttt{search\_emails}, \texttt{reply}, and \texttt{forward};
-\textbf{effect sinks} are \texttt{send\_email} and outbound
+\textbf{effect sinks or external tools} are \texttt{send\_email} and outbound
 \texttt{reply}/\texttt{forward}, through which exfiltration manifests as an
 email delivered to an attacker-controlled address.
 The adversary controls the \texttt{From}, \texttt{Subject}, and \texttt{Body}
@@ -534,26 +535,44 @@ satisfying the structural preconditions in Section~\ref{sec:threat-model}.
 
 \subsection{Agent Implementation}
 
-We implement the email assistant using LangGraph/LangChain: an LLM is given a
+We implement the email assistant using LangChain: an LLM is given a
 system prompt listing available tools and invokes them in a tool-calling loop.
 The agent has \emph{read} tools (\texttt{read\_all\_emails},
 \texttt{search\_emails}) and \emph{write} tools (\texttt{send\_email},
 \texttt{reply\_to\_email}, \texttt{forward\_to\_email}).
-Depending on the memory backend, it also has tools to update or query
-persistent memory (e.g., \texttt{update\_memory} for the explicit backend).
-Each benchmark run of a particular test case uses an an isolated environment with a mailbox (inbox, outbox, drafts) and the 
+% Depending on the memory backend, it also has tools to update or query
+% persistent memory (e.g., \texttt{update\_memory} for the explicit backend).
+Each benchmark run of a particular test case uses an isolated environment with a mailbox (inbox, outbox, drafts) and the
 memory backend of choice.
-We evaluate two target models---Gemini~3.1~Pro~Preview and
-GPT-5-mini, a fixed recursion limit of 50 steps per invoke, and a 600\,s timeout.
+We evaluate two target models---Gemini~3.1~Pro and
+GPT-5-mini, a fixed recursion limit of 50 steps per invoke, and a 600 second timeout.
 
 \subsection{Attack Benchmark}
 
-% \paragraph{Data and splits.}
 We use five trigger topics (finance, health, legal, tax, identity), each with
 dedicated templates and entity pools.
+To illustrate the sensitivity of data that can be exfiltrated when an attack
+succeeds, we provide one example user query for each topic below, with the
+sensitive information highlighted in red.
+\input{tables/attack_examples}
+
+Train and test cases are generated using a modified version of the data
+generation pipeline from LoCoMo~\citep{maharana2024lococmo}, a widely adopted
+benchmark for evaluating very long-term conversational memory in LLM agents.
+LoCoMo's pipeline generates rich, multi-session conversational histories
+grounded in persona statements and temporal event graphs, making it a natural
+foundation for our benign session content.
+However, LoCoMo's original format---dialogues between two virtual agents---does
+not directly fit our email-assistant setting, in which one party is a human
+user interacting with an AI agent.
+We therefore adapted its data generation scripts to produce single-user
+conversation histories consistent with our agent interface, reusing its
+persona and event-graph grounding to ensure realistic, coherent memory content
+across sessions.
 For each (topic, memory backend) pair we generate one \emph{train} case and
 four \emph{test} cases with disjoint templates and entity slots, ensuring no
 test phrasing is seen during attack optimization.
+
 
 \paragraph{Adaptive red-teaming.}
 We use an OpenEvolve-style evolutionary search to optimize the attack email on the
@@ -577,7 +596,7 @@ The best attack found is then evaluated on all four unseen test cases, measuring
 \label{sec:memory-backends}
 %==============================================================================
 
-Memory architecture or backendfundamentally determines how an agent accumulates,
+Memory architecture, or backend, fundamentally determines how an agent accumulates,
 retains, and retrieves information across sessions---and, as we demonstrate, shapes
 its exposure to persistent injection attacks.
 Recent surveys and benchmarks of agent memory~\cite{hu2025memorysurvey,
@@ -619,35 +638,37 @@ This backend is deterministic and human-inspectable, mirroring the
 file-based or scratchpad-style memory used by deployed assistants such as
 ChatGPT Memory~\cite{openai2024memory} and Claude's memory
 import~\cite{anthropic2025memory}.
-% Entries carry a trust label to support the provable defense.
-% User-prompt-only is not applicable to this backend, since explicit storage is
-% agent-directed rather than derived from the full conversation; the benchmark
-% skips that combination.
 
 \paragraph{Mem0 (agentic semantic memory).}
-TODO: Refine this description.
-Another LLM in addition to the main agent's LLM, continuously extracts structured \emph{memories} from both user and
-assistant messages, at every conversation turn.
-Stored items are semantic units produced by the extraction model---not raw
-text---and include automatic deduplication and contradiction resolution.
-Retrieval is by semantic similarity to the current turn: the top-$k$ (top-8 by default) most
-relevant memories are surfaced.
-This backend models state-of-the-art agentic memory systems that infer both
-\emph{what} to remember and \emph{when} to surface it based on meaning rather
-than recency~\cite{chhikara2025mem0}.
-We use the publicly available Mem0 implementation~\cite{chhikara2025mem0}
-with default extraction and retrieval settings.
+A dedicated extraction LLM processes every conversation turn and distills it
+into a set of atomic, semantically meaningful facts---distinct from raw text
+chunks---which are stored in a vector database alongside
+a relational history store that tracks provenance and lineage.
+On each subsequent turn, the current user message is used to query the vector
+store; the top-$k$ most semantically similar facts are retrieved and
+injected into context.
+Crucially, the extraction step is not additive: new memories are reconciled
+against existing ones, with the extraction LLM responsible for deduplication
+and contradiction resolution, so the store reflects a continuously updated
+model of the user rather than a growing log.
+This backend models state-of-the-art agentic memory systems that infer
+both \emph{what} to store and \emph{how to update} existing knowledge from
+ongoing interaction~\citep{chhikara2025mem0}.
+We use the publicly available open-source Mem0
+implementation~\citep{chhikara2025mem0} with default extraction and
+retrieval settings.
+
 % Session-level metadata can be attached to entries for the provable defense.
 %==============================================================================
 \section{Defenses}
 \label{sec:defenses}
 %==============================================================================
 Defending a memory-augmented LLM agent against the Trojan Hippocampus attack
-requires thinking end-to-end about the full system -- includingbetter safety alignment of the LLM and various general indirect prompt injection defenses. 
+requires thinking end-to-end about the full system -- including better safety alignment of the LLM and various general indirect prompt injection defenses.
 At the model level, train-time approaches such as instruction
 hierarchies~\citep{wallace2024instruction}, StruQ~\citep{chen2025struq},
 and SecAlign~\citep{chen2024secalign} fine-tune the model to deprioritize
-or resist instructions that arrive outside the trusted user turn, by training
+or resist instructions that are part of untrusted tool outputs, by training
 on adversarial examples or enforcing privilege-aware loss functions.
 At the pipeline level, test-time approaches intercept content before or after
 it reaches the model: sanitization methods such as
@@ -680,23 +701,81 @@ attack~\citep{jia2025critical} and require full model access and retraining.
 
 This motivates a complementary layer of protection at the memory
 system itself---one that has received little attention in prior work.
-Memory-layer defenses do not compete with indirect prompt onjection defenses;
+Memory-layer defenses do not compete with indirect prompt injection defenses;
 they address an attack path those approaches cannot observe.
 In this work, we focus exclusively on memory-system-level defenses
-and treat inference-layer indirect prompt injection defenses as an orthogonal, composable
+and treat general indirect prompt injection defenses as an orthogonal, composable
 layer.
 
 \subsection{Three Interception Points}
 
-The attack must succeed at three sequential steps: the payload must be
-(1)~\emph{written into persistent memory}, (2)~\emph{retrieved into context} in a
+The Trojan Hippocampus attack must succeed at three sequential steps: the payload must be
+(1)~\emph{indexing into persistent memory}, (2)~\emph{retrieved into context} in a
 sensitive session (containing high value personal information), and (3)~\emph{trigger an exfiltration action}.
 A defense that blocks any one step breaks the full chain. 
-Below we describe the four defenses we evaluate in detail, loosely categorised by the interception point they target.
+Below we describe the four defenses we evaluate in detail, loosely categorised by the interception point they target. See \cref{tab:defense-by-backend} for customized implementation details of each defense for each memory-backend. 
+
 
 \subsection{Defense Descriptions}
+\begin{table*}[h]
+\centering
+\caption{Per-backend realization of each defense. ``Defense Undefined''
+marks invalid (backend, defense) combinations; the benchmark skips those
+pairs.}
+\label{tab:defense-by-backend}
+\small
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{@{}p{2.9cm}p{3.1cm}p{3.1cm}p{3.1cm}p{2.9cm}@{}}
+\toprule
+\textbf{Defense} & \textbf{Explicit} & \textbf{Mem0} & \textbf{RAG}
+  & \textbf{Context} \\
+\midrule
+\textbf{User-prompt-only}
+  \newline\textit{(Blocks Memory Indexing)}
+  & \textit{Defense Undefined.}\newline
+    Injected payload can override the \texttt{update\_memory} call under
+    white-box attack; defense cannot be soundly enforced.
+  & Only \texttt{user}-role messages passed to extraction pipeline;
+    assistant turns dropped.
+  & Only \texttt{User:} segments embedded and stored; assistant turns discarded.
+  & Only \texttt{User:} segments appended to sliding-window history;
+    assistant turns discarded. \\
+\midrule
+\textbf{No-untrusted-tools}
+  \newline\textit{(Blocks Memory Indexing)}
+  & Untrusted flag set on taint tool call;
+    \texttt{update\_memory} silently no-ops for remainder of session.
+  & Untrusted flag set on taint tool call;
+    memory \texttt{add()} skipped for remainder of session.
+  & Untrusted flag set on taint tool call;
+    embedding and memory indexing skipped for remainder of session.
+  & Untrusted flag set on taint tool call;
+    history append suppressed for remainder of session. \\
+\midrule
+\textbf{Limit-memory-length}
+  \newline\textit{(Impedes Retrieval)}
+  & \texttt{update\_memory} argument truncated to 80 chars before storage.
+  & Extracted memory strings truncated to 80 chars before storage.
+  & Chunk size set to 80 chars (default: 512).
+  & \textit{Defense Undefined.}\newline
+    No discrete memory entries; truncation has no well-defined unit of
+    application. \\
+\midrule
+\textbf{Provable policy (IFC)}
+  \newline\textit{(Blocks Exfiltration)}
+  & Entries labeled T/U at write; U session $\Rightarrow$ send tools
+    blocked.
+  & Memories labeled T/U at add; U session $\Rightarrow$ send tools
+    blocked.
+  & Chunks labeled T/U at embed; U session $\Rightarrow$ send tools
+    blocked.
+  & History segments labeled T/U; U session $\Rightarrow$ send tools
+    blocked. \\
+\bottomrule
+\end{tabular}
+\end{table*}
 
-\paragraph{User-prompt-only (blocks step~1: write).}
+\paragraph{User-prompt-only (Blocks step~1: Memory Indexing).}
 \emph{Rationale.} The payload reaches memory because the agent indexes
 assistant turns or tool outputs that contain the email body.
 Restricting indexing to user-authored messages means adversary-controlled
@@ -707,7 +786,7 @@ each dialogue turn is passed to the indexing pipeline; assistant turns
 and tool outputs are discarded before any write.
 For Mem0, only \texttt{user}-role messages are passed to the extraction
 pipeline, preventing the LLM extractor from operating on any adversary-controlled content.
-\emph{Inapplicable to explicit backend.} Since memory writes are
+\emph{User-prompt-only defense is inapplicable to explicit backend.} Since memory writes are
 triggered by an explicit \texttt{update\_memory} tool call, enforcing
 this restriction requires the agent to follow an additional instruction
 in its system prompt.
@@ -722,9 +801,9 @@ The attack should fail at step~1 for all backends where the defense
 applies. Utility cost arises when the agent legitimately needs to
 remember information gleaned from tool outputs or assistant responses;
 flows that depend on assistant output recall (\texttt{assistant\_responses})
-are fully broken by this defense.
+are fully broken by this defense (see \cref{sec:utility-analysis}).
 
-\paragraph{No-untrusted-tools (blocks step~1: write).}
+\paragraph{No-untrusted-tools (Blocks step~1: Memory Indexing).}
 \emph{Rationale.} Poisoning always occurs in a session where the agent
 invokes an untrusted (taint) tool.
 Suppressing all memory writes in any session that touches any untrusted tool
@@ -750,7 +829,7 @@ Flows that combine inbox access with memory recall
 (\texttt{untrusted\_probe}, \texttt{untrusted\_send},
 \texttt{memory\_tools}) are degraded by this defense.
 
-\paragraph{Limit-memory-length (impedes step~2: retrieval).}
+\paragraph{Limit-memory-length (Impedes step~2: Retrieval).}
 \emph{Rationale.} For retrieval-based backends (RAG, Mem0), the payload
 must arrive in context \emph{intact}: both the trigger condition and the
 exfiltration instruction must be retrievable together in the same memory entry (chunk, memory, etc.).
@@ -760,8 +839,8 @@ match the sensitive topic may be retrieved while the exfiltration
 instruction, stored in a different fragment, is not.
 \emph{Implementation.}
 For RAG, the chunk size is set to 80~characters.
-For Mem0, both the input to the extraction pipeline and each extracted
-memory string are truncated to 80~characters before storage.
+For Mem0, each extracted
+memory string is truncated to 80~characters before storage.
 For explicit, \texttt{update\_memory} truncates the input string to
 80~characters before writing.
 The defense is inapplicable to the context backend, which has no
@@ -773,7 +852,7 @@ under adaptive attacks that compress their payloads accordingly.
 Utility cost arises when legitimate memory entries are truncated and
 lose meaning.
 
-\paragraph{Provable policy---information-flow control (blocks step~3: exfiltration).}
+\paragraph{Provable policy---information-flow control (Blocks step~3: Exfiltration).}
 \emph{Rationale.} Even if the payload is written to memory and retrieved
 intact, the exfiltration step can be made structurally impossible by
 tracking how information flows through the session.
@@ -806,129 +885,215 @@ in which the user reads from untrusted sources like the inbox or tainted long te
 be blocked from sending without manual intervention.
 This is a significant utility tradeoff, and we measure it directly in Section~\ref{sec:results}.
 
-\begin{table*}[t]
-\centering
-\caption{Per-backend realization of each defense. Each cell states
-what happens at the relevant interception point for that backend.
-``---'' marks invalid combinations; the benchmark skips those pairs.}
-\label{tab:defense-by-backend}
-\small
-\renewcommand{\arraystretch}{1.35}
-\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.0cm}@{}}
-\toprule
-\textbf{Defense} & \textbf{Explicit} & \textbf{Mem0} & \textbf{RAG} & \textbf{Context} \\
-\midrule
-\textbf{User-prompt-only}
-\newline \textit{(blocks write)}
-  & --- \newline Tool call can be overridden by injected payload; defense unsound under white-box attack
-  & Only \texttt{user}-role messages passed to Mem0 extraction pipeline; assistant + tool turns dropped
-  & Only \texttt{User:} segments of each turn embedded and stored; assistant turns and tool outputs discarded
-  & Only \texttt{User:} segments of each turn appended to sliding-window history \\
-\midrule
-\textbf{No-untrusted-tools}
-\newline \textit{(blocks write)}
-  & Session flag set U on taint tool call; \texttt{update\_memory} silently no-ops for rest of session
-  & Session flag set U on taint tool call; Mem0 \texttt{add()} skipped; flag resets next session
-  & Session flag set U on taint tool call; embedding + insertion skipped; flag resets next session
-  & Session flag set U on taint tool call; history append suppressed; flag resets next session \\
-\midrule
-\textbf{Limit-memory-length}
-\newline \textit{(impedes retrieval)}
-  & Input to \texttt{update\_memory} truncated to 80~chars before storage
-  & Input to extraction pipeline and each extracted memory string truncated to 80~chars
-  & Chunk size set to 80~chars (vs.\ default 512); chunks overlapping a boundary are split, not merged
-  & --- \newline No discrete entries; truncation has no well-defined unit of application \\
-\midrule
-\textbf{Provable policy (IFC)}
-\newline \textit{(blocks exfiltration)}
-  & Entries labeled T/U at write; session taints to U on taint tool or U-entry retrieval; effect sinks blocked if U
-  & Memories labeled T/U at add; session taints to U on taint tool or U-memory retrieval; effect sinks blocked if U
-  & Chunks labeled T/U at embed; session taints to U on taint tool or U-chunk retrieval; effect sinks blocked if U
-  & History segments labeled T/U; session taints to U on taint tool or U-segment in context; effect sinks blocked if U \\
-\bottomrule
-\end{tabular}
-\end{table*}
+
 
 
 %==============================================================================
 \section{Results}
 \label{sec:results}
 %==============================================================================
+We organize the results around three questions: (1)~How effective and persistent is the Trojan Hippocampus attack in the absence of any defense? 
+(2)~How effectively do the proposed memory-layer defenses reduce the attack success rate, and at 
+what cost to utility? (3)~How should practitioners reason about the security--utility 
+tradeoff of these defenses for their specific deployment?
 
 \subsection{Persistent and Strategic Sensitive Data Exfiltration}
-
-% For persistence evaluation, we define splits indexed by $N \in \{0, 10, 25,
-% 50, 100\}$. Each case proceeds as follows: the attack email is delivered and
-% the agent reads the inbox, writing the injected payload into persistent memory.
-% The agent then conducts $N$ normal sessions---conversations on topics unrelated
-% to the trigger, during which the memory store continues to be updated naturally
-% by routine user interactions. In session $N{+}1$, the user raises the trigger
-% topic. Thus $N{=}0$ means the trigger is raised immediately after poisoning;
-% $N{=}100$ means the payload must survive 100 intervening sessions of normal
-% agent use before activation.
-
-We first evaluate the strength and persistence of the attack with no defense enabled. \cref{fig:asr-vs-session-gemini-nodefense} reports the attack success rate (ASR) as a function of trigger-session index $N$ for Gemini~3.1~Pro~Preview, aggregated over five sensitive topics (finance, health, legal, tax, identity) and multiple memory backends. The setup follows \cref{sec:experimental-setup}: $N$ corresponds to split \texttt{test\_$N$} (load\_memory\_snapshot($N$) before the trigger session), and each point is the mean over three seeds with $\pm 1$ std over held-out test cases.
-
-The attack is injected once, prior to session $N=0$, when the agent processes a malicious email while reading/searching the inbox. From that point onward, the agent proceeds through fresh, benign user sessions. The x-axis index $N$ denotes the number of fully benign sessions that occur after poisoning and before the trigger session. Thus, ASR at $N=10$ means the agent has completed 10 normal, non-sensitive sessions in which the attack remains dormant in memory; on the 11th session, the user message concerns a sensitive topic and we measure whether exfiltration succeeds.
-
-Across all memory backends that persist information (Explicit scratchpad, Mem0 agentic memory, RAG, Context sliding-window), ASR is already high at $N=0$ and remains near-perfect up to $N=100$. This shows that a single poisoning event can induce long-lived compromise, surviving many benign interactions before strategically activating.
-
-Importantly, the attack remains stealthy during the benign sessions: it does not surface, interfere with normal task completion, or degrade performance.
-
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figures/asr_vs_session_defense_none_gemini-3_1-pro-preview.png}
-\caption{Attack success rate (ASR) versus trigger-session index $N$ for Gemini~3.1~Pro~Preview with no defense. The agent is poisoned once before $N=0$ by reading a malicious email; it then completes $N$ fully benign sessions before receiving a sensitive-topic trigger. Curves show mean ASR over three seeds (0, 42, 123) for each memory configuration; shaded bands indicate $\pm 1$ standard deviation. The attack is trained once per (topic, backend) and evaluated on held-out test cases. High ASR that does not decay with $N$ demonstrates persistent, strategically delayed exfiltration after a single poisoning event.}
+\caption{Attack success rate (ASR) versus trigger-session index $N$ for Gemini~3.1~Pro~Preview with no defense. The agent is poisoned once before $N=0$ by reading a malicious email; it then completes $N$ fully benign sessions before receiving a sensitive-topic trigger. Curves show mean ASR over three seeds for each memory configuration; shaded bands indicate $\pm 1$ standard deviation. The attack is trained once per (topic, backend) and evaluated on held-out test cases. High ASR that does not decay with $N$ demonstrates persistent, strategically delayed exfiltration after a single poisoning event.}
 \Description{Line plot of attack success rate versus session index for different memory backends.}
 \label{fig:asr-vs-session-gemini-nodefense}
 \end{figure}
 
-\subsection{Example Exfiltrated Trigger Messages}
-\label{sec:attack-examples}
+We first evaluate the strength and persistence of the attack with no defense enabled. \cref{fig:asr-vs-session-gemini-nodefense} reports the attack success rate (ASR) as a function of trigger-session index $N$ for Gemini~3.1~Pro~Preview, aggregated over five sensitive topics (finance, health, legal, tax, identity) and multiple memory backends. The setup follows \cref{sec:experimental-setup} and each point is the mean ASR over three seeds with over held-out test cases.
 
-To illustrate the sensitivity of data that can be exfiltrated when an attack succeeds, we selected one representative trigger user message per topic from the test suite for split \texttt{test\_0} (trigger in the first session after poisoning; see \cref{sec:experimental-setup}). Each example below was observed to succeed (attack goal passed) in at least one benchmark run (model/backend/defense configuration). \textbf{Boldface} indicates personal or otherwise sensitive information that an attacker would obtain if the agent forwarded the user's message to the exfiltration address.
+The attack is injected once, prior to session $N=0$, when the agent processes a malicious email while reading/searching the inbox. From that point onward, the agent proceeds through fresh, benign user sessions. The x-axis index $N$ denotes the number of fully benign sessions that occur after poisoning and before the trigger session. Thus, ASR at $N=10$ means the agent has completed 10 normal, non-sensitive sessions in which the attack remains dormant in memory; on the 11th session, the user message concerns a sensitive topic and we measure whether exfiltration succeeds.
 
-\input{tables/attack_examples}
+Across all memory backends that persist information (Explicit, Mem0 agentic memory, RAG, Context sliding-window), ASR is already high at $N=0$ and remains very high up to $N=100$. This shows that a single poisoning event can induce long-lived compromise, surviving many benign interactions before strategically activating.
 
-\subsection{Defense Effectiveness at Trigger Session $N=100$}
+% Importantly, the attack remains stealthy during the benign sessions: it does not surface, interfere with normal task completion, or degrade performance. 
+The apparent variation across $N$ in 
+Figure~\ref{fig:asr-vs-session-gemini-nodefense} reflects stochasticity 
+in memory content rather than a systematic trend. To verify this, we ran 
+20 independent trials at the $N{=}100$ split for RAG and Context, randomly 
+shuffling the 100 intervening benign conversations in each trial; this 
+yielded standard deviations of 33\% and 43\% respectively, confirming that 
+the observed fluctuations are within the range explained by randomness in 
+memory composition. Extending this analysis to all (backend, defense, $N$) 
+combinations was not feasible, as each 20-trial run costs approximately 
+\$500 in API calls.
 
-To illustrate how defenses reduce attack success, we report utility under attack and ASR at the trigger session corresponding to $N=100$ benign sessions after poisoning (split \texttt{test\_100}). \cref{tab:defense-effectiveness-test100} gives, for each target model, the two metrics by defense (rows) and memory backend (columns). Each cell aggregates over five topics and the test cases per topic (see \cref{sec:experimental-setup}), then over three seeds; we report the mean. \emph{Utility under attack} is the fraction of benign user steps that passed in the same attack-benchmark runs (i.e., the agent's ability to complete non-exfiltration steps while under attack). \emph{ASR} is the fraction of test cases in which exfiltration succeeded. Without defense, ASR is high across persistent-memory backends (e.g., 60--100\% for Gemini, 60--85\% for GPT-5-mini); all four defenses reduce ASR, with the provable policy and no-untrusted-tools achieving zero (or near-zero) exfiltration in this split. User-prompt-only is not defined for the Explicit backend; limit-memory-length is not defined for Context.
 
+\subsection{Defense Effectiveness}
+\label{sec:defenses}
 \input{tables/defense_effectiveness_test_100}
+\input{tables/utility_am_hm_asr_by_defense_backend}
+
+Table~\ref{tab:defense-effectiveness-test100} reports ASR and utility under
+attack at trigger session 100 (trigger after 100 benign sessions) for each (defense, backend) combination for all test cases (five different trigger topics).
+\emph{Utility under attack}\footnote{In practice, what matters most under attack is minimizing ASR and what matters most in benign sessions (which are vastly more frequent), is making sure that the defenses
+don't impair the utility.
+Hence, utility under attack is rather a secondary metric; we report it for
+completeness and comparability with prior work~\citep{agentdojo}, but direct
+the reader's attention to ASR for security evaluation and to
+Section~\ref{sec:utility-analysis} for the more practically relevant
+analysis of benign utility.} measures the effect of the attack and defenses on 
+the agent's ability to complete the user's tasks while under attack (In our experiments, we measure whether the agent successfully completes
+the user's trigger-session tasks in the same run where exfiltration is
+attempted).
+
+Memory-layer defenses substantially reduce ASR across backends for both
+models. For Gemini 3.1 Pro the baseline ASR reaches 85\% on
+Explicit and 100\% on Context, and residual exfiltration persists under
+limit-memory-length (e.g., Explicit 85\%, RAG 30\%) even after
+defense; cells marked ``---'' in Table~\ref{tab:defense-effectiveness-test100}
+denote combinations that are not applicable for that backend, or aggregates
+with no step-level data (\(0\) trials). Per-topic execution issues are listed
+in the attack-benchmark error summaries under \path{data/benchmark/consolidated_attack_results/}.
+For GPT-5-mini the baseline ASR is lower and most defenses 
+bring it down to zero. Across both models, the provable
+policy achieves 0\% ASR on every backend by construction, independent of
+model behavior; limit-memory-length is consistently the weakest, as a
+sufficiently compact payload fits within the character budget and adaptive
+attacks exploit this directly.
+
+ASR alone, however, does not tell the full story: a defense that eliminates
+exfiltration by rendering the agent broadly non-functional is not a
+practical solution. Table~\ref{tab:utility-am-hm-asr-by-defense-backend} therefore pairs ASR 
+with benign utility measured on our benign utility test
+suite reporting both arithmetic
+mean (AM) and harmonic mean (HM) across the suite. AM summarizes average
+capability retention across user flows; HM is sensitive to near-zero
+entries and penalizes defenses that completely break even one type of
+user task. A defense with high AM but HM~$\approx 0$ preserves most
+capabilities while rendering at least one user flow entirely
+non-functional---a qualitatively different failure mode than uniformly
+moderate degradation, and one that AM alone would mask.
+
+The provable policy illustrates this precisely: 0\% ASR on all backends
+and both models, but HM collapses to near zero in nearly every
+configuration, because IFC blocks all exfiltration tool calls in any
+session that has touched the inbox, completely eliminating task flows
+that require both reading email and sending a reply. The AM for IFC
+can appear moderate because flows that do not require send actions
+remain unaffected, but HM correctly surfaces the structural breakage.
+Limit-memory-length presents the opposite profile: on RAG it preserves
+high AM and HM (Gemini: 89/88) while leaving 30\% residual ASR. 
+No-untrusted-tools and user-prompt-only occupy the middle
+ground, achieving near-zero ASR with a more consistent and
+moderate utility reduction.
+
 
 \subsection{Utility Analysis}
-\label{sec:utility}
-
-We evaluate utility in benign settings (no attack email) across seven capability classes. \cref{tab:utility-by-backend-defense} reports utility by capability class for each (memory backend, defense) pair for both Gemini~3.1~Pro~Preview and GPT-5-mini. For the full methodology, capability-class taxonomy, deployment profiles, weighted utility, and security--utility tradeoff analysis, see \cref{app:utility-analysis}.
-
+\label{sec:utility-analysis}
 \input{tables/utility_by_backend_defense}
+Prior agentic security benchmarks report utility as a single aggregate
+score---the fraction of tasks completed without attack. As we argue, this
+obscures which specific capabilities break under each defense, making it
+difficult to reason about deployment tradeoffs: two defenses with identical
+aggregate utility may differ sharply in \emph{which} user workflows they
+impair, with very different consequences depending on what the agent is
+actually used for.
 
-Summary tables (arithmetic and harmonic means by defense and backend, and the same with ASR at $N=100$) are in the appendix as \cref{tab:utility-am-hm-by-defense-backend} and \cref{tab:utility-am-hm-asr-by-defense-backend}. Full per-capability tables and deployment-profile analysis are in \cref{app:utility-analysis}.
+We address this with a transparent, capability-decomposed evaluation. We
+define seven representative user flows, each characterized by a distinct
+combination and sequence of three axes: memory demand (what kind of stored information the
+task requires), inbox access (whether it invokes untrusted read tools), and
+send capability (whether it requires an outbound action). For each
+(backend, defense) pair we measure success per flow, making the utility
+impact of every defense directly interpretable. These flows are not an
+exhaustive partition of all possible tasks but are selected to cover the
+dominant interaction patterns for a memory-equipped email assistant; full
+definitions are in Appendix~\ref{app:user-task-taxonomy}.
 
-\subsection{Utility Evaluation}
+Table~\ref{tab:utility-by-backend-defense} reports per-flow success rates
+alongside the change from the undefended baseline ($\Delta$) for each
+(defense, backend) pair. The pattern of degradation is clearly presented: if a defense targets a specific region of the capability space as compared to the No Defense baseline, the $\Delta$ columns make this visible at a glance.
 
-The seven representative task flows
-(\texttt{memory\_only}, \texttt{assistant\_responses},
-\texttt{untrusted\_probe}, \texttt{untrusted\_send}, \texttt{disable\_send},
-\texttt{memory\_tools}, \texttt{long\_memory}) are defined in
-Appendix~\ref{app:user-task-taxonomy}; each has multiple test cases per (backend, defense)
-combination.
-Utility runs are conducted \emph{without} any attack email present.
-We report per-flow success rates alongside a macro-average over the seven
-flows as the primary aggregate utility metric (BMU); a proxy-weighted
-aggregate using the deployment-profile weights derived in
-Appendix~\ref{app:obtaining-weights} is provided as a sensitivity check.
+\emph{User-prompt-only} primarily degrades only the
+\texttt{assistant\_} \texttt{responses} user flow, which drops sharply across all backends
+(e.g., RAG: 95\%$\to$25\% for Gemini, 100\%$\to$0\% for GPT-5-mini),
+because prior assistant turns are no longer indexed and cannot be recalled.
+All remaining flows are largely preserved, and on Mem0 several flows
+\emph{improve} (e.g., Gemini: \texttt{untrusted\_send} +42pp,
+\texttt{mem\_tools} +42pp), because removing noisy assistant-turn content
+makes user-turn memory more precise.
+
+\paragraph{No-untrusted-tools} produces the complementary pattern: it zeroes
+out \texttt{untrusted\_probe} and \texttt{untrusted\_send} on every backend,
+since both require post-inbox memory recall which is suppressed once a taint
+tool is invoked, while all other flows remain essentially unchanged.
+
+\paragraph{Limit-memory-length} produces the least structured degradation:
+reductions are diffuse and backend-dependent, with no single flow bearing
+the cost. RAG is notably resilient (Gemini AM/HM 89/88, GPT-5-mini 88/86),
+while Mem0 degrades more broadly across memory-heavy flows.
+
+\paragraph{Provable policy} zeroes out exactly the flows requiring an
+outbound action---\texttt{disable\_send}, \texttt{mem\_tools}, and
+\texttt{untrusted\_send}---while leaving read-only and memory-only flows
+intact. This structural pattern explains the HM$\,{=}\,0$ result seen across
+all backends in Table~\ref{tab:utility-am-hm-asr-by-defense-backend}: a single zeroed flow
+collapses the harmonic mean regardless of how well the remaining flows
+perform.
+
+\paragraph{No-memory baseline.} As a calibration point, the No Memory
+baseline scores near zero on \texttt{long\_memory} and \texttt{mem\_only}
+for both models, confirming that persistent backends are providing genuine
+capability that in-context-only agents cannot replicate.
+
+\subsection{Security--Utility Tradeoff Analysis}
+
+Comparing defenses on one security--utility curve requires aggregating
+per-flow scores into a single utility value. Simple aggregation (arithmetic or
+harmonic mean across the seven flows) is reproducible and useful for academic
+comparison, but often unrepresentative in deployment: a user who mostly reads
+and archives email is affected differently from one who frequently delegates
+reply composition or relies on cross-session memory. In practice, the right
+aggregate is a weighted mean over user flows, where weights reflect the task
+distribution in the target deployment. Because no public dataset yet captures
+real user-task distributions for memory-equipped email agents, we evaluate
+utility under three representative deployment profiles and compute a weighted
+aggregate for each. This helps practitioners select the (backend, defense)
+combination that best matches their deployment regime rather than optimizing
+for one arbitrary aggregate. The full weight derivation, profile definitions,
+and resulting security--utility curves are provided in Appendix~\ref{app:profiles}.
+
 
 %==============================================================================
 \section{Conclusion}
 \label{sec:conclusion}
 %==============================================================================
 
-We studied persistent data exfiltration in memory-augmented LLM agents under a realistic threat model: the adversary controls only the content of emails the user receives, and the agent's memory is populated automatically from conversation and tool outputs. Across four memory backends (explicit, Mem0, RAG, context) and two frontier models (Gemini~3.1~Pro~Preview, GPT-5-mini), a single poisoning event induces long-lived compromise: attack success remains high from the first trigger session up to $N=100$ benign sessions later, demonstrating that persistent memory fundamentally expands the attack surface. Our OpenEvolve-based red-teaming---optimizing on one train instance per (topic, backend, defense) and evaluating on held-out test cases---shows that attacks generalize; heuristic defenses (user-prompt-only, no-untrusted-tools, limit-memory-length) reduce but do not eliminate exfiltration. The provable IFC defense achieves 0\% ASR across all configurations and is shown to enforce non-interference against the two-session attack.
+We presented the first end-to-end study of persistent data exfiltration in 
+memory-augmented LLM agents under a realistic indirect-injection threat model: 
+the adversary controls only inbound email content, with no privileged access 
+to the agent or memory store. Across four memory backends and two 
+safety-aligned frontier models, a single poisoning event induces long-lived 
+compromise---attack success remains high even after $N{=}100$ benign sessions, 
+demonstrating that persistent memory fundamentally expands the attack surface 
+beyond what one-shot injection benchmarks capture. Our OpenEvolve-based 
+adaptive red-teaming, optimized on a single train instance per 
+(topic, backend, defense) and evaluated on held-out cases, shows that 
+effective attacks generalize well beyond the instances they were optimized on.
 
-Practitioners face a security--utility tradeoff: the provable policy eliminates exfiltration but reduces weighted utility (e.g., disable-send and untrusted-send tasks are blocked when the session is untrusted). The optimal (backend, defense) choice depends on deployment profile---balanced, email-heavy, or recall-focused---as illustrated by our capability-class decomposition and deployment-profile-weighted analysis. We provide full per-suite utility tables in the appendix to support informed deployment decisions.
+Memory-system-level defenses reduce exfiltration substantially, and our 
+proposed IFC policy eliminates it entirely with a formal non-interference 
+guarantee---but at a real utility cost. Security and utility are not 
+reducible to a single number: our capability-class decomposition shows that 
+the optimal (backend, defense) choice shifts with the deployment's task 
+distribution, and that aggregate scores can mask the complete elimination of 
+specific user workflows. Secure deployment of memory-augmented agents requires 
+deployment-aware evaluation.
 
-Limitations include evaluation in a single domain (email assistant), specific models and backends, and in-memory runs without organizational or hardware deployment. Future work may extend the threat model to multi-step exfiltration, additional backends and domains, and formal guarantees for richer policy classes.
+More broadly, this work argues that designing secure agents is not only a 
+matter of better prompt injection defenses---it requires rethinking memory 
+abstractions themselves. The threat surface we identify will only grow: 
+dormant payloads conditioned on richer triggers such as detected location or 
+emotional state, cross-agent propagation where one compromised agent silently 
+poisons others at scale, and memory stores that carry no integrity metadata 
+are all natural extensions of the attack class we study. Hence, we wish to draw urgent attention to the security of these memory layers.
 
 \section{Disclosing LLM Usage}
 In this thesis, LLMs were used only to help refine and format tables and to make minor refinements to the writing; all other content was originally produced, with suggestions from thesis advisors.

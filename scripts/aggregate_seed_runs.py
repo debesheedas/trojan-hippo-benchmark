@@ -17,7 +17,7 @@ import argparse
 import csv
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_AGGREGATED_DIR = BASE_DIR / "data" / "benchmark" / "aggregated_test_results"
@@ -131,10 +131,12 @@ def aggregate_per_seed_all_topics(
 ) -> Dict[Tuple[str, str, str, str], Dict[str, float]]:
     """
     For one seed, aggregate over topics: (split, model, memory_backend, defense) -> rates.
-    Used for all-topics ASR vs session plot.
+    Used for all-topics ASR vs session and utility vs session plots.
     """
     from collections import defaultdict
-    groups = defaultdict(lambda: {"attack_passed": 0, "attack_total": 0})
+    groups = defaultdict(
+        lambda: {"attack_passed": 0, "attack_total": 0, "user_passed": 0, "user_total": 0}
+    )
     for row in seed_rows:
         key = (
             row.get("split", ""),
@@ -145,13 +147,19 @@ def aggregate_per_seed_all_topics(
         g = groups[key]
         g["attack_passed"] += int(numeric(row, "attack_passed", 0))
         g["attack_total"] += int(numeric(row, "attack_total", 0))
+        g["user_passed"] += int(numeric(row, "user_passed", 0))
+        g["user_total"] += int(numeric(row, "user_total", 0))
     result = {}
     for key, g in groups.items():
         a_total = g["attack_total"] or 1
+        u_total = g["user_total"] or 1
         result[key] = {
             "attack_rate": (g["attack_passed"] / a_total) * 100,
             "attack_passed": g["attack_passed"],
             "attack_total": g["attack_total"],
+            "user_rate": (g["user_passed"] / u_total) * 100,
+            "user_passed": g["user_passed"],
+            "user_total": g["user_total"],
         }
     return result
 
@@ -159,7 +167,7 @@ def aggregate_per_seed_all_topics(
 def run(
     input_dir: Path,
     no_plots: bool = False,
-    model_filter: str | None = None,
+    model_filter: Optional[str] = None,
 ) -> int:
     input_dir = input_dir.resolve()
     if not input_dir.is_dir():
@@ -246,8 +254,12 @@ def run(
             sessions_sorted = sorted(set(
                 sidx for b in backend_sessions for sidx in backend_sessions[b]
             ))
+            # For the paper plots we only display the 4 capability classes that include memory.
+            # (Skip "none" == No Memory.)
+            plot_backends = [b for b in MEMORY_BACKENDS if b != "none"]
+
             fig, ax = plt.subplots(figsize=(8, 5))
-            for backend in MEMORY_BACKENDS:
+            for backend in plot_backends:
                 if backend not in backend_sessions:
                     continue
                 xs, ys, yerrs = [], [], []
@@ -269,17 +281,115 @@ def run(
                 upper = [m + e for m, e in zip(ys, yerrs)]
                 ax.fill_between(xs, lower, upper, alpha=0.15)
             if ax.has_data():
-                ax.set_xlabel("Session index")
-                ax.set_ylabel("Attack success rate (%)")
-                ax.set_title(f"{model_name} - All topics: ASR vs. session (defense=None)\nmean ± std over {len(seeds)} seed(s)")
+                ax.set_xlabel("Trigger Session Index (N)")
+                ax.set_ylabel("Attack Success Rate (%)")
+                ax.set_title("Persistent Exfiltration ASR vs. Trigger Session")
                 ax.set_ylim(-5, 105)
                 ax.grid(True, alpha=0.3)
                 ax.legend(fontsize=8)
                 fig.tight_layout()
-                plot_path = input_dir / f"asr_vs_session_defense_none_{model_name.replace('.', '_')}.png"
+                stem = f"asr_vs_session_defense_none_{model_name.replace('.', '_')}"
+                plot_path_pdf = input_dir / f"{stem}.pdf"
+                plot_path = input_dir / f"{stem}.png"
+                fig.savefig(plot_path_pdf, bbox_inches="tight")
                 fig.savefig(plot_path, dpi=300, bbox_inches="tight")
                 plt.close(fig)
+                print(f"  Plot: {plot_path_pdf}")
                 print(f"  Plot: {plot_path}")
+
+            # Additional ASR plot variant: mean line with min/max shaded region
+            fig_mm, ax_mm = plt.subplots(figsize=(8, 5))
+            for backend in plot_backends:
+                if backend not in backend_sessions:
+                    continue
+                xs, ys, lowers, uppers = [], [], [], []
+                for s in sessions_sorted:
+                    rates = backend_sessions[backend].get(s, [])
+                    if not rates:
+                        continue
+                    xs.append(s)
+                    ys.append(float(_mean(rates)))
+                    lowers.append(float(min(rates)))
+                    uppers.append(float(max(rates)))
+                if not xs:
+                    continue
+                label = BACKEND_LABELS[MEMORY_BACKENDS.index(backend)]
+                ax_mm.plot(xs, ys, marker="o", label=label)
+                ax_mm.fill_between(xs, lowers, uppers, alpha=0.15)
+            if ax_mm.has_data():
+                ax_mm.set_xlabel("Trigger Session Index (N)")
+                ax_mm.set_ylabel("Attack Success Rate (%)")
+                ax_mm.set_title("Persistent Exfiltration ASR vs. Trigger Session")
+                ax_mm.set_ylim(-5, 105)
+                ax_mm.grid(True, alpha=0.3)
+                ax_mm.legend(fontsize=8)
+                fig_mm.tight_layout()
+                stem_mm = f"asr_vs_session_defense_none_{model_name.replace('.', '_')}_minmax"
+                plot_path_mm_pdf = input_dir / f"{stem_mm}.pdf"
+                plot_path_mm = input_dir / f"{stem_mm}.png"
+                fig_mm.savefig(plot_path_mm_pdf, bbox_inches="tight")
+                fig_mm.savefig(plot_path_mm, dpi=300, bbox_inches="tight")
+                plt.close(fig_mm)
+                print(f"  Plot: {plot_path_mm_pdf}")
+                print(f"  Plot: {plot_path_mm}")
+
+            # Utility vs session (defense=none, all topics): same structure, user_rate on y-axis
+            backend_sessions_util: Dict[str, Dict[int, List[float]]] = {
+                b: {} for b in MEMORY_BACKENDS
+            }
+            for seed, rows in seed_data:
+                per_combo = aggregate_per_seed_all_topics(rows)
+                for (split, model, backend, defense), vals in per_combo.items():
+                    if model != model_name or defense != "none":
+                        continue
+                    sidx = session_index_from_split(split)
+                    if sidx not in backend_sessions_util.get(backend, {}):
+                        backend_sessions_util.setdefault(backend, {})[sidx] = []
+                    backend_sessions_util[backend][sidx].append(vals["user_rate"])
+            sessions_sorted_util = sorted(
+                set(
+                    sidx
+                    for b in backend_sessions_util
+                    for sidx in backend_sessions_util[b]
+                )
+            )
+            fig2, ax2 = plt.subplots(figsize=(8, 5))
+            for backend in plot_backends:
+                if backend not in backend_sessions_util:
+                    continue
+                xs, ys, yerrs = [], [], []
+                for s in sessions_sorted_util:
+                    rates = backend_sessions_util[backend].get(s, [])
+                    if not rates:
+                        continue
+                    xs.append(s)
+                    mean_val = _mean(rates)
+                    std_val = _std(rates)
+                    ys.append(float(mean_val))
+                    yerrs.append(float(std_val))
+                if not xs:
+                    continue
+                label = BACKEND_LABELS[MEMORY_BACKENDS.index(backend)]
+                ax2.plot(xs, ys, marker="o", label=label)
+                lower = [m - e for m, e in zip(ys, yerrs)]
+                upper = [m + e for m, e in zip(ys, yerrs)]
+                ax2.fill_between(xs, lower, upper, alpha=0.15)
+            if ax2.has_data():
+                ax2.set_xlabel("Trigger Session Index (N)")
+                ax2.set_ylabel("Utility (%)")
+                ax2.set_title("Utility vs. Trigger Session")
+                ax2.set_ylim(-5, 105)
+                ax2.grid(True, alpha=0.3)
+                ax2.legend(fontsize=8)
+                fig2.tight_layout()
+                util_stem = f"utility_vs_session_defense_none_{model_name.replace('.', '_')}"
+                util_plot_path_pdf = input_dir / f"{util_stem}.pdf"
+                util_plot_path = input_dir / f"{util_stem}.png"
+                fig2.savefig(util_plot_path_pdf, bbox_inches="tight")
+                fig2.savefig(util_plot_path, dpi=300, bbox_inches="tight")
+                plt.close(fig2)
+                print(f"  Plot: {util_plot_path_pdf}")
+                print(f"  Plot: {util_plot_path}")
     elif no_plots:
         print("Plots skipped (--no-plots)")
     elif not PLOTTING_AVAILABLE:

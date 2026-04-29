@@ -2,26 +2,26 @@
 """
 Train Results Consolidation Script with CSV and Plots
 
-Consolidates TRAIN results only from the attack benchmark. Reads from
-data/benchmark/attack_results/train/ and data/benchmark/attack_logs/train/ by default
-(train/test layout matches attack_bench). Includes only result files whose filename
-stem contains "train". By default writes to two output folders: consolidated_train_results
-(from attack_results/attack_logs) and consolidated_train_results_stealth (from
-attack_results_stealth/attack_logs_stealth). Use --results-dir/--logs-dir/--output-dir
-for a single custom pass.
+Consolidates TRAIN results only from the attack benchmark.
 
-Use --train-folder train_10 (or train_20, train_0, etc.) for train_N layout (model/topic/backend/defense);
-outputs go to data/benchmark/consolidated_<train-folder>_results and heatmaps show per-topic
-success rates.
+Default (no arguments): Discovers all train splits (train_0, train_10, ..., train_100)
+under data/benchmark/attack_results/, consolidates all models in each split, and writes
+to data/benchmark/consolidated_train_results/<split>/<model>/ (e.g. consolidated_train_results/
+train_100/gpt-5-mini/). Also writes consolidated_train_results_stealth/ from
+attack_results_stealth/ when that directory exists.
 
-Discovers suites that have at least one train result file and generates CSVs/plots
-for those suites.
+Use --train-folder to process only one split (e.g. train_100); output still goes under
+consolidated_train_results/<train-folder>/.
+Use --model to limit to one model. Use --results-dir/--logs-dir/--output-dir for a
+single custom pass.
+
+Includes only result files whose filename stem contains "train". Discovers suites that
+have at least one train result file and generates CSVs/plots for those suites.
 
 Usage:
-    python scripts/consolidate_train.py
+    python scripts/consolidate_train.py                    # all splits, all models -> consolidated_train_results/<split>/<model>/
     python scripts/consolidate_train.py --train-folder train_10
-    python scripts/consolidate_train.py --train-folder train_20
-    python scripts/consolidate_train.py --results-dir data/benchmark/attack_results/train_20
+    python scripts/consolidate_train.py --train-folder train_100
     python scripts/consolidate_train.py --model gpt-4o-mini
     python scripts/consolidate_train.py --no-plots
 """
@@ -1070,7 +1070,7 @@ def main() -> int:
         "--output-dir",
         type=str,
         default=None,
-        help="Output directory for consolidated files (default: consolidated_<train-folder>_results)",
+        help="Output directory for consolidated files (default: consolidated_train_results/<train-folder>/)",
     )
     parser.add_argument(
         "--model",
@@ -1121,6 +1121,8 @@ def main() -> int:
             if not train_folders:
                 print(f"WARNING: No train folders found under {results_base_run}, skipping [{run_name}] run.\n")
                 continue
+            out_base = (CONSOLIDATED_BASE / output_subdir) if output_subdir is not None else output_dir_for_run
+            print(f"[{run_name}] Consolidating all train splits -> {out_base}/<split>/<model>/")
             print(f"[{run_name}] Discovered train folders: {', '.join(train_folders)}\n")
 
         # Cross-train-split ASR (defense=none): model -> backend -> split_idx -> (passed, total)
@@ -1134,10 +1136,9 @@ def main() -> int:
             if output_subdir is not None:
                 results_base_dir = results_base_run / train_folder if use_train_10_layout else DEFAULT_RESULTS_DIR
                 logs_base_dir = logs_base_run / train_folder if use_train_10_layout else DEFAULT_LOGS_DIR
-                if len(train_folders) > 1:
+                # Always use output_subdir/train_folder for train_N layout so results stay under consolidated_train_results/
+                if use_train_10_layout:
                     output_dir = CONSOLIDATED_BASE / output_subdir / train_folder
-                elif use_train_10_layout:
-                    output_dir = CONSOLIDATED_BASE / f"consolidated_{train_folder}_results{run_suffix}"
                 else:
                     output_dir = CONSOLIDATED_BASE / output_subdir
             else:

@@ -430,6 +430,18 @@ class Memory(MemoryBase):
             is_agent_memory = self._should_use_agent_memory_extraction(messages, metadata)
             system_prompt, user_prompt = get_fact_retrieval_messages(parsed_messages, is_agent_memory)
 
+            # Optional local debug tracing for benchmark runs.
+            # Enable by setting MEM0_BENCH_TRACE=1.
+            if os.getenv("MEM0_BENCH_TRACE") == "1":
+                try:
+                    roles = [m.get("role") for m in messages if isinstance(m, dict)]
+                except Exception:
+                    roles = []
+                print(
+                    f"\n[mem0_bench_trace] extraction mode: is_agent_memory={is_agent_memory} "
+                    f"metadata_agent_id={metadata.get('agent_id', None)!r} roles={roles}"
+                )
+
         response = self.llm.generate_response(
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -453,6 +465,19 @@ class Memory(MemoryBase):
         except Exception as e:
             logger.error(f"Error in new_retrieved_facts: {e}")
             new_retrieved_facts = []
+
+        if os.getenv("MEM0_BENCH_TRACE") == "1":
+            try:
+                preview = (response or "").replace("\n", " ")
+                preview = preview[:500] + ("…" if len(preview) > 500 else "")
+            except Exception:
+                preview = "<unavailable>"
+            facts_preview = new_retrieved_facts[:5] if isinstance(new_retrieved_facts, list) else []
+            print(
+                f"[mem0_bench_trace] parsed facts count={len(new_retrieved_facts) if isinstance(new_retrieved_facts, list) else 'unknown'} "
+                f"facts_preview={facts_preview} "
+                f"response_preview={preview}"
+            )
 
         if not new_retrieved_facts:
             logger.debug("No new facts retrieved from input. Skipping memory update LLM call.")

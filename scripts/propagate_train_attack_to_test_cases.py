@@ -216,9 +216,10 @@ def _get_best_attack_for_train_split(
     Return the single best attack (email, source) for the given train split.
     Prefers cached (optimized) attack for that split, then original train file.
     """
+    # Cache layout is always train_cache/<model>/... or train_cache_N/<model>/... (same as attack_logs/attack_results).
+    layout_without_model = False
     if train_split == "train":
         split_cache_base = cache_base
-        layout_without_model = False
         cache_label = "train_cache"
     else:
         # train_0 -> train_cache_0, train_10 -> train_cache_10, ..., train_100 -> train_cache_100
@@ -227,10 +228,8 @@ def _get_best_attack_for_train_split(
         split_cache_base = attack_bench_base / cache_dir_name
         if not split_cache_base.exists():
             split_cache_base = cache_base
-            layout_without_model = False
             cache_label = "train_cache"
         else:
-            layout_without_model = True
             cache_label = cache_dir_name
 
     if stealth:
@@ -284,8 +283,7 @@ def _resolve_cache_base_for_split(
     attack_bench_base: Path, cache_base: Path, train_split: str
 ) -> Tuple[Path, bool, str]:
     """Return (split_cache_base, layout_without_model, cache_label) for a train split.
-    Normal: attack_bench/train_cache, attack_bench/train_cache_10, ...
-    Stealth: attack_bench_stealth/train_cache, attack_bench_stealth/train_cache_10, ... (same names; pass attack_bench_stealth as base and cache_base = attack_bench_stealth/train_cache).
+    Cache paths are always <split_cache_base>/<model>/topic/backend/defense/ (layout_without_model=False).
     """
     if train_split == "train":
         return cache_base, False, "train_cache"
@@ -294,7 +292,7 @@ def _resolve_cache_base_for_split(
     split_cache_base = attack_bench_base / cache_dir_name
     if not split_cache_base.exists():
         return cache_base, False, "train_cache"
-    return split_cache_base, True, cache_dir_name
+    return split_cache_base, False, cache_dir_name
 
 
 def _find_one_cached_file(

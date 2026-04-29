@@ -649,7 +649,10 @@ def invoke_agent(text: str, session_id: str, config: dict, in_memory_env) -> Dic
                 future = executor.submit(_invoke)
                 result = future.result(timeout=invoke_timeout_sec)
             finally:
-                executor.shutdown(wait=False)
+                # wait=True ensures the worker thread fully exits (including HTTP/LLM cleanup).
+                # Otherwise a lingering non-daemon thread can block process exit when the
+                # interpreter tries to join all threads at shutdown.
+                executor.shutdown(wait=True)
             break
         except FuturesTimeoutError as e:
             last_error = e

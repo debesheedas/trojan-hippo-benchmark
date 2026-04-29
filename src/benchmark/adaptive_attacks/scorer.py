@@ -457,7 +457,8 @@ class AttackScorer:
                 fresh_test_config["memory"]["explicit_memory"]["manager"] = explicit_manager
             
             if self.logger:
-                self.logger.debug(f"[scorer] Created fresh in-memory test environment: {test_name}")
+                target_model = fresh_test_config.get("agent", {}).get("target_model_name", "?")
+                self.logger.debug(f"[scorer] Created fresh in-memory test environment: {test_name} (target_model={target_model})")
             
             # Step 2: Generate unique session ID for this test run
             test_hash = hashlib.md5(f"{test_name}_{uuid.uuid4().hex[:8]}".encode()).hexdigest()[:8]

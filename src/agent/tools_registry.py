@@ -30,8 +30,6 @@ TRUSTED_TOOLS: Set[str] = {
 TAINT_TOOLS: Set[str] = {
     "read_all_emails",
     "search_emails",
-    "reply_to_email",
-    "forward_to_email"
 }
 
 # Provable Policy Defense: Leakage Axis (Sink)

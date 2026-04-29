@@ -95,6 +95,7 @@ def run_benchmark(
     results_base_dir: Optional[Path] = None,
     logs_base_dir: Optional[Path] = None,
     target_model_name: Optional[str] = None,
+    seed_override: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Run benchmark for a specific memory backend and defense type.
@@ -128,7 +129,8 @@ def run_benchmark(
         unified_defense=unified_defense,
         config_path=config_path,
         target_model_name=target_model_name,
-        results_base_dir=results_base_dir
+        results_base_dir=results_base_dir,
+        seed_override=seed_override,
     )
     
     # When adaptive + --stealth: optimizers should optimize for attack + stealth (blend score with stealth goal)
@@ -137,11 +139,11 @@ def run_benchmark(
         # Stealth cache lives under attack_bench_stealth with same names as normal (train_cache, train_cache_0, ...).
         config.setdefault("benchmark", {})["attack_bench_cache_base"] = str(Path("data/benchmark/attack_bench_stealth").resolve())
     
-    # When adaptive: inject early_stop_patience from CLI (default 5) into openevolve config
+    # When adaptive: inject early_stop_patience from CLI into openevolve config (default 10, matches openevolve_optimizer.py)
     if adaptive and early_stop_patience is not None:
         config.setdefault("benchmark", {}).setdefault("openevolve", {})["early_stop_patience"] = early_stop_patience
     elif adaptive:
-        config.setdefault("benchmark", {}).setdefault("openevolve", {})["early_stop_patience"] = 5
+        config.setdefault("benchmark", {}).setdefault("openevolve", {})["early_stop_patience"] = 10
     
     # Get results_base_dir from config (in case it was set to default)
     results_base_dir = Path(config["benchmark"]["results_dir"])
@@ -379,7 +381,7 @@ def _check_result_for_errors(
 
 
 def _run_single_combination(
-    args_tuple: Tuple[str, str, str, str, bool, bool, bool, Optional[Path], Optional[Path], Optional[str], bool]
+    args_tuple: Tuple[str, str, str, str, bool, bool, bool, Optional[int], Optional[Path], Optional[Path], Optional[str], Optional[int]]
 ) -> Tuple[str, str, Dict[str, Any]]:
     """
     Wrapper function to run a single backend+defense combination.
@@ -393,7 +395,7 @@ def _run_single_combination(
     All output is redirected to a log file specific to this combination.
     
     Args:
-        args_tuple: (memory_backend, unified_defense, test_path, config_path, force, adaptive, stealth, early_stop_patience, results_base_dir, logs_base_dir, target_model_name)
+        args_tuple: (memory_backend, unified_defense, test_path, config_path, force, adaptive, stealth, early_stop_patience, results_base_dir, logs_base_dir, target_model_name, seed_override)
     
     Returns:
         (memory_backend, unified_defense, result_dict)
@@ -414,6 +416,7 @@ def _run_single_combination(
         results_base_dir,
         logs_base_dir,
         target_model_name,
+        seed_override,
     ) = args_tuple
     
     # Determine attack type from test_path (needed for result paths)
@@ -474,6 +477,7 @@ def _run_single_combination(
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
             target_model_name=target_model_name,
+            seed_override=seed_override,
         )
         
         # Print completion summary to terminal
@@ -589,6 +593,7 @@ def run_all_combinations(
     results_base_dir: Optional[Path] = None,
     logs_base_dir: Optional[Path] = None,
     target_model_name: Optional[str] = None,
+    seed_override: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Run benchmarks for all combinations of memory backends and defense types in parallel.
@@ -660,6 +665,7 @@ def run_all_combinations(
             results_base_dir,
             logs_base_dir,
             target_model_name,
+            seed_override,
         )
         for backend, defense in combinations
     ]
@@ -1071,9 +1077,9 @@ Examples:
     parser.add_argument(
         "--early-stop-patience",
         type=int,
-        default=5,
+        default=10,
         metavar="N",
-        help="[Adaptive only] OpenEvolve early-stop patience: stop if no improvement for N iterations (default: 5). Ignored in static mode."
+        help="[Adaptive only] OpenEvolve early-stop patience: stop if no improvement for N iterations (default: 10). Ignored in static mode."
     )
     
     parser.add_argument(
@@ -1092,7 +1098,8 @@ Examples:
         "--model",
         type=str,
         dest="target_model_name",
-        help="Target model name (e.g., 'gpt-5-mini', 'gemini-3-pro-preview', 'gemini-3.1-pro-preview', 'gemini-2.5-pro'). Overrides config value."
+        required=True,
+        help="Target model name (e.g., 'gpt-5-mini', 'gemini-3.1-pro-preview'). Required; do not set target_model_name in agent_config.yaml."
     )
     
     parser.add_argument(
@@ -1109,6 +1116,13 @@ Examples:
         choices=["INFO", "DEBUG"],
         default="INFO",
         help="Debug verbosity level: INFO (standard messages) or DEBUG (detailed debug messages). Default: INFO"
+    )
+    
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed override for reproducibility (default: from agent_config.yaml or 42)"
     )
     
     args = parser.parse_args()
@@ -1216,6 +1230,7 @@ Examples:
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
             target_model_name=args.target_model_name,
+            seed_override=args.seed,
         )
     else:
         # Single combination mode
@@ -1241,6 +1256,7 @@ Examples:
             results_base_dir=results_base_dir,
             logs_base_dir=logs_base_dir,
             target_model_name=args.target_model_name,
+            seed_override=args.seed,
         )
     
     # Exit with appropriate code

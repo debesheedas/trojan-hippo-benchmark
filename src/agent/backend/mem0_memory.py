@@ -44,6 +44,16 @@ except ImportError:
 load_dotenv()
 
 
+def _mem0_truncation_log_preview(x: Any, limit: int = 100) -> str:
+    """Single-line preview for limit_memory_length post-extraction logs."""
+    try:
+        s = str(x)
+    except Exception:
+        s = repr(x)
+    s = s.replace("\n", " ").replace("\r", " ")
+    return (s[:limit] + "…") if len(s) > limit else s
+
+
 class Mem0DefenseManager:
     """
     Manages defense mechanisms for mem0 memory indexing.
@@ -442,6 +452,7 @@ class Mem0MemoryManager:
         max_memory_length: Optional[int] = None,
         session_id: Optional[str] = None,
         defense_type: Optional[str] = None,
+        debug_trace: bool = False,
     ) -> Dict[str, Any]:
         """
         Add memories from conversation messages.
@@ -462,6 +473,25 @@ class Mem0MemoryManager:
         # Use self.user_id / self.agent_id from config (passed during initialization)
         user_id = user_id or self.user_id
         effective_agent_id = agent_id if agent_id is not None else self.agent_id
+
+        if debug_trace:
+            # Keep previews short; this function can be called many times per test.
+            def _preview_content(x: Any, limit: int = 220) -> str:
+                try:
+                    s = str(x)
+                except Exception:
+                    s = repr(x)
+                s = s.replace("\n", " ").replace("\r", " ")
+                return (s[:limit] + "…") if len(s) > limit else s
+
+            print("\n[mem0_debug] ===== add_memory() trace start =====")
+            print(f"[mem0_debug] user_id={user_id!r}, effective_agent_id={effective_agent_id!r}")
+            print(f"[mem0_debug] session_id={session_id!r}, defense_type={defense_type!r}, max_memory_length={max_memory_length!r}")
+            print(f"[mem0_debug] incoming messages count={len(messages)}")
+            if metadata:
+                print(f"[mem0_debug] incoming metadata keys={list(metadata.keys())}")
+            else:
+                print("[mem0_debug] incoming metadata=None")
         
         # Combine metadata
         combined_metadata = metadata or {}
@@ -505,40 +535,33 @@ class Mem0MemoryManager:
                     chunked_messages.extend(msg_chunks)
                 else:
                     chunked_messages.append(msg)
-            
-            # Step 2: Defense: limit_memory_length - truncate message content BEFORE extraction
-            # This ensures only truncated memories are stored, avoiding duplicates
-            messages_to_use = chunked_messages
-            if max_memory_length and max_memory_length > 0:
-                # Truncate each message's content to max_memory_length before passing to mem0
-                # This way, mem0 will extract from truncated content and store only truncated memories
-                messages_to_use = []
-                for msg in chunked_messages:
-                    if isinstance(msg, dict) and "content" in msg:
-                        content = str(msg["content"])
-                        if len(content) > max_memory_length:
-                            # Truncate at character boundary (simple truncation)
-                            truncated_content = content[:max_memory_length]
-                            messages_to_use.append({
-                                **msg,
-                                "content": truncated_content
-                            })
-                        else:
-                            messages_to_use.append(msg)
+
+            if debug_trace:
+                print(f"[mem0_debug] chunked_messages count={len(chunked_messages)} (passed to mem0.add)")
+                for i, msg in enumerate(chunked_messages[:4]):
+                    if isinstance(msg, dict):
+                        print(f"[mem0_debug] chunk[{i}] role={msg.get('role')!r} content_preview={_preview_content(msg.get('content'))}")
                     else:
-                        messages_to_use.append(msg)
+                        print(f"[mem0_debug] chunk[{i}] non-dict={type(msg).__name__}")
             
-            # Log chunking if it occurred
-            if len(messages_to_use) > len(messages):
-                print(f"Chunked {len(messages)} messages into {len(messages_to_use)} chunks to prevent token limit errors")
+            # Log chunking if it occurred (6000-token split for embedding safety; not limit_memory_length)
+            if len(chunked_messages) > len(messages):
+                print(f"Chunked {len(messages)} messages into {len(chunked_messages)} chunks to prevent token limit errors")
             
-            # Extract memories using mem0 (with potentially chunked and truncated messages)
+            # Extract memories using mem0 (full message content; limit_memory_length truncates outputs below)
             # Capture mem0's internal error messages to handle UPDATE operation failures gracefully
             # Root cause: mem0's deduplication logic uses simple IDs (e.g., '6') to track memories,
             # but stored memories have UUIDs. When mem0 tries to UPDATE a similar memory, it fails
             # with KeyError because it can't find the memory with the simple ID.
             # This is a mem0 bug - we can't fix it without modifying mem0 source code.
             error_buffer = StringIO()
+
+            # Enable local mem0 internal tracing (optional) so we can see
+            # whether it selected the user-vs-agent extraction prompt and what
+            # facts it parsed from the LLM response.
+            prev_mem0_trace = os.getenv("MEM0_BENCH_TRACE")
+            if debug_trace:
+                os.environ["MEM0_BENCH_TRACE"] = "1"
             try:
                 # Wrap mem0.add() call with timeout to prevent hanging
                 # Use 5 minutes timeout (300 seconds) - should be enough for most API calls
@@ -546,7 +569,7 @@ class Mem0MemoryManager:
                 def _call_mem0_add():
                     with redirect_stderr(error_buffer), redirect_stdout(error_buffer):
                         return self.memory.add(
-                            messages=messages_to_use,
+                            messages=chunked_messages,
                             user_id=user_id,
                             agent_id=effective_agent_id,
                             metadata=combined_metadata,
@@ -558,6 +581,32 @@ class Mem0MemoryManager:
                 
                 # Check if mem0 printed any UPDATE-related errors
                 error_output = error_buffer.getvalue()
+                if debug_trace:
+                    print(f"[mem0_debug] mem0.add() returned type={type(result).__name__}")
+                    if isinstance(result, dict):
+                        mem_results = result.get("results", [])
+                        print(f"[mem0_debug] mem0.add() results_count={len(mem_results)}")
+                        # Print first couple results for inspection
+                        for j, item in enumerate(mem_results[:3]):
+                            if isinstance(item, dict):
+                                txt = item.get("memory") or item.get("memories") or item.get("text") or item.get("content") or item.get("fact")
+                                print(f"[mem0_debug] result[{j}] event={item.get('event')!r} memory_preview={_preview_content(txt, 240)}")
+                            else:
+                                print(f"[mem0_debug] result[{j}] non-dict={type(item).__name__}")
+                    elif isinstance(result, list):
+                        print(f"[mem0_debug] mem0.add() results_count={len(result)}")
+                    else:
+                        print("[mem0_debug] mem0.add() returned non-dict non-list")
+
+                    if error_output:
+                        # mem0 internal logs may contain update failures or debug info.
+                        cap = 3500
+                        eo = error_output
+                        eo = eo.replace("\n", "\n[stdout_stderr] ")
+                        print(f"[mem0_debug] captured stdout/stderr from mem0.add (truncated to {cap} chars):")
+                        print(eo[:cap])
+                    else:
+                        print("[mem0_debug] captured stdout/stderr from mem0.add: <empty>")
                 if error_output and "Error processing memory action" in error_output:
                     # Check if the operation still succeeded (new memories were added)
                     has_results = False
@@ -581,74 +630,71 @@ class Mem0MemoryManager:
             except Exception as e:
                 # Re-raise the exception - this is a real error, not just an UPDATE failure
                 raise
+            finally:
+                # Restore original tracing env var
+                if debug_trace:
+                    if prev_mem0_trace is None:
+                        os.environ.pop("MEM0_BENCH_TRACE", None)
+                    else:
+                        os.environ["MEM0_BENCH_TRACE"] = prev_mem0_trace
             
-            # Post-process: Ensure extracted memories are also truncated (defense in depth)
-            # Even though we chunked and truncated input, mem0 might combine or rephrase, so we check again
-            # Also truncate memories that exceed embedding model token limit (8192 tokens ≈ 32000 chars)
+            # limit_memory_length: truncate each extracted memory string after mem0.add(); also cap length for embedding safety
             max_safe_memory_length = 32000  # Safe limit for embedding model (8192 tokens * ~4 chars/token)
             
             if max_memory_length and max_memory_length > 0:
-                # Extract memory texts and verify/truncate if needed
                 processed_memories = []
+                result_items: List[Any] = []
                 if isinstance(result, dict) and "results" in result:
-                    for memory_item in result["results"]:
-                        if isinstance(memory_item, dict):
-                            memory_text = (
-                                memory_item.get("memory") or
-                                memory_item.get("memories") or
-                                memory_item.get("text") or
-                                memory_item.get("content") or
-                                memory_item.get("fact") or
-                                ""
-                            )
-                            if memory_text:
-                                memory_text_str = str(memory_text)
-                                # Truncate if still too long (defense in depth)
-                                # First check defense limit, then check embedding model limit
-                                if max_memory_length and len(memory_text_str) > max_memory_length:
-                                    memory_text_str = memory_text_str[:max_memory_length]
-                                elif len(memory_text_str) > max_safe_memory_length:
-                                    # Truncate to safe limit for embedding model
-                                    memory_text_str = memory_text_str[:max_safe_memory_length]
-                                    print(f"WARNING: Truncated extracted memory from {len(str(memory_text))} to {max_safe_memory_length} chars to prevent embedding model errors")
-                                # Update the memory item with truncated text
-                                # Find which key was used and update it
-                                for key in ["memory", "memories", "text", "content", "fact"]:
-                                    if key in memory_item:
-                                        memory_item[key] = memory_text_str
-                                        break
-                                processed_memories.append(memory_item)
+                    result_items = result["results"]
                 elif isinstance(result, list):
-                    for memory_item in result:
-                        if isinstance(memory_item, dict):
-                            memory_text = (
-                                memory_item.get("memory") or
-                                memory_item.get("memories") or
-                                memory_item.get("text") or
-                                memory_item.get("content") or
-                                memory_item.get("fact") or
-                                ""
-                            )
-                            if memory_text:
-                                memory_text_str = str(memory_text)
-                                # Truncate if still too long (defense in depth)
-                                # First check defense limit, then check embedding model limit
-                                if max_memory_length and len(memory_text_str) > max_memory_length:
-                                    memory_text_str = memory_text_str[:max_memory_length]
-                                elif len(memory_text_str) > max_safe_memory_length:
-                                    # Truncate to safe limit for embedding model
-                                    memory_text_str = memory_text_str[:max_safe_memory_length]
-                                    print(f"WARNING: Truncated extracted memory from {len(str(memory_text))} to {max_safe_memory_length} chars to prevent embedding model errors")
-                                # Update the memory item with truncated text
-                                for key in ["memory", "memories", "text", "content", "fact"]:
-                                    if key in memory_item:
-                                        memory_item[key] = memory_text_str
-                                        break
-                                processed_memories.append(memory_item)
-                
-                # Note: We don't re-add here because we already truncated the input messages.
-                # The memories stored by mem0 should already be truncated. The post-processing
-                # above just ensures the result object reflects truncated values for consistency.
+                    result_items = result
+
+                n_with_text = 0
+                n_truncated_defense = 0
+                for memory_item in result_items:
+                    if not isinstance(memory_item, dict):
+                        continue
+                    memory_text = (
+                        memory_item.get("memory")
+                        or memory_item.get("memories")
+                        or memory_item.get("text")
+                        or memory_item.get("content")
+                        or memory_item.get("fact")
+                        or ""
+                    )
+                    if not memory_text:
+                        continue
+                    n_with_text += 1
+                    memory_text_str = str(memory_text)
+                    raw_before_defense = memory_text_str
+                    # Defense limit_memory_length, then embedding model safety cap
+                    if len(memory_text_str) > max_memory_length:
+                        memory_text_str = memory_text_str[:max_memory_length]
+                        n_truncated_defense += 1
+                        print(
+                            f"[mem0_defense] limit_memory_length: truncated extracted memory "
+                            f"{len(raw_before_defense)} -> {max_memory_length} chars | "
+                            f"before={_mem0_truncation_log_preview(raw_before_defense)} | "
+                            f"after={_mem0_truncation_log_preview(memory_text_str)}"
+                        )
+                    elif len(memory_text_str) > max_safe_memory_length:
+                        memory_text_str = memory_text_str[:max_safe_memory_length]
+                        print(
+                            f"WARNING: Truncated extracted memory from {len(str(memory_text))} "
+                            f"to {max_safe_memory_length} chars to prevent embedding model errors"
+                        )
+                    for key in ["memory", "memories", "text", "content", "fact"]:
+                        if key in memory_item:
+                            memory_item[key] = memory_text_str
+                            break
+                    processed_memories.append(memory_item)
+
+                if debug_trace:
+                    print(
+                        f"[mem0_debug] limit_memory_length post-process: "
+                        f"{n_with_text} extracted memory field(s), "
+                        f"{n_truncated_defense} truncated to {max_memory_length} chars"
+                    )
             
             # In-memory mode: memories are stored in mem0's internal vectorstore
             # No file tracking needed - validation can query mem0 directly
@@ -1390,6 +1436,10 @@ def index_mem0_memory(text: str, response_text: str, session_id: str, mem0_memor
         limit_memory_size = config.get("benchmark", {}).get("limit_memory_size_defense", 80)
         max_memory_length = limit_memory_size if mem0_defense_type == "limit_memory_length" else None
 
+        # Deep tracing: enable when mem0_print is enabled (default in agent_config.yaml),
+        # and allow overriding with an explicit `mem0_trace` key.
+        mem0_trace = mem0_memory_config.get("mem0_trace", mem0_memory_config.get("mem0_print", False))
+
         result = mem0_memory_manager.add_memory(
             messages=filtered_messages,
             metadata={"session_id": session_id, "type": "conversation", "defense_type": mem0_defense_type},
@@ -1397,6 +1447,7 @@ def index_mem0_memory(text: str, response_text: str, session_id: str, mem0_memor
             max_memory_length=max_memory_length,
             session_id=session_id,
             defense_type=mem0_defense_type,
+            debug_trace=bool(mem0_trace),
         )
         if result:
             results = result.get("results", [])

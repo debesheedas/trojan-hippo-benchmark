@@ -254,6 +254,13 @@ def get_model_context_window(model_name: str, default: int = 128000) -> int:
     return _get_model_context_windows().get(model_name.lower(), default)
 
 
+def get_api_token_limit(model_name: str, default: int = 128000) -> int:
+    """
+    Get API token limit (max input tokens) for a model name.
+    """
+    return _get_api_token_limits().get(model_name.lower(), default)
+
+
 def load_config(config_path: str = "agent_config.yaml") -> dict:
     """Load configuration from YAML file."""
     config_file = Path(config_path)

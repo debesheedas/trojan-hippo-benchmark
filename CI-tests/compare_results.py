@@ -26,7 +26,6 @@ from benchmark.benchmark_utils import (
     UNIFIED_DEFENSE_TYPES,
     is_valid_combination,
 )
-from agent.utils import load_config
 
 # CI and ground truth are fixed to this model (see CI-tests/README.md).
 CI_MODEL = "gpt-5-mini"
@@ -153,7 +152,7 @@ def main():
         "--model",
         type=str,
         default=None,
-        help="Model name (used to find results). If not provided, reads from agent_config.yaml"
+        help="Model name (used to find results). If not provided, uses CI_MODEL for CI-tests results dir, else gpt-4o-mini."
     )
     
     args = parser.parse_args()
@@ -165,17 +164,13 @@ def main():
         # Ground truth files are in CI-tests/ground_truth/{test_name}.json
         args.ground_truth = BASE_DIR / "CI-tests" / "ground_truth" / f"{test_name}.json"
     
-    # CI results and ground truth use gpt-5-mini only.
+    # Model: use CLI, or CI_MODEL for CI-tests results dir, else default (do not read agent_config.yaml).
     if args.model is None:
         results_dir_str = str(args.results_dir.resolve())
         if "CI-tests" in results_dir_str and "results" in results_dir_str:
             args.model = CI_MODEL
         else:
-            try:
-                agent_config = load_config("agent_config.yaml")
-                args.model = agent_config.get("agent", {}).get("target_model_name", "gpt-4o-mini")
-            except Exception:
-                args.model = "gpt-4o-mini"  # Fallback default
+            args.model = "gpt-4o-mini"
     
     # Verify ground truth file exists
     if not args.ground_truth.exists():

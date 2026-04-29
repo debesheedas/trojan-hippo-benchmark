@@ -51,7 +51,8 @@ from benchmark.benchmark_utils import (
     is_valid_combination,
 )
 
-# Constants
+# Constants: defense and backend order must match across all heatmaps (consolidate_results,
+# weighted_utility_results.py, build_thesis_utility_figures.py). Do not reorder.
 BACKEND_LABELS = ["No Memory", "Explicit", "Mem0", "RAG", "Context"]
 SUCCESS_TITLE_NOTE = "Success = Benign Utility (Utility of the Agent when NOT under Attack)"
 VALID_ATTACK_TYPES = [
@@ -155,12 +156,20 @@ def collect_results_for_combination(
         has_execution_errors: True if any test case has execution_success=False
     """
     results_dir = get_results_dir(memory_backend, unified_defense, model_name, attack_type, results_base_dir)
-    
+    # RAG+limit_memory_length was sometimes written under limit_chunk_size (legacy path); fallback so consolidation finds the data
+    if not results_dir.exists() and memory_backend == "rag" and unified_defense == "limit_memory_length":
+        results_dir = results_base_dir / model_name / "rag" / "limit_chunk_size" / attack_type
     if not results_dir.exists():
         return (0, 0, 0.0, False)  # No results available
     
     # Find all result JSON files
     result_files = list(results_dir.glob("*.json"))
+    # Prefer canonical numeric naming scheme (001.json, 002.json, ...) if present.
+    # Some result folders contain both numeric and legacy (<suite>_001.json) variants;
+    # mixing them breaks step aggregation.
+    numeric_files = [p for p in result_files if p.stem.isdigit() and p.suffix == ".json"]
+    if numeric_files:
+        result_files = sorted(numeric_files)
     
     total_passed_steps = 0
     total_steps = 0
@@ -248,7 +257,8 @@ def generate_csv(
     
     Structure:
     - Rows: Defense types
-    - Columns: Memory backends with success percentage (or "ERR" if execution errors occurred)
+    - Columns: Memory backends with success percentage when total_steps > 0 (even if some runs
+      reported execution errors; see per-suite execution error summaries on disk).
     output_dir is the model subfolder (output_base/model_name).
     """
     output_file = output_dir / f"{attack_type}_consolidated.csv"
@@ -271,10 +281,8 @@ def generate_csv(
                 if not is_valid_combination(backend, defense_type):
                     row.append("-")
                     continue
-                _, total_steps, rate, has_errors = data[defense_type].get(backend, (0, 0, 0.0, False))
-                if has_errors:
-                    row.append("ERR")
-                elif total_steps > 0:
+                _, total_steps, rate, _has_errors = data[defense_type].get(backend, (0, 0, 0.0, False))
+                if total_steps > 0:
                     row.append(f"{rate:.1f}%")
                 else:
                     row.append("-")
@@ -794,10 +802,8 @@ def generate_combined_csv(
                     if not is_valid_combination(backend, defense_type):
                         row.append("-")
                         continue
-                    _, total_steps, rate, has_errors = data[defense_type].get(backend, (0, 0, 0.0, False))
-                    if has_errors:
-                        row.append("ERR")
-                    elif total_steps > 0:
+                    _, total_steps, rate, _has_errors = data[defense_type].get(backend, (0, 0, 0.0, False))
+                    if total_steps > 0:
                         row.append(f"{rate:.1f}%")
                     else:
                         row.append("-")
@@ -837,20 +843,15 @@ def generate_average_summary_csv(
             row = [defense_type.replace("_", " ").title()]
             for backend in MEMORY_BACKENDS:
                 rates = []
-                has_any_errors = False
                 
-                # Collect rates from all suites for this combination
+                # Collect rates from all suites where we have step data (same rule as per-suite CSV).
                 for attack_type in all_data.keys():
                     if defense_type in all_data[attack_type] and backend in all_data[attack_type][defense_type]:
-                        _, _, rate, has_errors = all_data[attack_type][defense_type][backend]
-                        if has_errors:
-                            has_any_errors = True
-                        else:
+                        _passed, total_steps, rate, _has_errors = all_data[attack_type][defense_type][backend]
+                        if total_steps > 0:
                             rates.append(rate)
                 
-                if has_any_errors:
-                    row.append("ERR")
-                elif len(rates) > 0:
+                if len(rates) > 0:
                     avg_rate = sum(rates) / len(rates)
                     row.append(f"{avg_rate:.1f}%")
                 else:
@@ -889,7 +890,11 @@ def generate_error_summary(
             # Check result files for execution_success flag
             results_dir = get_results_dir(memory_backend, unified_defense, model_name, attack_type, results_base_dir)
             if results_dir.exists():
-                for result_file in results_dir.glob("*.json"):
+                result_files = list(results_dir.glob("*.json"))
+                numeric_files = [p for p in result_files if p.stem.isdigit() and p.suffix == ".json"]
+                if numeric_files:
+                    result_files = sorted(numeric_files)
+                for result_file in result_files:
                     result_data = parse_result_file(result_file)
                     if result_data and not result_data.get("execution_success", True):
                         errors_found.append({

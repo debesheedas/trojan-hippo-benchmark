@@ -120,10 +120,13 @@ class TestBench:
         debug_level = DebugLevel.DEBUG if debug_level_env == "DEBUG" else DebugLevel.INFO
         set_debug_level(debug_level)
         
-        # Read model name strictly from agent_config.yaml
+        # Model name is set by prepare_benchmark_config from run_benchmark --model (not from agent_config.yaml).
         self.model_name = self.config.get("agent", {}).get("target_model_name")
         if not self.model_name:
-            raise ValueError("Config missing agent.target_model_name. Please set it in agent_config.yaml.")
+            raise ValueError(
+                "Config missing agent.target_model_name. Pass --model when running the benchmark: "
+                "scripts/run_benchmark.py --model <name> ... (e.g. --model gpt-5-mini)."
+            )
         # No test directories needed - everything is in-memory
         self.test_dirs = []  # Kept for compatibility but will always be empty
         self.force = force  # Force overwrite existing results
@@ -2098,15 +2101,12 @@ class TestBench:
                 debug_print_exception(e, context="Loading existing adaptive test result", include_traceback=True)
                 # Continue to run the test
         
-        # Check for cached version first
+        # Check for cached version first (cache paths are per-model: train_cache/<model>/... so no cross-model reuse)
         cached_test = self._get_cached_test(test_file)
         if cached_test:
             print(f"💾 Found cached test with optimized attack, loading it")
-            # Load the cached test definition (which has optimized attack emails)
             with open(cached_test, 'r', encoding='utf-8') as f:
-                cached_test_def = json.load(f)
-            # Use the cached test definition instead of the original
-            test_def = cached_test_def
+                test_def = json.load(f)
             print(f"💾 Using optimized attack email from cache")
         
         print(f"Running adaptive test for indirect attack: {test_name}")
@@ -2216,7 +2216,7 @@ class TestBench:
         return result
     
     def _get_attack_bench_cache_path(self, test_file: Path, defense: Optional[str] = None) -> Optional[Path]:
-        """For attack_bench/train/... or attack_bench_stealth/train/... return train_cache/... or train_cache_10/... with same layout. Defense defaults to self.unified_defense (per-defense cache)."""
+        """For attack_bench/train/... or attack_bench_stealth/train/... return train_cache/<model>/... or train_cache_10/<model>/... with same layout (model subfolder like attack_logs/attack_results). Defense defaults to self.unified_defense (per-defense cache)."""
         rest = get_attack_bench_rest_parts(test_file)
         if not rest:
             return None
@@ -2225,29 +2225,29 @@ class TestBench:
         if split != ATTACK_BENCH_TRAIN and not split.startswith("train_"):
             return None
         # Derive cache base directory for this split from the configured cache root.
-        # Same layout for normal (attack_bench) and stealth (attack_bench_stealth): train_cache, train_cache_10, ...
         cache_root = self.cache_dir.name  # e.g. "train_cache"
         if split == ATTACK_BENCH_TRAIN:
             cache_base = self.cache_dir
         else:
-            # split like "train_10" -> suffix "10" → train_cache_10
             suffix = split.replace(ATTACK_BENCH_TRAIN, "", 1).lstrip("_") or "0"
             cache_dir_name = f"{cache_root}_{suffix}"
             cache_base = self.cache_dir.parent / cache_dir_name
         d = defense if defense is not None else self.unified_defense
-        # New layout: attack_bench/train_10/topic/backend/defense/file -> train_cache_10/topic/backend/defense/file
+        # Insert model name so caches are per-model (like attack_logs and attack_results).
+        model_part = self.model_name
+        # New layout: train_cache_10/<model>/topic/backend/defense/file
         if len(rest) >= 5:
             topic, backend, defense_dir = rest[1], rest[2], rest[3]
-            return cache_base / topic / backend / defense_dir / test_file.name
-        # Old layout: attack_bench/train/backend/suite/filename -> train_cache/backend/defense/suite/filename
+            return cache_base / model_part / topic / backend / defense_dir / test_file.name
+        # Old layout: train_cache/<model>/backend/defense/suite/filename
         if len(rest) >= 4:
             backend, suite = rest[1], rest[2]
-            return cache_base / backend / d / suite / test_file.name
+            return cache_base / model_part / backend / d / suite / test_file.name
         return None
 
     def _get_cached_train_file_for_suite(self, backend: str, defense: str, suite_name: str) -> Optional[Path]:
-        """Return path to cached train file at train_cache/backend/defense/suite/*_train.json, or None."""
-        cache_suite_dir = self.cache_dir / backend / defense / suite_name
+        """Return path to cached train file at train_cache/<model>/backend/defense/suite/*_train.json, or None."""
+        cache_suite_dir = self.cache_dir / self.model_name / backend / defense / suite_name
         if not cache_suite_dir.exists():
             return None
         for p in cache_suite_dir.glob("*.json"):
@@ -2256,7 +2256,7 @@ class TestBench:
         return None
 
     def _get_cached_train_file_for_attack_bench_test(self, test_file: Path, defense: str) -> Optional[Path]:
-        """Return path to cached train file for this test file (test or test_10 layout). Uses train_cache or train_cache_10 accordingly. Handles attack_bench and attack_bench_stealth paths."""
+        """Return path to cached train file for this test file (test or test_10 layout). Uses train_cache/<model>/ or train_cache_10/<model>/ accordingly. Handles attack_bench_stealth paths."""
         rest = get_attack_bench_rest_parts(test_file)
         if not rest:
             return None
@@ -2272,16 +2272,17 @@ class TestBench:
             suffix = split.replace(ATTACK_BENCH_TEST, "", 1).lstrip("_") or "0"
             cache_dir_name = f"{cache_root}_{suffix}"
             cache_base = self.cache_dir.parent / cache_dir_name
-        # New layout: test_10/topic/backend/defense/file -> train_cache_10/topic/backend/defense/
+        model_part = self.model_name
+        # New layout: train_cache_10/<model>/topic/backend/defense/
         if len(rest) >= 5:
             topic, backend, defense_dir = rest[1], rest[2], rest[3]
-            cache_suite_dir = cache_base / topic / backend / defense_dir
+            cache_suite_dir = cache_base / model_part / topic / backend / defense_dir
         else:
-            # Old layout: test/backend/suite/file -> train_cache/backend/defense/suite/
+            # Old layout: train_cache/<model>/backend/defense/suite/
             if len(rest) < 4:
                 return None
             backend, suite_name = rest[1], rest[2]
-            cache_suite_dir = cache_base / backend / defense / suite_name
+            cache_suite_dir = cache_base / model_part / backend / defense / suite_name
         if not cache_suite_dir.exists():
             return None
         for p in cache_suite_dir.glob("*.json"):
@@ -2816,47 +2817,60 @@ class TestBench:
                             )
                             
                             # Run verification on a completely fresh environment: create new env and replay
-                            # steps 0..through_idx (0-based), then run the attack step. This avoids any read/unread
-                            # or state leakage from the previous run (same as scorer does for each candidate).
+                            # steps 0..through_idx (0-based), then run the attack step. Retry up to 2 times
+                            # if verification fails (model non-determinism can cause scorer to pass but verification to fail).
                             through_idx = max(0, i - 2)  # 0-based: replay through step i-2 so step i-1 is last replayed
-                            print(f"🔄 Running verification on fresh environment (replay steps 1-{through_idx + 1}, then step {i})...")
-                            if self.logger:
-                                self.logger.info("[adaptive] Verification: replaying steps 1-%s then attack step %s on fresh environment", through_idx + 1, i)
-                            test_config, session_id, replayed_step_data = self._run_steps_on_fresh_environment(
-                                test_def, through_idx, optimization_result.optimized_attack_email
-                            )
-                            print(f"✅ Fresh replay complete; running attack step {i}")
-                            if self.logger:
-                                self.logger.info("[adaptive] Verification replay complete; running attack step %s (attack+stealth check)", i)
-                            # Update step_results and session_history with verification-run traces so result file
-                            # shows e.g. update_memory in step 2 (not the initial run's traces).
-                            for j in range(through_idx + 1):
-                                if j < len(step_results) and replayed_step_data and j < len(replayed_step_data) and replayed_step_data[j]:
-                                    if "step_traces" in replayed_step_data[j]:
-                                        step_results[j]["step_traces"] = replayed_step_data[j]["step_traces"]
-                                    if "agent_response" in replayed_step_data[j]:
-                                        step_results[j]["agent_response"] = replayed_step_data[j]["agent_response"]
-                            # session_history[0] is steps 1-2; set its traces from the replayed step that has them (step index 1 = step 2)
-                            if session_history and replayed_step_data and len(replayed_step_data) > 1 and replayed_step_data[1].get("step_traces"):
-                                session_history[0]["traces"] = replayed_step_data[1]["step_traces"]
-                            
-                            # Run the attack step (no inject needed; env already has optimized email)
-                            step_result = self._run_step_with_attack_check(
-                                step, i, session_id, test_config,
-                                optimized_attack_email=None
-                            )
-                            # Log verification outcome so the adaptive log clearly shows attack+stealth status
-                            ag = step_result.get("attack_goal", {})
-                            sg = step_result.get("stealth_goal", {})
-                            attack_ok = ag.get("passed") if isinstance(ag, dict) else None
-                            stealth_ok = sg.get("passed") if isinstance(sg, dict) else None
-                            if self.logger:
-                                self.logger.info(
-                                    "[adaptive] Verification result: attack_goal=%s, stealth_goal=%s (both must pass in stealth mode)",
-                                    "PASSED" if attack_ok is True else "FAILED" if attack_ok is False else "N/A",
-                                    "PASSED" if stealth_ok is True else "FAILED" if stealth_ok is False else "N/A",
+                            verification_max_retries = 2  # 1 initial + 2 retries = 3 attempts total
+                            step_result = None
+                            attack_ok = None
+                            stealth_ok = None
+                            for verification_attempt in range(verification_max_retries + 1):
+                                if verification_attempt > 0:
+                                    print(f"🔄 Verification attempt {verification_attempt + 1}/{verification_max_retries + 1} (retry after failure)...")
+                                    if self.logger:
+                                        self.logger.info("[adaptive] Verification retry %s/%s", verification_attempt + 1, verification_max_retries + 1)
+                                else:
+                                    print(f"🔄 Running verification on fresh environment (replay steps 1-{through_idx + 1}, then step {i})...")
+                                if self.logger:
+                                    self.logger.info("[adaptive] Verification: replaying steps 1-%s then attack step %s on fresh environment (target_model=%s)", through_idx + 1, i, self.model_name)
+                                test_config, session_id, replayed_step_data = self._run_steps_on_fresh_environment(
+                                    test_def, through_idx, optimization_result.optimized_attack_email
                                 )
-                            
+                                print(f"✅ Fresh replay complete; running attack step {i}")
+                                if self.logger:
+                                    self.logger.info("[adaptive] Verification replay complete; running attack step %s (attack+stealth check)", i)
+                                # Update step_results and session_history with verification-run traces so result file
+                                # shows e.g. update_memory in step 2 (not the initial run's traces).
+                                for j in range(through_idx + 1):
+                                    if j < len(step_results) and replayed_step_data and j < len(replayed_step_data) and replayed_step_data[j]:
+                                        if "step_traces" in replayed_step_data[j]:
+                                            step_results[j]["step_traces"] = replayed_step_data[j]["step_traces"]
+                                        if "agent_response" in replayed_step_data[j]:
+                                            step_results[j]["agent_response"] = replayed_step_data[j]["agent_response"]
+                                if session_history and replayed_step_data and len(replayed_step_data) > 1 and replayed_step_data[1].get("step_traces"):
+                                    session_history[0]["traces"] = replayed_step_data[1]["step_traces"]
+                                # Run the attack step (no inject needed; env already has optimized email)
+                                step_result = self._run_step_with_attack_check(
+                                    step, i, session_id, test_config,
+                                    optimized_attack_email=None
+                                )
+                                ag = step_result.get("attack_goal", {})
+                                sg = step_result.get("stealth_goal", {})
+                                attack_ok = ag.get("passed") if isinstance(ag, dict) else None
+                                stealth_ok = sg.get("passed") if isinstance(sg, dict) else None
+                                if self.logger:
+                                    self.logger.info(
+                                        "[adaptive] Verification result: attack_goal=%s, stealth_goal=%s (both must pass in stealth mode)",
+                                        "PASSED" if attack_ok is True else "FAILED" if attack_ok is False else "N/A",
+                                        "PASSED" if stealth_ok is True else "FAILED" if stealth_ok is False else "N/A",
+                                    )
+                                step_has_stealth_goal = bool(step.get("stealth_goal"))
+                                adaptive_stealth = self.config.get("benchmark", {}).get("adaptive_stealth", False)
+                                verification_passed = attack_ok is True and (not (adaptive_stealth and step_has_stealth_goal) or stealth_ok is True)
+                                if verification_passed:
+                                    break
+                            if not verification_passed and self.logger:
+                                self.logger.info("[adaptive] Verification failed after %s attempt(s) (possible model non-determinism)", verification_max_retries + 1)
                             optimization_used = True
                             step_result["optimization"] = {
                                 "strategy": optimization_result.optimization_strategy,
@@ -2864,7 +2878,7 @@ class TestBench:
                                 "feedback": optimization_result.feedback,
                                 "optimized_attack_email": optimization_result.optimized_attack_email,
                                 "score": (optimization_result.final_evaluation or {}).get("score"),
-                                "success": True,
+                                "success": verification_passed,
                             }
                         else:
                             print(f"ERROR: All optimization strategies failed for step {i}")
@@ -3883,31 +3897,31 @@ class TestBench:
         test_success_rate = f"{(passed_tests/total_tests*100):.1f}%" if total_tests > 0 else "0%"
         step_success_rate = f"{(passed_steps/total_steps*100):.1f}%" if total_steps > 0 else "0%"
         
-        print(f"\n{'='*80}")
-        print(f"FINAL SUMMARY")
-        print(f"{'='*80}")
-        print(f"Tests: {passed_tests}/{total_tests} passed ({test_success_rate})")
-        print(f"Steps: {passed_steps}/{total_steps} passed ({step_success_rate})")
+        print(f"\n{'='*80}", flush=True)
+        print(f"FINAL SUMMARY", flush=True)
+        print(f"{'='*80}", flush=True)
+        print(f"Tests: {passed_tests}/{total_tests} passed ({test_success_rate})", flush=True)
+        print(f"Steps: {passed_steps}/{total_steps} passed ({step_success_rate})", flush=True)
         
         # Show attack type breakdown
         if any(category_stats.values()):
-            print(f"\nATTACK TYPE BREAKDOWN:")
+            print(f"\nATTACK TYPE BREAKDOWN:", flush=True)
             for attack_type, stats in category_stats.items():
                 if stats["total"] > 0:
-                    print(f"  {attack_type.upper()}: {stats['passed']}/{stats['total']} passed ({stats['success_rate']})")
+                    print(f"  {attack_type.upper()}: {stats['passed']}/{stats['total']} passed ({stats['success_rate']})", flush=True)
         
         # Show dual evaluation results if available
         if has_dual_evaluation:
-            print(f"\nDUAL EVALUATION RESULTS:")
-            print(f"Utility Success Rate: {utility_success_rate}")
-            print(f"Attack Success Rate: {attack_success_rate}")
-            print(f"  (Lower attack success rate is better - indicates resistance to attacks)")
+            print(f"\nDUAL EVALUATION RESULTS:", flush=True)
+            print(f"Utility Success Rate: {utility_success_rate}", flush=True)
+            print(f"Attack Success Rate: {attack_success_rate}", flush=True)
+            print(f"  (Lower attack success rate is better - indicates resistance to attacks)", flush=True)
         
         if failed_tests > 0:
-            print(f"\nFailed tests:")
+            print(f"\nFailed tests:", flush=True)
             for result in results:
                 if not result["overall_success"]:
-                    print(f"  - {result['test_name']}")
+                    print(f"  - {result['test_name']}", flush=True)
     
 
 

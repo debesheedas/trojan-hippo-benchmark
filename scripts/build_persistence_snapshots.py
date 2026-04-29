@@ -87,6 +87,12 @@ def main():
         default="both",
         help="Which benign snapshot split to run (train, test, or both). Default: both.",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        help="Target model name (e.g. gpt-5-mini, gemini-3.1-pro-preview). Same as run_benchmark --model.",
+    )
     args = parser.parse_args()
 
     memory_backends = args.backends if args.backends else list(MEMORY_BACKENDS)
@@ -158,7 +164,7 @@ def main():
             num_workers=args.num_workers,
             results_base_dir=snapshot_results_base,
             logs_base_dir=snapshot_logs_base,
-            target_model_name=None,
+            target_model_name=args.model,
         )
 
         ok = result.get("failed_combinations", 0) == 0 and not result.get("combinations_with_errors")

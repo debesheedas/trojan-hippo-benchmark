@@ -1594,7 +1594,6 @@
       \ (\acmConference@shortname)\fi}%
   \fi
 }
-\newcommand{\ACM@ETHZurichLogo}{\includegraphics[height=9pt]{figures/eth_logo_kurz_pos.png}}%
 \if@ACM@journal\else
 \acmConference[Conference'17]{ACM Conference}{July 2017}{Washington,
   DC, USA}%
@@ -3132,9 +3131,10 @@
             \ACM@linecountR}%
         \else
           \fancyhead[LE]{\ACM@linecountL\@headfootfont\footnotesize
-            \ACM@ETHZurichLogo}%
+            \acmConference@shortname, \acmConference@date, \acmConference@venue}%
           \fancyhead[RO]{\@headfootfont
-            \ACM@ETHZurichLogo\ACM@linecountR}%
+            \acmConference@shortname, \acmConference@date, \acmConference@venue
+            \ACM@linecountR}%
          \fi
       \fi
     \fi
@@ -3153,10 +3153,11 @@
           EngageCSEdu. \ifx\@acmDOI\@empty\else\@formatdoi{\@acmDOI}\fi
           \ACM@linecountR}%
       \else
-        \fancyhead[LE]{\ACM@linecountL\@headfootfont
-          \ACM@ETHZurichLogo}%
-        \fancyhead[RO]{\@headfootfont
-          \ACM@ETHZurichLogo\ACM@linecountR}%
+        \fancyhead[LE]{\ACM@linecountL\@headfootfont\footnotesize
+          \acmConference@shortname, \acmConference@date, \acmConference@venue}%
+        \fancyhead[RO]{\@headfootfont\footnotesize
+          \acmConference@shortname, \acmConference@date, \acmConference@venue
+          \ACM@linecountR}%
        \fi
     \fi
   \fi

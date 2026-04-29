@@ -12,7 +12,8 @@ import shutil
 import copy
 from pathlib import Path
 from typing import Dict, Any, Optional, List
-from agent.utils import load_config, detect_provider
+import re
+from agent.utils import load_config, detect_provider, get_model_context_window, get_api_token_limit
 
 # Hardcoded test directory (unified test location)
 # This is a project structure constant - not configurable via config files
@@ -101,7 +102,7 @@ def _get_result_path_components(
 
 # Base segment for attack_bench in paths (used to detect and parse suite subfolder)
 ATTACK_BENCH_SEGMENT = "attack_bench"
-# Subfolders under attack_bench: train (train cases), test (test cases), train_cache (cached optimized train)
+# Subfolders under attack_bench: train (train cases), test (test cases), train_cache/<model>/ (cached optimized train, per-model like attack_logs/attack_results)
 ATTACK_BENCH_TRAIN = "train"
 ATTACK_BENCH_TEST = "test"
 ATTACK_BENCH_TRAIN_CACHE = "train_cache"
@@ -260,16 +261,43 @@ def get_result_path(
             )
     else:
         # Construct path: results/{model_name}/{memory_backend}/{defense_folder}/{attack_type}/{test_file_name}.json
+        canonical_test_filename = _canonicalize_utility_test_filename(test_file)
         result_path = (
             results_base_dir /
             model_name /
             backend_for_path /
             defense_folder /
             attack_type /
-            test_file.name
+            canonical_test_filename
         )
     
     return result_path
+
+
+def _canonicalize_utility_test_filename(test_file: Path) -> str:
+    """
+    Canonicalize utility test result/log filenames to numeric form.
+
+    Examples:
+      memory_tools_001.json -> 001.json
+      002.json -> 002.json
+      long_memory_004.json -> 004.json
+
+    This avoids legacy naming patterns from leaking into `data/benchmark/results`.
+    """
+    stem = test_file.stem
+    suffix = test_file.suffix  # expected ".json"
+
+    if stem.isdigit():
+        return f"{int(stem):03d}{suffix}"
+
+    # Match legacy pattern "<prefix>_<digits>"
+    m = re.match(r"^.*_(\d+)$", stem)
+    if m:
+        return f"{int(m.group(1)):03d}{suffix}"
+
+    # Fallback: keep original
+    return test_file.name
 
 
 def get_log_path(
@@ -342,13 +370,14 @@ def get_log_path(
         # Construct path: logs/{model_name}/{memory_backend}/{defense_folder}/{attack_type}/{test_file_name}.log
         # Use "unknown" if attack_type is still None or empty
         attack_type_folder = attack_type if attack_type else "unknown"
+        canonical_test_filename = _canonicalize_utility_test_filename(test_file)
         log_path = (
             logs_base_dir /
             model_name /
             backend_for_path /
             defense_folder /
             attack_type_folder /
-            test_file.with_suffix('.log').name
+            Path(canonical_test_filename).with_suffix('.log').name
         )
     
     return log_path
@@ -731,7 +760,8 @@ def prepare_benchmark_config(
     unified_defense: str,
     config_path: str = "benchmark_config.yaml",
     target_model_name: Optional[str] = None,
-    results_base_dir: Optional[Path] = None
+    results_base_dir: Optional[Path] = None,
+    seed_override: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Prepare configuration dictionary for a benchmark run.
@@ -776,20 +806,20 @@ def prepare_benchmark_config(
         # and will be handled by the target_model_name check below
         pass
     
-    # Set target model name (command line arg takes precedence over config)
-    # When overriding model, also set provider so the correct API is used (e.g. gpt-4o-mini -> OpenAI, gemini-* -> Gemini)
-    if target_model_name:
-        if "agent" not in config:
-            config["agent"] = {}
-        config["agent"]["target_model_name"] = target_model_name
-        config["agent"]["provider"] = detect_provider(target_model_name)
-    elif "agent" not in config or "target_model_name" not in config.get("agent", {}):
-        # If no agent config was loaded and no target_model_name provided, raise error
+    # Target model is supplied only via run_benchmark --model (not from agent_config.yaml).
+    if not target_model_name:
         raise ValueError(
-            "Agent configuration missing. Please ensure agent_config.yaml exists with an 'agent' section, "
-            "or provide target_model_name argument to specify target_model_name."
+            "Target model is required. Pass it via run_benchmark: scripts/run_benchmark.py --model <name> ... "
+            "(e.g. --model gpt-5-mini or --model gemini-3.1-pro-preview). Do not set target_model_name in agent_config.yaml."
         )
-    
+    if "agent" not in config:
+        config["agent"] = {}
+    config["agent"]["target_model_name"] = target_model_name
+    config["agent"]["provider"] = detect_provider(target_model_name)
+    # Set context window and API token limit from model (benchmark loads config before target_model_name is set, so do it here)
+    config["agent"]["context_window"] = get_model_context_window(target_model_name)
+    config["agent"]["api_token_limit"] = get_api_token_limit(target_model_name)
+
     # Set memory backend and defense type in config
     if "memory" not in config:
         config["memory"] = {}
@@ -819,6 +849,10 @@ def prepare_benchmark_config(
     # Set results directory (command line arg takes precedence, default if not provided)
     if results_base_dir is None:
         results_base_dir = Path("data/benchmark/results")  # Hardcoded default
+    
+    # Seed override from CLI takes precedence over config
+    if seed_override is not None:
+        config["seed"] = seed_override
     
     # Set results_dir in config for TestBench (it reads from config)
     if "benchmark" not in config:
