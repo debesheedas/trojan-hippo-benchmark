@@ -224,9 +224,6 @@ memory-agent-security-benchmark/
 ├── agent_config.yaml            # Agent configuration (model, temperature, etc.)
 ├── benchmark_config.yaml        # Benchmark-specific settings
 ├── proof.md                     # Security proofs and formal analysis
-├── .github/
-│   └── workflows/              # GitHub Actions CI/CD workflows
-│       └── regression_test.yml  # Regression testing workflow
 ├── src/
 │   ├── agent/                   # Core agent implementation
 │   │   ├── agent_core.py        # Main agent execution logic
@@ -267,18 +264,6 @@ memory-agent-security-benchmark/
 │   ├── run_benchmark.py        # Unified benchmark runner
 │   ├── consolidate_results.py  # Unified results consolidation
 │   └── aggregate_csv.py        # CSV aggregation utilities
-├── CI-tests/                    # Continuous integration test suite
-│   ├── compare_results.py      # Result comparison utilities
-│   ├── testcases/              # CI test cases
-│   │   ├── test1.json
-│   │   └── test2.json
-│   ├── ground_truth/           # Ground truth files
-│   │   ├── test1.json          # Ground truth for test1
-│   │   └── test2.json          # Ground truth for test2
-│   ├── results/                # CI test results
-│   ├── README.md               # CI tests documentation
-│   ├── GITHUB_ACTIONS_EXPLANATION.md  # GitHub Actions guide
-│   └── GITHUB_ACTIONS_SETUP.md        # GitHub Actions setup guide
 ├── data/
 │   ├── agent/                   # Agent data (mailbox, drafts, outbox, memory)
 │   └── benchmark/              # Benchmark data
@@ -865,79 +850,6 @@ data/benchmark/results/
 3. **Defaults** - System defaults
 
 The `--memory-backend` argument automatically enables the specified backend and disables others, overriding config file settings.
-
-## CI Regression Tests
-
-The `CI-tests/` directory contains regression tests to verify the benchmark works correctly across all memory backends and defense types.
-
-### Running CI Tests
-
-Run test1 across all 5 backends × 5 defenses (23 valid combinations):
-
-```bash
-python scripts/run_benchmark.py \
-  --test CI-tests/testcases/test1.json \
-  --memory-backend none explicit mem0 rag context \
-  --defense-type none user_prompt_only no_untrusted_tools limit_memory_length provable_policy \
-  --results-dir CI-tests/results \
-  --logs-dir CI-tests/logs \
-  --num-workers 1 \
-  --force
-```
-
-### Quick Single-Combination Tests
-
-To quickly verify a specific backend works:
-
-```bash
-# explicit backend with none defense
-python scripts/run_benchmark.py \
-  --test CI-tests/testcases/test1.json \
-  --memory-backend explicit \
-  --defense-type none \
-  --results-dir CI-tests/results \
-  --logs-dir CI-tests/logs \
-  --force
-
-# rag backend with none defense  
-python scripts/run_benchmark.py \
-  --test CI-tests/testcases/test1.json \
-  --memory-backend rag \
-  --defense-type none \
-  --results-dir CI-tests/results \
-  --logs-dir CI-tests/logs \
-  --force
-
-# mem0 backend with none defense
-python scripts/run_benchmark.py \
-  --test CI-tests/testcases/test1.json \
-  --memory-backend mem0 \
-  --defense-type none \
-  --results-dir CI-tests/results \
-  --logs-dir CI-tests/logs \
-  --force
-
-# context backend with none defense
-python scripts/run_benchmark.py \
-  --test CI-tests/testcases/test1.json \
-  --memory-backend context \
-  --defense-type none \
-  --results-dir CI-tests/results \
-  --logs-dir CI-tests/logs \
-  --force
-```
-
-### Comparing Results Against Ground Truth
-
-After running tests, compare results:
-
-```bash
-python CI-tests/compare_results.py \
-  --results-dir CI-tests/results \
-  --test-file CI-tests/testcases/test1.json
-```
-
-See `CI-tests/README.md` for more details on the CI test infrastructure.
 
 ## License
 

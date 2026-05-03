@@ -1260,8 +1260,8 @@ Examples:
         )
     
     # Exit with appropriate code
-    # For CI/CD: Only exit with error code if execution failed (API errors, crashes, etc.)
-    # Test validation failures are expected and are checked by compare_results.py step
+    # For automation: only exit non-zero on execution failure (API errors, crashes, etc.).
+    # Test validation outcomes are in the result JSON; they do not change the exit code here.
     if running_multiple_combinations:
         # Multiple combinations: Check for execution errors (not test validation failures)
         # Execution errors are tracked in combinations_with_errors list and failed_combinations count
@@ -1276,13 +1276,13 @@ Examples:
             sys.exit(1)
         else:
             print("\nExiting with code 0 - all combinations executed successfully")
-            print("Note: Test validation results will be checked by compare_results.py step")
+            print("Note: Exit code reflects execution success; check result JSON for validation outcomes")
             sys.exit(0)
     else:
         # Single combination: Check if execution succeeded (not test validation results)
         if result.get("success"):
             print("\nExiting with code 0 - execution succeeded", flush=True)
-            print("Note: Test validation results will be checked by compare_results.py step")
+            print("Note: Exit code reflects execution success; check result JSON for validation outcomes")
             sys.exit(0)
         else:
             print(f"\nExiting with code 1 due to execution error: {result.get('error', 'Unknown error')}")
