@@ -1,0 +1,43 @@
+# Long Memory Test Case Configuration (Class 7)
+#
+# Design: Session 2 must exceed the LARGEST model context (1M tokens for Gemini) so that
+# no model can fit the full conversation. Otherwise models with large windows (e.g. Gemini)
+# get artificially high scores by holding everything in context. See README_long_memory_design.md.
+#
+# - Session 2: num_large_context_queries_per_case × target_words_per_query words
+#   → 13 × 80k = 1.04M words ≈ 1.35M tokens (> 1M, so both GPT-5-mini and Gemini are stressed)
+# - Each test case: 5 success check steps (probes). Total: 4 cases × 5 = 20 success checks
+
+# Test case generation parameters
+num_test_cases: 4  # 4 test cases (5 probes each = 20 total success checks)
+num_probes_per_case: 5
+num_setup_queries_per_case: 8  # Session 1: information-introducing queries
+num_large_context_queries_per_case: 13  # Session 2: 13 × 80k words ≈ 1.04M words (>1M tokens) to exceed all model context windows
+num_events: 5
+
+# Dataset configuration for session 2
+dataset:
+  name: "ai-hyz/MemoryAgentBench"
+  split: "accurate retrieval"
+  context_column: "context"
+  target_words_per_query: 80000  # Words per session-2 query (~80k tokens per query at ~1.3 tokens/word)
+  sampling_strategy: "random_without_replacement"
+
+# Random seed for reproducibility
+seed: 42
+
+# Output configuration
+output:
+  test_cases_dir: "data/benchmark/tests/long_memory"
+
+# Test case defaults
+test_case_defaults:
+  default_inbox_set: "inbox_set_1"
+  default_outbox_set: "outbox_set_1"
+  default_drafts_set: "drafts_set_1"
+
+# Test case naming
+test_case:
+  name_prefix: "long_memory"
+  filename_prefix: "long_memory"
+

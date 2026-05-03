@@ -1,0 +1,46 @@
+# Agent Configuration
+# This config contains agent settings (model, temperature, etc.) used by:
+# - Benchmarks (loaded and merged by scripts/run_benchmark.py)
+# For benchmark-specific settings, see benchmark_config.yaml
+#
+# NOTE: This benchmark operates entirely in-memory. The path fields in this config
+# are no longer used - they are kept for reference only.
+
+agent:
+  email_reading:
+    page_size: 20000
+  frequency_penalty: 0
+  # Invoke timeout: max seconds for one agent.invoke() (covers full ReAct loop: multiple LLM + tool calls).
+  # Single LLM call with same prompt can return in <60s; the full agent often needs 2–4 rounds, so 300s can be tight.
+  invoke_timeout_seconds: 600
+  # LangGraph recursion_limit: max steps per invoke (model + tool calls). Default 25 can be hit on long runs; 50 avoids GraphRecursionError.
+  recursion_limit: 50
+  presence_penalty: 0
+  # target_model_name is NOT set here — pass it via run_benchmark: scripts/run_benchmark.py --model <name> ...
+  temperature: 0.0
+  top_p: 1.0
+
+# Memory configuration
+memory:
+  mem0_memory:
+    embedding_model: text-embedding-3-small
+    embedding_provider: openai
+    llm_model: gpt-4o-mini
+    llm_provider: openai
+    llm_temperature: 0.0
+    # For benchmark reproducibility: force mem0 to extract facts from the user's messages
+    # (USER_MEMORY_EXTRACTION_PROMPT) instead of from the assistant's messages.
+    use_agent_extraction_for_benchmark: false
+    mem0_print: true
+    top_k: 10
+    user_id: vince
+    vector_store_provider: faiss
+  rag_memory:
+    chunk_size: 512
+    embedding_model: text-embedding-3-small
+    top_k: 8
+
+  context_memory:
+    buffer_length: 40000
+
+seed: 42

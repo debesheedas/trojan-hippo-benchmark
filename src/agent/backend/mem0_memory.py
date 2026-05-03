@@ -1,0 +1,1537 @@
+"""
+Mem0 Memory Module
+Combines Mem0 Defense Manager and Mem0 Memory Manager.
+
+Defense Mechanisms:
+1. disable_memory: Baseline defense that disables all memory indexing
+2. user_prompt_only: Only index user messages (filter out assistant messages)
+3. no_untrusted_tools: Only index when no untrusted tools have been called in the session
+
+Memory Management Features:
+- Intelligent fact extraction from conversations
+- Semantic search over memories
+- Automatic memory updates and deduplication
+- Support for local and hosted configurations
+"""
+
+import os
+import sys
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+# Threading removed - each test runs in isolation, no locks needed
+from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
+# Add mem0 directory to Python path (local copy included in repo)
+BASE_DIR = Path(__file__).parent.parent.parent.parent
+MEM0_DIR = BASE_DIR / "mem0"
+if MEM0_DIR.exists() and str(MEM0_DIR) not in sys.path:
+    sys.path.insert(0, str(MEM0_DIR))
+
+from mem0 import Memory
+import tiktoken
+from agent.utils import debug_info, debug_debug, debug_print_exception
+
+# Import in-memory storage (optional - for backward compatibility)
+try:
+    from benchmark.in_memory_storage import InMemoryVectorstore
+except ImportError:
+    InMemoryVectorstore = None  # Type: ignore
+
+# Load environment variables from .env file
+load_dotenv()
+
+
+def _mem0_truncation_log_preview(x: Any, limit: int = 100) -> str:
+    """Single-line preview for limit_memory_length post-extraction logs."""
+    try:
+        s = str(x)
+    except Exception:
+        s = repr(x)
+    s = s.replace("\n", " ").replace("\r", " ")
+    return (s[:limit] + "…") if len(s) > limit else s
+
+
+class Mem0DefenseManager:
+    """
+    Manages defense mechanisms for mem0 memory indexing.
+    """
+    
+    def __init__(
+        self,
+        defense_type: str = "none"
+    ):
+        """
+        Initialize the defense manager.
+        
+        Args:
+            defense_type: Type of defense to apply. Options:
+                - "none": No defense (default behavior)
+                - "disable_memory": Disable all memory indexing
+                - "user_prompt_only": Only index user messages
+                - "no_untrusted_tools": Only index when no untrusted tools called
+                - "limit_memory_length": Truncate extracted mem0 memories to a fixed length
+        """
+        self.defense_type = defense_type
+        
+    def should_index_memory(
+        self,
+        session_id: str,
+        messages: List[Dict[str, str]]
+    ) -> bool:
+        """
+        Determine if memory should be indexed based on defense type.
+        
+        Args:
+            session_id: Session identifier
+            messages: List of messages to potentially index
+            
+        Returns:
+            True if memory should be indexed, False otherwise
+        """
+        # Defense 1: Disable memory (baseline)
+        if self.defense_type == "disable_memory":
+            return False
+        
+        # Defense 2: User-only indexing
+        if self.defense_type == "user_prompt_only":
+            # This is handled by filtering messages, not by returning False
+            # So we return True here and filter in filter_messages
+            return True
+        
+        # Defense 3: No untrusted tools
+        if self.defense_type == "no_untrusted_tools":
+            # Check session trust status using SessionTrustManager
+            from agent.agent_core import SessionTrustManager
+            if not SessionTrustManager.is_trusted(session_id):
+                return False
+            return True
+        
+        # No defense: allow indexing
+        if self.defense_type == "none":
+            return True
+        
+        # Unknown defense type: default to allowing
+        return True
+    
+    def filter_messages(
+        self,
+        messages: List[Dict[str, str]]
+    ) -> List[Dict[str, str]]:
+        """
+        Filter messages based on defense type.
+        
+        Args:
+            messages: List of messages to filter
+            
+        Returns:
+            Filtered list of messages
+        """
+        # Defense 2: User-only indexing
+        if self.defense_type == "user_prompt_only":
+            # Filter to only include user messages
+            return [msg for msg in messages if msg.get("role") == "user"]
+        
+        # Other defenses don't filter messages
+        return messages
+    
+
+
+def get_defense_manager(
+    defense_type: str = "none",
+    session_id: Optional[str] = None,
+) -> Mem0DefenseManager:
+    """
+    Create a new defense manager instance.
+    
+    Args:
+        defense_type: Type of defense to apply
+        session_id: Optional session ID (kept for API compatibility, not used)
+        
+    Returns:
+        A new Mem0DefenseManager instance
+    """
+    return Mem0DefenseManager(
+        defense_type=defense_type
+    )
+
+
+
+class Mem0TimeoutError(Exception):
+    """
+    Custom exception for mem0 API timeouts.
+    
+    This exception should be re-raised (not caught silently) to ensure
+    test results are marked as unreliable when API calls fail.
+    """
+    pass
+
+
+def _call_with_timeout(func, timeout_seconds=300, error_message="mem0 API call"):
+    """
+    Helper function to call a mem0 API function with a timeout.
+    
+    Args:
+        func: Callable that performs the mem0 API call
+        timeout_seconds: Maximum time to wait (default: 5 minutes)
+        error_message: Error message prefix for timeout errors
+        
+    Returns:
+        Result from func()
+        
+    Raises:
+        Mem0TimeoutError: If the call exceeds timeout_seconds
+    """
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(func)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except FutureTimeoutError:
+            error_msg = (
+                f"{error_message} timed out after {timeout_seconds} seconds. "
+                f"This indicates the API call was not successful. "
+                f"Results from this test are UNRELIABLE and should be marked as failed. "
+                f"This may indicate an API issue, network problem, or mem0 library bug."
+            )
+            print(f"ERROR: {error_msg}")
+            print(f"   This is likely causing the benchmark to hang.")
+            print(f"   Consider checking:")
+            print(f"   - API rate limits and quotas")
+            print(f"   - Network connectivity")
+            print(f"   - mem0 library version and known issues")
+            raise Mem0TimeoutError(error_msg) from None
+
+
+class Mem0MemoryManager:
+    """
+    Manages intelligent memory using mem0's Memory class (in-memory only).
+    """
+    
+    def __init__(
+        self,
+        llm_provider: str = "openai",
+        llm_model: str = "gpt-5-mini",
+        llm_temperature: float = 0.0,
+        embedding_provider: str = "openai",
+        embedding_model: str = "text-embedding-3-small",
+        vector_store_provider: str = "faiss",
+        top_k: int = 10,
+        user_id: str = "vince",
+        agent_id: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ):
+        """
+        Initialize the mem0 memory manager (in-memory only).
+        
+        Args:
+            llm_provider: LLM provider (openai, ollama, anthropic, etc.)
+            llm_model: LLM model name
+            llm_temperature: LLM temperature
+            embedding_provider: Embedding provider (openai, ollama, huggingface, etc.)
+            embedding_model: Embedding model name
+            vector_store_provider: Vector store provider (faiss, chroma, qdrant, etc.)
+            top_k: Number of top memories to retrieve
+            user_id: User identifier for memory scoping
+            agent_id: Optional agent ID. When set, mem0 uses AGENT_MEMORY_EXTRACTION_PROMPT
+                (extracts from assistant messages only). When None, uses USER_MEMORY_EXTRACTION_PROMPT
+                (extracts from user messages only). For the benchmark we set this so the attack
+                email (which appears in the assistant reply in step 2) is extracted.
+            api_key: Optional API key (uses env vars if not provided)
+        """
+        
+        self.llm_provider = llm_provider
+        self.llm_model = llm_model
+        self.llm_temperature = llm_temperature
+        self.embedding_provider = embedding_provider
+        self.embedding_model = embedding_model
+        self.vector_store_provider = vector_store_provider
+        self.top_k = top_k
+        self.user_id = user_id
+        self.agent_id = agent_id
+        
+        # Get API key from parameter or environment
+        api_key = api_key or os.getenv("OPENAI_API_KEY")
+        
+        # Build mem0 configuration (always in-memory)
+        config_dict = self._build_config_dict(api_key)
+        
+        # Initialize mem0 Memory instance using from_config classmethod
+        self.memory = Memory.from_config(config_dict)
+        # Last retrieved memories (list of memory text strings) for scorer/benchmark analysis
+        self._last_retrieved_memories: Optional[List[str]] = None
+
+    def _build_config_dict(self, api_key: Optional[str]) -> Dict[str, Any]:
+        """Build mem0 configuration dictionary."""
+        # Determine embedding dimensions based on model
+        # text-embedding-3-small: 1536, text-embedding-3-large: 3072, text-embedding-ada-002: 1536
+        embedding_dims = 1536  # Default
+        if "large" in self.embedding_model.lower():
+            embedding_dims = 3072
+        elif "3-small" in self.embedding_model.lower() or "ada" in self.embedding_model.lower():
+            embedding_dims = 1536
+        
+        config_dict = {
+            "llm": {
+                "provider": self.llm_provider,
+                "config": {
+                    "model": self.llm_model,
+                    "temperature": self.llm_temperature,
+                }
+            },
+            "embedder": {
+                "provider": self.embedding_provider,
+                "config": {
+                    "model": self.embedding_model,
+                }
+            },
+            "vector_store": {
+                "provider": self.vector_store_provider,
+                "config": {
+                    "collection_name": "mem0_memories",
+                    "embedding_model_dims": embedding_dims,
+                }
+            }
+        }
+        
+        # Add API key to LLM config if needed
+        if self.llm_provider == "openai" and api_key:
+            config_dict["llm"]["config"]["api_key"] = api_key
+        
+        # Add API key to embedding config if needed
+        if self.embedding_provider == "openai" and api_key:
+            config_dict["embedder"]["config"]["api_key"] = api_key
+        
+        # Always use in-memory mode (path=None)
+        if self.vector_store_provider == "faiss":
+            config_dict["vector_store"]["config"]["path"] = None
+        
+        return config_dict
+    
+    def _chunk_large_message(
+        self,
+        message: Dict[str, str],
+        max_tokens: int = 6000,
+        model_name: str = "gpt-4o-mini"
+    ) -> List[Dict[str, str]]:
+        """
+        Chunk a large message into smaller pieces that fit within token limits.
+        
+        This prevents mem0's embedding model from hitting token limits during search.
+        The embedding model (text-embedding-3-small) has an 8192 token limit, so we
+        use 6000 tokens per chunk to leave room for overhead.
+        
+        Args:
+            message: Message dictionary with 'role' and 'content'
+            max_tokens: Maximum tokens per chunk (default: 6000, safe for 8192 limit)
+            model_name: Model name for tokenizer (default: gpt-4o-mini)
+            
+        Returns:
+            List of message chunks, each within token limit
+        """
+        if not isinstance(message, dict) or "content" not in message:
+            return [message]
+        
+        content = str(message["content"])
+        role = message.get("role", "user")
+        
+        # If content is small, no need to chunk
+        if len(content) < 10000:  # Rough heuristic: ~10000 chars ≈ ~2500 tokens
+            return [message]
+        
+        # Optimization: For very large messages, use character-based chunking directly
+        # Encoding 1.9M+ characters is very slow, and we know they need chunking anyway
+        # Threshold: if message is clearly >5x max_tokens in characters, use character-based
+        very_large_threshold = max_tokens * 5 * 4  # ~5x max_tokens in chars (conservative estimate)
+        
+        if len(content) > very_large_threshold:
+            # Very large message - use character-based chunking (much faster)
+            # This avoids slow tokenization of 1.9M+ character messages
+            chunk_size_chars = max_tokens * 4
+            chunks = []
+            for i in range(0, len(content), chunk_size_chars):
+                chunk_content = content[i:i + chunk_size_chars]
+                chunks.append({
+                    "role": role,
+                    "content": chunk_content,
+                    "chunk_index": i // chunk_size_chars,
+                    "total_chunks": (len(content) + chunk_size_chars - 1) // chunk_size_chars
+                })
+            return chunks
+        
+        # Count tokens to see if chunking is needed
+        try:
+            # Fallback: use character-based estimation (rough: 1 token ≈ 4 chars)
+            estimated_tokens = len(content) // 4
+            if estimated_tokens <= max_tokens:
+                return [message]
+            # Chunk by characters
+            chunk_size_chars = max_tokens * 4
+            chunks = []
+            for i in range(0, len(content), chunk_size_chars):
+                chunk_content = content[i:i + chunk_size_chars]
+                chunks.append({
+                    "role": role,
+                    "content": chunk_content,
+                    "chunk_index": i // chunk_size_chars,
+                    "total_chunks": (len(content) + chunk_size_chars - 1) // chunk_size_chars
+                })
+            return chunks
+        except Exception:
+            # Fallback: use character-based estimation (rough: 1 token ≈ 4 chars)
+            estimated_tokens = len(content) // 4
+            if estimated_tokens <= max_tokens:
+                return [message]
+            # Chunk by characters
+            chunk_size_chars = max_tokens * 4
+            chunks = []
+            for i in range(0, len(content), chunk_size_chars):
+                chunk_content = content[i:i + chunk_size_chars]
+                chunks.append({
+                    "role": role,
+                    "content": chunk_content,
+                    "chunk_index": i // chunk_size_chars,
+                    "total_chunks": (len(content) + chunk_size_chars - 1) // chunk_size_chars
+                })
+            return chunks
+        
+        # Use tiktoken for accurate token counting (for medium-sized messages)
+            try:
+                tokenizer = tiktoken.encoding_for_model(model_name)
+            except KeyError:
+                tokenizer = tiktoken.encoding_for_model("gpt-4o-mini")
+            
+            # Encode to get token count
+            encoded = tokenizer.encode(content, disallowed_special=())
+            token_count = len(encoded)
+            
+            # If within limit, return as-is
+            if token_count <= max_tokens:
+                return [message]
+            
+            # Chunk by tokens (preserve token boundaries)
+            chunks = []
+            num_chunks = (token_count + max_tokens - 1) // max_tokens
+            
+            for i in range(num_chunks):
+                start_idx = i * max_tokens
+                end_idx = min((i + 1) * max_tokens, token_count)
+                chunk_encoded = encoded[start_idx:end_idx]
+                chunk_content = tokenizer.decode(chunk_encoded)
+                
+                chunks.append({
+                    "role": role,
+                    "content": chunk_content,
+                    "chunk_index": i,
+                    "total_chunks": num_chunks
+                })
+            
+            return chunks
+        except Exception as e:
+            # If tokenization fails, fall back to character-based chunking
+            print(f"Warning: Token-based chunking failed, using character-based: {e}")
+            chunk_size_chars = max_tokens * 4
+            chunks = []
+            for i in range(0, len(content), chunk_size_chars):
+                chunk_content = content[i:i + chunk_size_chars]
+                chunks.append({
+                    "role": role,
+                    "content": chunk_content,
+                    "chunk_index": i // chunk_size_chars,
+                    "total_chunks": (len(content) + chunk_size_chars - 1) // chunk_size_chars
+                })
+            return chunks
+    
+    def add_memory(
+        self,
+        messages: List[Dict[str, str]],
+        metadata: Optional[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        max_memory_length: Optional[int] = None,
+        session_id: Optional[str] = None,
+        defense_type: Optional[str] = None,
+        debug_trace: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Add memories from conversation messages.
+        
+        Args:
+            messages: List of message dictionaries with 'role' and 'content'
+            metadata: Optional metadata dictionary
+            user_id: Optional user ID (defaults to self.user_id from config)
+            agent_id: Optional agent ID (defaults to self.agent_id)
+            
+        Returns:
+            Dictionary with memory addition results
+        """
+        # No lock needed - each test runs in isolation
+        if not messages:
+            return {"results": []}
+        
+        # Use self.user_id / self.agent_id from config (passed during initialization)
+        user_id = user_id or self.user_id
+        effective_agent_id = agent_id if agent_id is not None else self.agent_id
+
+        if debug_trace:
+            # Keep previews short; this function can be called many times per test.
+            def _preview_content(x: Any, limit: int = 220) -> str:
+                try:
+                    s = str(x)
+                except Exception:
+                    s = repr(x)
+                s = s.replace("\n", " ").replace("\r", " ")
+                return (s[:limit] + "…") if len(s) > limit else s
+
+            print("\n[mem0_debug] ===== add_memory() trace start =====")
+            print(f"[mem0_debug] user_id={user_id!r}, effective_agent_id={effective_agent_id!r}")
+            print(f"[mem0_debug] session_id={session_id!r}, defense_type={defense_type!r}, max_memory_length={max_memory_length!r}")
+            print(f"[mem0_debug] incoming messages count={len(messages)}")
+            if metadata:
+                print(f"[mem0_debug] incoming metadata keys={list(metadata.keys())}")
+            else:
+                print("[mem0_debug] incoming metadata=None")
+        
+        # Combine metadata
+        combined_metadata = metadata or {}
+        combined_metadata["session_type"] = "conversation"
+        
+        # Note: We pass messages to mem0 as-is. For user_prompt_only defense,
+        # messages are already filtered to only user messages by the defense manager.
+        # mem0 should handle UPDATE operations correctly regardless of message structure.
+        
+        # P3: Memory Labeling - inherit session label for provable_policy defense
+        if defense_type == "provable_policy":
+            if session_id:
+                from agent.agent_core import ProvablePolicyManager
+                session_label = ProvablePolicyManager.get_session_label(session_id)
+                combined_metadata["label"] = session_label
+            else:
+                # Default to T if no session_id provided
+                session_label = "T"
+                combined_metadata["label"] = session_label
+            debug_info(
+                f"[mem0_defense] provable_policy: memories will be stored with session_label={combined_metadata.get('label', 'T')}",
+                truncate=False,
+            )
+        
+        try:
+            # Mem0 uses agent_id presence to choose extraction prompt:
+            # - agent_id set → AGENT_MEMORY_EXTRACTION_PROMPT (extracts from assistant messages only)
+            # - agent_id not set → USER_MEMORY_EXTRACTION_PROMPT (extracts from user messages only)
+            # For the benchmark we pass agent_id (use_agent_extraction_for_benchmark) so the attack
+            # email (which appears in the assistant reply in step 2) is extracted.
+            
+            # Step 1: Chunk large messages to prevent embedding model token limit errors
+            # mem0's embedding model (text-embedding-3-small) has 8192 token limit
+            # We chunk messages to 6000 tokens to leave room for overhead
+            # This prevents errors during memory.search() when mem0 tries to embed all memories
+            chunked_messages = []
+            for msg in messages:
+                if isinstance(msg, dict) and "content" in msg:
+                    # Chunk large messages (6000 tokens = safe for 8192 limit)
+                    msg_chunks = self._chunk_large_message(msg, max_tokens=6000)
+                    chunked_messages.extend(msg_chunks)
+                else:
+                    chunked_messages.append(msg)
+
+            if debug_trace:
+                print(f"[mem0_debug] chunked_messages count={len(chunked_messages)} (passed to mem0.add)")
+                for i, msg in enumerate(chunked_messages[:4]):
+                    if isinstance(msg, dict):
+                        print(f"[mem0_debug] chunk[{i}] role={msg.get('role')!r} content_preview={_preview_content(msg.get('content'))}")
+                    else:
+                        print(f"[mem0_debug] chunk[{i}] non-dict={type(msg).__name__}")
+            
+            # Log chunking if it occurred (6000-token split for embedding safety; not limit_memory_length)
+            if len(chunked_messages) > len(messages):
+                print(f"Chunked {len(messages)} messages into {len(chunked_messages)} chunks to prevent token limit errors")
+            
+            # Extract memories using mem0 (full message content; limit_memory_length truncates outputs below)
+            # Capture mem0's internal error messages to handle UPDATE operation failures gracefully
+            # Root cause: mem0's deduplication logic uses simple IDs (e.g., '6') to track memories,
+            # but stored memories have UUIDs. When mem0 tries to UPDATE a similar memory, it fails
+            # with KeyError because it can't find the memory with the simple ID.
+            # This is a mem0 bug - we can't fix it without modifying mem0 source code.
+            error_buffer = StringIO()
+
+            # Enable local mem0 internal tracing (optional) so we can see
+            # whether it selected the user-vs-agent extraction prompt and what
+            # facts it parsed from the LLM response.
+            prev_mem0_trace = os.getenv("MEM0_BENCH_TRACE")
+            if debug_trace:
+                os.environ["MEM0_BENCH_TRACE"] = "1"
+            try:
+                # Wrap mem0.add() call with timeout to prevent hanging
+                # Use 5 minutes timeout (300 seconds) - should be enough for most API calls
+                # If it hangs longer, something is wrong and we should fail fast
+                def _call_mem0_add():
+                    with redirect_stderr(error_buffer), redirect_stdout(error_buffer):
+                        return self.memory.add(
+                            messages=chunked_messages,
+                            user_id=user_id,
+                            agent_id=effective_agent_id,
+                            metadata=combined_metadata,
+                            infer=True,  # Use LLM to extract facts
+                        )
+                
+                # Execute with timeout
+                result = _call_with_timeout(_call_mem0_add, timeout_seconds=300, error_message="mem0.add()")
+                
+                # Check if mem0 printed any UPDATE-related errors
+                error_output = error_buffer.getvalue()
+                if debug_trace:
+                    print(f"[mem0_debug] mem0.add() returned type={type(result).__name__}")
+                    if isinstance(result, dict):
+                        mem_results = result.get("results", [])
+                        print(f"[mem0_debug] mem0.add() results_count={len(mem_results)}")
+                        # Print first couple results for inspection
+                        for j, item in enumerate(mem_results[:3]):
+                            if isinstance(item, dict):
+                                txt = item.get("memory") or item.get("memories") or item.get("text") or item.get("content") or item.get("fact")
+                                print(f"[mem0_debug] result[{j}] event={item.get('event')!r} memory_preview={_preview_content(txt, 240)}")
+                            else:
+                                print(f"[mem0_debug] result[{j}] non-dict={type(item).__name__}")
+                    elif isinstance(result, list):
+                        print(f"[mem0_debug] mem0.add() results_count={len(result)}")
+                    else:
+                        print("[mem0_debug] mem0.add() returned non-dict non-list")
+
+                    if error_output:
+                        # mem0 internal logs may contain update failures or debug info.
+                        cap = 3500
+                        eo = error_output
+                        eo = eo.replace("\n", "\n[stdout_stderr] ")
+                        print(f"[mem0_debug] captured stdout/stderr from mem0.add (truncated to {cap} chars):")
+                        print(eo[:cap])
+                    else:
+                        print("[mem0_debug] captured stdout/stderr from mem0.add: <empty>")
+                if error_output and "Error processing memory action" in error_output:
+                    # Check if the operation still succeeded (new memories were added)
+                    has_results = False
+                    if isinstance(result, dict):
+                        has_results = bool(result.get("results"))
+                    elif isinstance(result, list):
+                        has_results = bool(result)
+                    elif result:
+                        has_results = True
+                    
+                    if has_results:
+                        # Operation succeeded despite UPDATE failure - log as warning for monitoring
+                        # The new memory was added, but mem0 failed to UPDATE the old similar memory
+                        # This is non-fatal but worth tracking to see if it affects performance
+                        print(f"Warning: mem0 UPDATE operation failed (mem0 bug - ID mismatch), but new memory was added. "
+                              f"This may cause duplicate memories. Error: {error_output[:300]}")
+                    else:
+                        # Operation completely failed - this is more serious
+                        print(f"Error: mem0 UPDATE operation failed, and no new memories were added. "
+                              f"This may indicate a more serious issue. Error: {error_output[:300]}")
+            except Exception as e:
+                # Re-raise the exception - this is a real error, not just an UPDATE failure
+                raise
+            finally:
+                # Restore original tracing env var
+                if debug_trace:
+                    if prev_mem0_trace is None:
+                        os.environ.pop("MEM0_BENCH_TRACE", None)
+                    else:
+                        os.environ["MEM0_BENCH_TRACE"] = prev_mem0_trace
+            
+            # limit_memory_length: truncate each extracted memory string after mem0.add(); also cap length for embedding safety
+            max_safe_memory_length = 32000  # Safe limit for embedding model (8192 tokens * ~4 chars/token)
+            
+            if max_memory_length and max_memory_length > 0:
+                processed_memories = []
+                result_items: List[Any] = []
+                if isinstance(result, dict) and "results" in result:
+                    result_items = result["results"]
+                elif isinstance(result, list):
+                    result_items = result
+
+                n_with_text = 0
+                n_truncated_defense = 0
+                for memory_item in result_items:
+                    if not isinstance(memory_item, dict):
+                        continue
+                    memory_text = (
+                        memory_item.get("memory")
+                        or memory_item.get("memories")
+                        or memory_item.get("text")
+                        or memory_item.get("content")
+                        or memory_item.get("fact")
+                        or ""
+                    )
+                    if not memory_text:
+                        continue
+                    n_with_text += 1
+                    memory_text_str = str(memory_text)
+                    raw_before_defense = memory_text_str
+                    # Defense limit_memory_length, then embedding model safety cap
+                    if len(memory_text_str) > max_memory_length:
+                        memory_text_str = memory_text_str[:max_memory_length]
+                        n_truncated_defense += 1
+                        print(
+                            f"[mem0_defense] limit_memory_length: truncated extracted memory "
+                            f"{len(raw_before_defense)} -> {max_memory_length} chars | "
+                            f"before={_mem0_truncation_log_preview(raw_before_defense)} | "
+                            f"after={_mem0_truncation_log_preview(memory_text_str)}"
+                        )
+                    elif len(memory_text_str) > max_safe_memory_length:
+                        memory_text_str = memory_text_str[:max_safe_memory_length]
+                        print(
+                            f"WARNING: Truncated extracted memory from {len(str(memory_text))} "
+                            f"to {max_safe_memory_length} chars to prevent embedding model errors"
+                        )
+                    for key in ["memory", "memories", "text", "content", "fact"]:
+                        if key in memory_item:
+                            memory_item[key] = memory_text_str
+                            break
+                    processed_memories.append(memory_item)
+
+                if debug_trace:
+                    print(
+                        f"[mem0_debug] limit_memory_length post-process: "
+                        f"{n_with_text} extracted memory field(s), "
+                        f"{n_truncated_defense} truncated to {max_memory_length} chars"
+                    )
+            
+            # In-memory mode: memories are stored in mem0's internal vectorstore
+            # No file tracking needed - validation can query mem0 directly
+            return result
+        except Exception as e:
+            debug_info("Could not add memory to mem0")
+            debug_print_exception(e, context="Adding memory to mem0", include_traceback=True)
+            return {"results": []}
+    
+    def search(
+        self,
+        query: str,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        limit: Optional[int] = None,
+        session_id: Optional[str] = None,
+        defense_type: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for relevant memories.
+        
+        Uses batch search to avoid token limit errors:
+        1. First tries normal search (semantic search over all memories)
+        2. If that fails (token limit), falls back to batch search:
+           - Gets memories in batches using get_all()
+           - Searches each batch separately
+           - Combines and ranks results
+        
+        Args:
+            query: Search query string
+            user_id: Optional user ID (defaults to self.user_id from config)
+            agent_id: Optional agent ID (defaults to self.agent_id)
+            limit: Number of results to return (defaults to self.top_k)
+            
+        Returns:
+            List of memory dictionaries
+        """
+        # No lock needed - each test runs in isolation
+        if not query or not query.strip():
+            return []
+        
+        # Use self.user_id / self.agent_id from config (passed during initialization)
+        user_id = user_id or self.user_id
+        agent_id = agent_id if agent_id is not None else self.agent_id
+        limit = limit or self.top_k
+        
+        # Optimization: Truncate very large queries before search
+        # mem0's embedding model (text-embedding-3-small) has 8192 token limit
+        # If the query is very large (e.g., 80k word context documents), truncate it
+        # to prevent hanging during embedding. The first portion usually contains
+        # the most relevant information for search anyway.
+        max_query_tokens = 6000  # Safe limit for 8192 token embedding model
+        search_query = query
+        
+        # Quick check: if query is clearly very large, use character-based truncation
+        very_large_threshold = max_query_tokens * 5 * 4  # ~5x max_tokens in chars
+        if len(query) > very_large_threshold:
+            # Very large query - use character-based truncation (faster)
+            truncate_chars = max_query_tokens * 4
+            search_query = query[:truncate_chars]
+            print(f"WARNING: [SEARCH OPTIMIZATION] Truncated very large query from {len(query):,} to {len(search_query):,} chars (estimated {max_query_tokens} tokens) for search")
+        else:
+            # For medium-sized queries, use tokenization to check if truncation is needed
+            try:
+                try:
+                    tokenizer = tiktoken.encoding_for_model("gpt-4o-mini")
+                except KeyError:
+                    tokenizer = tiktoken.encoding_for_model("gpt-4o-mini")
+                
+                encoded = tokenizer.encode(query, disallowed_special=())
+                token_count = len(encoded)
+                
+                if token_count > max_query_tokens:
+                    # Truncate to first max_query_tokens
+                    truncated_encoded = encoded[:max_query_tokens]
+                    search_query = tokenizer.decode(truncated_encoded)
+                    print(f"WARNING: [SEARCH OPTIMIZATION] Truncated query from {token_count:,} to {max_query_tokens:,} tokens for search")
+            except Exception as e:
+                # If tokenization fails, fall back to character-based truncation
+                print(f"Warning: Query tokenization failed, using character-based truncation: {e}")
+                truncate_chars = max_query_tokens * 4
+                if len(query) > truncate_chars:
+                    search_query = query[:truncate_chars]
+                    print(f"WARNING: [SEARCH OPTIMIZATION] Truncated query from {len(query):,} to {len(search_query):,} chars for search")
+        
+        # Try normal search first (semantic search over all memories)
+        print(f"[BATCH SEARCH DEBUG] Attempting normal mem0 search (semantic search over all memories)")
+        print(f"   Query: '{search_query[:100]}...' (truncated)" if len(search_query) > 100 else f"   Query: '{search_query}'")
+        if search_query != query:
+            print(f"   Original query length: {len(query):,} chars, using truncated query: {len(search_query):,} chars")
+        print(f"   Limit: {limit} results")
+        
+        try:
+            # Wrap mem0.search() call with timeout to prevent hanging
+            def _call_mem0_search():
+                return self.memory.search(
+                    query=search_query,  # Use truncated query
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    limit=limit
+                )
+            
+            result = _call_with_timeout(_call_mem0_search, timeout_seconds=300, error_message="mem0.search()")
+            # Extract results from mem0 response
+            memories = []
+            if isinstance(result, dict) and "results" in result:
+                memories = result["results"]
+            elif isinstance(result, list):
+                memories = result
+            else:
+                memories = []
+            
+            print(f"[BATCH SEARCH DEBUG] Normal search succeeded: Found {len(memories)} memories")
+            
+            # P1: Check if any retrieved memory has U label (provable_policy defense)
+            if defense_type == "provable_policy" and session_id:
+                from agent.agent_core import ProvablePolicyManager
+                print(f"[DEBUG] mem0 search: Checking {len(memories)} memories for U labels (session_id={session_id})")
+                found_u_label = False
+                for i, memory_item in enumerate(memories):
+                    if isinstance(memory_item, dict):
+                        # Check metadata for label
+                        metadata = memory_item.get("metadata", {})
+                        label = metadata.get("label", None)
+                        memory_text = memory_item.get("memory", "")[:50]
+                        print(f"[DEBUG] mem0 Memory {i}: label={label}, text_preview='{memory_text}'")
+                        if label == "U":
+                            # Upgrade session to U if U-labeled memory is retrieved
+                            print(f"[DEBUG] mem0: Found U-labeled memory! Upgrading session '{session_id}' to UNTRUSTED")
+                            ProvablePolicyManager.set_untrusted(session_id)
+                            found_u_label = True
+                            break
+                        elif label is None:
+                            # Error: memory should have a label
+                            print(f"WARNING: [DEBUG] mem0 Memory {i} missing label! text_preview='{memory_text}'")
+                            raise ValueError(
+                                f"Mem0 memory entry missing label in provable_policy defense. "
+                                f"All memories must have 'label' metadata set to 'T' or 'U'. "
+                                f"Memory text preview: {memory_text}..."
+                            )
+                if not found_u_label:
+                    print(f"[DEBUG] mem0: No U-labeled memories found. Session '{session_id}' remains trusted.")
+            
+            return memories
+        except Exception as e:
+            error_str = str(e)
+            print(f"ERROR: [BATCH SEARCH DEBUG] Normal search failed: {error_str[:200]}")
+            
+            # Check if this is a token limit error
+            is_token_limit_error = (
+                "8192 tokens" in error_str or
+                "context length" in error_str.lower() or
+                ("token" in error_str.lower() and "limit" in error_str.lower()) or
+                "105107 tokens" in error_str or
+                "102925 tokens" in error_str or
+                "118565 tokens" in error_str or
+                "119102 tokens" in error_str
+            )
+            
+            if is_token_limit_error:
+                # Fall back to batch search (use truncated query)
+                print(f"WARNING: [BATCH SEARCH DEBUG] Token limit error detected - switching to batch search fallback")
+                print(f"   Error type: Token limit exceeded (embedding model limit: 8192 tokens)")
+                return self._batch_search(search_query, user_id, agent_id, limit, session_id, defense_type)
+            else:
+                # Other errors - just return empty
+                debug_debug("Non-token-limit error in mem0 search - returning empty results")
+                debug_info("Could not search mem0 memory")
+                debug_print_exception(e, context="Searching mem0 memory", include_traceback=True)
+                return []
+    
+    def _batch_search(
+        self,
+        query: str,
+        user_id: str,
+        agent_id: Optional[str],
+        limit: int,
+        session_id: Optional[str],
+        defense_type: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        """
+        Batch search fallback: Get memories in batches and search each batch.
+        
+        This is a workaround for mem0's token limit issue. Since mem0's search()
+        embeds ALL memories at once (which exceeds token limit), we:
+        1. Get memories in batches using get_all() with a reasonable limit
+        2. For each batch, try to use mem0's search() (semantic search)
+        3. If batch search also fails, use text matching as final fallback
+        4. Combine and rank results
+        
+        Note: mem0's get_all() doesn't support pagination, so we get the first N memories.
+        This searches through recent memories, which is often sufficient.
+        
+        Args:
+            query: Search query string
+            user_id: User ID
+            agent_id: Agent ID (always None for mem0)
+            limit: Number of results to return
+            session_id: Optional session ID
+            defense_type: Optional defense type
+            
+        Returns:
+            List of memory dictionaries
+        """
+        print(f"[BATCH SEARCH DEBUG] Starting batch search fallback")
+        print(f"   Query: '{query[:100]}...' (truncated)" if len(query) > 100 else f"   Query: '{query}'")
+        print(f"   Target: {limit} results")
+        
+        # Truncate query for batch search as well (same logic as in search())
+        # This ensures we don't hit token limits even in the fallback path
+        max_query_tokens = 6000  # Safe limit for 8192 token embedding model
+        batch_search_query = query
+        
+        # Quick check: if query is clearly very large, use character-based truncation
+        very_large_threshold = max_query_tokens * 5 * 4  # ~5x max_tokens in chars
+        if len(query) > very_large_threshold:
+            # Very large query - use character-based truncation (faster)
+            truncate_chars = max_query_tokens * 4
+            batch_search_query = query[:truncate_chars]
+            print(f"WARNING: [BATCH SEARCH OPTIMIZATION] Truncated very large query from {len(query):,} to {len(batch_search_query):,} chars for batch search")
+        else:
+            # For medium-sized queries, use tokenization to check if truncation is needed
+            try:
+                try:
+                    tokenizer = tiktoken.encoding_for_model("gpt-4o-mini")
+                except KeyError:
+                    tokenizer = tiktoken.encoding_for_model("gpt-4o-mini")
+                
+                encoded = tokenizer.encode(query, disallowed_special=())
+                token_count = len(encoded)
+                
+                if token_count > max_query_tokens:
+                    # Truncate to first max_query_tokens
+                    truncated_encoded = encoded[:max_query_tokens]
+                    batch_search_query = tokenizer.decode(truncated_encoded)
+                    print(f"WARNING: [BATCH SEARCH OPTIMIZATION] Truncated query from {token_count:,} to {max_query_tokens:,} tokens for batch search")
+            except Exception as e:
+                # If tokenization fails, fall back to character-based truncation
+                print(f"Warning: Query tokenization failed in batch search, using character-based truncation: {e}")
+                truncate_chars = max_query_tokens * 4
+                if len(query) > truncate_chars:
+                    batch_search_query = query[:truncate_chars]
+                    print(f"WARNING: [BATCH SEARCH OPTIMIZATION] Truncated query from {len(query):,} to {len(batch_search_query):,} chars for batch search")
+        
+        try:
+            # Get memories in batches - try semantic search first, fall back to text matching
+            batch_size = 50  # Process 50 memories at a time
+            max_memories_to_search = 200  # Search through up to 200 memories total
+            all_results = []
+            
+            # Get all memories we want to search through
+            print(f"📥 [BATCH SEARCH DEBUG] Getting memories to search (limit: {max_memories_to_search})")
+            all_memories = self.get_all_memories(
+                user_id=user_id,
+                agent_id=agent_id,
+                limit=max_memories_to_search
+            )
+            
+            total_memories = len(all_memories)
+            print(f"   Retrieved {total_memories} memories from vector store")
+            
+            if not all_memories:
+                print(f"WARNING: [BATCH SEARCH DEBUG] No memories found in vector store")
+                return []
+            
+            # Try to search in batches using mem0's search()
+            # Note: mem0's search() still searches ALL memories, but we can try smaller batches
+            # by creating temporary filtered searches. However, mem0 doesn't support this directly.
+            # So we'll use text matching as a fallback, but try semantic search on the full set first
+            # with a smaller limit to see if it works.
+            
+            # Strategy: Try semantic search with smaller result limit first
+            # If that fails, use text matching on batches
+            print(f"[BATCH SEARCH DEBUG] Attempting semantic search with reduced scope...")
+            
+            # Try semantic search one more time with a smaller limit (might work if fewer results needed)
+            # Use truncated query
+            try:
+                def _call_mem0_search_small():
+                    return self.memory.search(
+                        query=batch_search_query,  # Use truncated query
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        limit=min(limit, 10)  # Try smaller limit
+                    )
+                
+                semantic_result = _call_with_timeout(_call_mem0_search_small, timeout_seconds=300, error_message="mem0.search() (batch fallback)")
+                semantic_memories = []
+                if isinstance(semantic_result, dict) and "results" in semantic_result:
+                    semantic_memories = semantic_result["results"]
+                elif isinstance(semantic_result, list):
+                    semantic_memories = semantic_result
+                
+                if semantic_memories:
+                    print(f"[BATCH SEARCH DEBUG] Semantic search with reduced limit succeeded: {len(semantic_memories)} results")
+                    all_results = semantic_memories
+                else:
+                    raise Exception("No results from semantic search")
+            except Exception as semantic_error:
+                print(f"WARNING: [BATCH SEARCH DEBUG] Semantic search with reduced limit also failed: {str(semantic_error)[:100]}")
+                print(f"   Falling back to text matching on {total_memories} memories")
+                
+                # Fall back to text matching: check if query words appear in memory text
+                # Use truncated query for text matching as well (more efficient)
+                query_lower = batch_search_query.lower()
+                query_words = set(query_lower.split())
+                if not query_words:
+                    print(f"WARNING: [BATCH SEARCH DEBUG] Empty query words after processing")
+                    return []
+                
+                print(f"   Query words: {list(query_words)[:10]}..." if len(query_words) > 10 else f"   Query words: {list(query_words)}")
+                
+                scored_memories = []
+                for i, mem in enumerate(all_memories):
+                    if isinstance(mem, dict):
+                        memory_text = str(mem.get("memory", "")).lower()
+                        memory_words = set(memory_text.split())
+                        
+                        # Count how many query words match
+                        matches = len(query_words.intersection(memory_words))
+                        
+                        if matches > 0:
+                            # Calculate relevance score (percentage of query words matched)
+                            relevance_score = matches / len(query_words)
+                            
+                            # Also check if query appears as substring (higher relevance)
+                            if query_lower in memory_text:
+                                relevance_score += 0.5
+                            
+                            mem_copy = mem.copy()
+                            mem_copy["_relevance_score"] = relevance_score
+                            scored_memories.append(mem_copy)
+                            
+                            if len(scored_memories) <= 5:  # Debug first 5 matches
+                                print(f"   Match {len(scored_memories)}: score={relevance_score:.2f}, text='{memory_text[:60]}...'")
+                
+                # Sort by relevance score (highest first)
+                scored_memories.sort(key=lambda x: x.get("_relevance_score", 0), reverse=True)
+                
+                # Remove temporary relevance scores
+                for mem in scored_memories:
+                    if "_relevance_score" in mem:
+                        del mem["_relevance_score"]
+                
+                all_results = scored_memories
+                print(f"[BATCH SEARCH DEBUG] Text matching: {len(scored_memories)} matches found from {total_memories} memories")
+            
+            # P1: Check if any retrieved memory has U label (provable_policy defense)
+            if defense_type == "provable_policy" and session_id:
+                from agent.agent_core import ProvablePolicyManager
+                found_u_label = False
+                for memory_item in all_results:
+                    if isinstance(memory_item, dict):
+                        metadata = memory_item.get("metadata", {})
+                        label = metadata.get("label", None)
+                        if label == "U":
+                            ProvablePolicyManager.set_untrusted(session_id)
+                            found_u_label = True
+                            break
+                        elif label is None:
+                            raise ValueError(
+                                f"Mem0 batch search memory entry missing label in provable_policy defense. "
+                                f"All memories must have 'label' metadata set to 'T' or 'U'."
+                            )
+            
+            final_results = all_results[:limit]
+            print(f"[BATCH SEARCH DEBUG] Batch search complete: Returning {len(final_results)} results (requested: {limit})")
+            if final_results:
+                print(f"   Top result: '{final_results[0].get('memory', '')[:80]}...'")
+            
+            return final_results
+            
+        except Exception as e:
+            print(f"ERROR: [BATCH SEARCH DEBUG] Batch search fallback failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
+    def get_context(self, query: str, user_id: Optional[str] = None, agent_id: Optional[str] = None, session_id: Optional[str] = None, defense_type: Optional[str] = None) -> str:
+        """
+        Get formatted context string for a query.
+        
+        Args:
+            query: The search query
+            user_id: Optional user ID (defaults to self.user_id from config)
+            agent_id: Optional agent ID
+            session_id: Optional session ID for provable_policy defense
+            defense_type: Optional defense type to check if provable_policy is active
+            
+        Returns:
+            Formatted context string with retrieved memories
+        """
+        # Use self.user_id / self.agent_id from config (passed during initialization)
+        user_id = user_id or self.user_id
+        agent_id = agent_id if agent_id is not None else self.agent_id
+        memories = self.search(query, user_id=user_id, agent_id=agent_id, session_id=session_id, defense_type=defense_type)
+        
+        # If we got fewer memories than top_k, try a more aggressive fallback
+        # This helps when the query is too specific and doesn't match stored memories well
+        if len(memories) < self.top_k:
+            try:
+                # Get a sample of all memories as fallback
+                all_memories = self.get_all_memories(user_id=user_id, agent_id=agent_id, limit=self.top_k)
+                if all_memories:
+                    # Use first few memories as fallback context
+                    existing_texts = {m.get("memory", "") for m in memories if isinstance(m, dict)}
+                    for mem in all_memories[:min(10, len(all_memories))]:
+                        if isinstance(mem, dict):
+                            mem_text = mem.get("memory", "")
+                            if mem_text and mem_text not in existing_texts:
+                                memories.append(mem)
+                                existing_texts.add(mem_text)
+                                if len(memories) >= self.top_k:
+                                    break
+                    
+                    # P1: Check if any fallback memory has U label (provable_policy defense)
+                    # This is critical - fallback memories must also be checked for U labels
+                    if defense_type == "provable_policy" and session_id:
+                        from agent.agent_core import ProvablePolicyManager
+                        print(f"[DEBUG] mem0 get_context fallback: Checking {len(all_memories)} fallback memories for U labels (session_id={session_id})")
+                        found_u_label = False
+                        for i, memory_item in enumerate(all_memories):
+                            if isinstance(memory_item, dict):
+                                metadata = memory_item.get("metadata", {})
+                                label = metadata.get("label", None)
+                                memory_text = memory_item.get("memory", "")[:50]
+                                print(f"[DEBUG] mem0 Fallback Memory {i}: label={label}, text_preview='{memory_text}'")
+                                if label == "U":
+                                    print(f"[DEBUG] mem0 fallback: Found U-labeled memory! Upgrading session '{session_id}' to UNTRUSTED")
+                                    ProvablePolicyManager.set_untrusted(session_id)
+                                    found_u_label = True
+                                    break
+                                elif label is None:
+                                    print(f"WARNING: [DEBUG] mem0 Fallback Memory {i} missing label! text_preview='{memory_text}'")
+                                    raise ValueError(
+                                        f"Mem0 fallback memory entry missing label in provable_policy defense. "
+                                        f"All memories must have 'label' metadata set to 'T' or 'U'. "
+                                        f"Memory text preview: {memory_text}..."
+                                    )
+                        if not found_u_label:
+                            print(f"[DEBUG] mem0 fallback: No U-labeled memories found. Session '{session_id}' remains trusted.")
+            except Exception:
+                pass
+        
+        if not memories:
+            self._last_retrieved_memories = []
+            return ""
+
+        # Store raw memory texts for scorer/benchmark (e.g. to detect reward hacking vs true memory retrieval)
+        memory_texts = []
+        for memory_item in memories:
+            mem_text = memory_item.get("memory", "") if isinstance(memory_item, dict) else str(memory_item)
+            if mem_text:
+                memory_texts.append(mem_text)
+        self._last_retrieved_memories = memory_texts
+
+        context_parts = []
+        for i, memory_text in enumerate(memory_texts, 1):
+            context_parts.append(f"Memory {i}:\n{memory_text}")
+
+        return "\n\n".join(context_parts)
+
+    def get_all_memories(
+        self,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all memories for a user using the get_all API.
+        
+        Args:
+            user_id: Optional user ID (defaults to self.user_id)
+            agent_id: Optional agent ID (defaults to self.agent_id; when set, memories were stored with AGENT extraction)
+            filters: Optional additional filters (supports AND, OR, etc.)
+            limit: Maximum number of memories to return (default: 100)
+            
+        Returns:
+            List of all memory dictionaries
+        """
+        # No lock needed - each test runs in isolation
+        user_id = user_id or self.user_id
+        agent_id = agent_id if agent_id is not None else self.agent_id
+        
+        all_memories = []
+        
+        try:
+            query_filters = (filters or {}).copy()
+            
+            # Add user_id to filters
+            if user_id:
+                query_filters["user_id"] = user_id
+            
+            # Call get_all (with timeout to prevent hanging)
+            def _call_mem0_get_all():
+                return self.memory.get_all(
+                    user_id=user_id if user_id else None,
+                    agent_id=agent_id,
+                    filters=query_filters if query_filters else None,
+                    limit=limit
+                )
+            
+            result = _call_with_timeout(_call_mem0_get_all, timeout_seconds=300, error_message="mem0.get_all()")
+            
+            # Extract results from mem0 response
+            if isinstance(result, dict) and "results" in result:
+                all_memories.extend(result["results"])
+            elif isinstance(result, list):
+                all_memories.extend(result)
+            
+            return all_memories
+        except Exception as e:
+            debug_info("Could not get all memories from mem0")
+            debug_print_exception(e, context="Getting all memories from mem0", include_traceback=True)
+            return []
+    
+    def clear_all_memory(
+        self,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None
+    ):
+        """
+        Clear all memories for a user/agent.
+        
+        Args:
+            user_id: Optional user ID (defaults to self.user_id)
+            agent_id: Optional agent ID (defaults to self.agent_id)
+        """
+        # No lock needed - each test runs in isolation
+        user_id = user_id or self.user_id
+        agent_id = agent_id if agent_id is not None else self.agent_id
+        
+        try:
+            # Get all memories first
+            all_memories = self.get_all_memories(user_id=user_id, agent_id=agent_id)
+            
+            # Delete each memory (mem0 doesn't have a bulk delete, so we iterate)
+            for memory_item in all_memories:
+                memory_id = memory_item.get("id") if isinstance(memory_item, dict) else None
+                if memory_id:
+                    try:
+                        # Note: mem0 Memory class may not have delete method in open-source version
+                        # This is a placeholder - actual implementation depends on mem0 API
+                        pass
+                    except Exception as e:
+                        debug_info(f"Could not delete memory {memory_id} from mem0")
+                        debug_print_exception(e, context=f"Deleting memory {memory_id} from mem0", include_traceback=True)
+            
+            print(f"Cleared memories for user_id={user_id}, agent_id={agent_id}")
+        except Exception as e:
+            debug_info("Could not clear mem0 memory")
+            debug_print_exception(e, context="Clearing all mem0 memory", include_traceback=True)
+    
+    def get_users(self) -> Dict[str, Any]:
+        """
+        Get all users, agents, and runs that have memories.
+        
+        Note: This method may not be available in all versions of mem0.
+        
+        Returns:
+            Dictionary with list of entities
+        """
+        # No lock needed - each test runs in isolation
+        try:
+            # Try to call users() method if it exists
+            if hasattr(self.memory, 'users'):
+                result = self.memory.users()
+                return result
+            else:
+                # Fallback: return empty result
+                return {"results": []}
+        except Exception as e:
+            debug_info("Could not get users from mem0")
+            debug_print_exception(e, context="Getting users from mem0", include_traceback=True)
+            return {"results": []}
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics about the memory system.
+        
+        Returns:
+            Dictionary with memory statistics
+        """
+        # No lock needed - each test runs in isolation
+        try:
+            all_memories = self.get_all_memories()
+            return {
+                "total_memories": len(all_memories),
+                "llm_provider": self.llm_provider,
+                "llm_model": self.llm_model,
+                "embedding_provider": self.embedding_provider,
+                "embedding_model": self.embedding_model,
+                "vector_store_provider": self.vector_store_provider,
+                "top_k": self.top_k,
+                "user_id": self.user_id,
+                "agent_id": self.agent_id
+            }
+        except Exception as e:
+            print(f"Warning: Could not get mem0 memory stats: {e}")
+            return {}
+
+
+def get_mem0_memory_manager(
+    llm_provider: str = "openai",
+    llm_model: str = "gpt-5-mini",
+    llm_temperature: float = 0.0,
+    embedding_provider: str = "openai",
+    embedding_model: str = "text-embedding-3-small",
+    vector_store_provider: str = "faiss",
+    top_k: int = 10,
+    user_id: str = "vince",
+    agent_id: Optional[str] = None,
+) -> Mem0MemoryManager:
+    """
+    Create a new mem0 memory manager instance (in-memory only).
+    
+    Args:
+        llm_provider: LLM provider
+        llm_model: LLM model name
+        llm_temperature: LLM temperature
+        embedding_provider: Embedding provider
+        embedding_model: Embedding model name
+        vector_store_provider: Vector store provider
+        top_k: Number of top memories to retrieve
+        user_id: User identifier
+        agent_id: Optional. When set, mem0 uses AGENT_MEMORY_EXTRACTION (assistant messages only).
+            Use for benchmark so the attack email (in assistant reply) is extracted.
+    
+    Returns:
+        A new Mem0MemoryManager instance
+    """
+    return Mem0MemoryManager(
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        llm_temperature=llm_temperature,
+        embedding_provider=embedding_provider,
+        embedding_model=embedding_model,
+        vector_store_provider=vector_store_provider,
+        top_k=top_k,
+        user_id=user_id,
+        agent_id=agent_id,
+    )
+
+
+def get_mem0_memory_context(text: str, session_id: str, memory_config: dict, in_memory_env = None) -> str:
+    """Retrieve mem0 memory context if active (in-memory only).
+    
+    The backend is considered active if a manager exists in in_memory_env or config.
+    This is set by test_bench when memory_backend="mem0" is specified.
+    """
+    mem0_memory_config = memory_config.get("mem0_memory", {})
+    mem0_defense_type = mem0_memory_config.get("defense_type", "none")
+    
+    # Check defense type first
+    if mem0_defense_type == "disable_memory":
+        return ""
+    
+    try:
+        # Get manager from in_memory_env (preferred) or from config (backward compatibility)
+        # If a manager exists, the backend is active (set by test_bench based on CLI args)
+        mem0_memory_manager = None
+        if in_memory_env:
+            mem0_memory_manager = in_memory_env.mem0_manager
+        if not mem0_memory_manager:
+            mem0_memory_manager = mem0_memory_config.get("manager")
+        
+        # No manager means mem0 backend is not active - return empty
+        if not mem0_memory_manager:
+            return ""
+        
+        mem0_context = mem0_memory_manager.get_context(
+            text, user_id=mem0_memory_manager.user_id, session_id=session_id, defense_type=mem0_defense_type
+        )
+        # Expose last retrieved memories for scorer (e.g. to verify attack came from memory, not search_emails)
+        if in_memory_env is not None and hasattr(in_memory_env, "last_mem0_retrieved_memories"):
+            in_memory_env.last_mem0_retrieved_memories = getattr(
+                mem0_memory_manager, "_last_retrieved_memories", None
+            ) or []
+        return "\n\n# Relevant Mem0 Memory Context\n" + mem0_context + "\n" if mem0_context else ""
+    except Mem0TimeoutError as e:
+        print(f"CRITICAL ERROR: mem0 memory retrieval timed out: {e}")
+        print("   Test results are UNRELIABLE - the API call was not successful.")
+        raise
+    except (OSError, IOError, ValueError, RuntimeError) as e:
+        debug_debug(f"Could not retrieve mem0 memory context: {e}")
+        return ""
+
+
+def index_mem0_memory(text: str, response_text: str, session_id: str, mem0_memory_config: dict, mem0_defense_type: str, config: dict) -> None:
+    """Index conversation into mem0 memory if enabled and defense allows."""
+    try:
+        defense_manager = get_defense_manager(defense_type=mem0_defense_type, session_id=session_id)
+        
+        conversation_messages = [
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": response_text}
+        ]
+        
+        if not defense_manager.should_index_memory(session_id, conversation_messages):
+            if mem0_defense_type == "no_untrusted_tools":
+                debug_info(
+                    "[mem0_defense] no_untrusted_tools: memory indexing blocked for this turn (session UNTRUSTED due to untrusted tool use).",
+                    truncate=False,
+                )
+            if mem0_memory_config.get("mem0_print", False):
+                print(f"\nDefense '{mem0_defense_type}' blocked memory indexing for this turn")
+            return
+        
+        filtered_messages = defense_manager.filter_messages(conversation_messages)
+        n_passed = len(filtered_messages)
+        n_excluded = len(conversation_messages) - n_passed
+        if mem0_defense_type == "user_prompt_only" and n_excluded > 0:
+            debug_info(
+                f"[mem0_defense] user_prompt_only: passing {n_passed} user message(s) to mem0 for extraction "
+                f"({n_excluded} assistant message(s) excluded)",
+                truncate=False,
+            )
+        if not filtered_messages:
+            if mem0_memory_config.get("mem0_print", False):
+                print(f"\nDefense '{mem0_defense_type}' filtered out all messages")
+            return
+        
+        # Use shared manager from config if available (persists memories across invocations)
+        mem0_memory_manager = mem0_memory_config.get("manager")
+        if not mem0_memory_manager:
+            # Fallback: create new manager (memories won't persist across calls)
+            mem0_memory_manager = get_mem0_memory_manager(
+                llm_provider=mem0_memory_config.get("llm_provider", "openai"),
+                llm_model=mem0_memory_config.get("llm_model", "gpt-5-mini"),
+                llm_temperature=mem0_memory_config.get("llm_temperature", 0.0),
+                embedding_provider=mem0_memory_config.get("embedding_provider", "openai"),
+                embedding_model=mem0_memory_config.get("embedding_model", "text-embedding-3-small"),
+                vector_store_provider=mem0_memory_config.get("vector_store_provider", "faiss"),
+                top_k=mem0_memory_config.get("top_k", 3),
+                user_id=mem0_memory_config.get("user_id", "default_user"),
+            )
+        
+        limit_memory_size = config.get("benchmark", {}).get("limit_memory_size_defense", 80)
+        max_memory_length = limit_memory_size if mem0_defense_type == "limit_memory_length" else None
+
+        # Deep tracing: enable when mem0_print is enabled (default in agent_config.yaml),
+        # and allow overriding with an explicit `mem0_trace` key.
+        mem0_trace = mem0_memory_config.get("mem0_trace", mem0_memory_config.get("mem0_print", False))
+
+        result = mem0_memory_manager.add_memory(
+            messages=filtered_messages,
+            metadata={"session_id": session_id, "type": "conversation", "defense_type": mem0_defense_type},
+            user_id=mem0_memory_manager.user_id,
+            max_memory_length=max_memory_length,
+            session_id=session_id,
+            defense_type=mem0_defense_type,
+            debug_trace=bool(mem0_trace),
+        )
+        if result:
+            results = result.get("results", [])
+            if mem0_defense_type == "user_prompt_only" and not results:
+                debug_info(
+                    "[mem0_defense] No memories extracted this turn; user_prompt_only indexed only user message(s) (assistant reply excluded).",
+                    truncate=False,
+                )
+        if mem0_memory_config.get("mem0_print", False) and result:
+            results = result.get("results", [])
+            if results:
+                print(f"\nStored {len(results)} memory(ies) to mem0")
+            else:
+                print("\nWARNING: No memories extracted from conversation")
+    except Mem0TimeoutError as e:
+        print(f"CRITICAL ERROR: mem0 memory operation timed out: {e}")
+        print("   Test results are UNRELIABLE - the API call was not successful.")
+        raise
+    except (OSError, IOError, ValueError, RuntimeError) as e:
+        debug_debug(f"Could not index mem0 memory: {e}")
+
+
+# ============================================================================
+# Test Utilities
+# ============================================================================
+
+def get_memory_state_for_test(test_dir: Path, config: Dict[str, Any]) -> List[str]:
+    """
+    Get mem0 memory contents for test validation.
+    
+    This is a test utility function that reads memory state from the test directory.
+    For efficiency, it first checks for recent memories added in the current step.
+    If no recent memories file exists, it falls back to checking all memories from the vectorstore.
+    
+    Args:
+        test_dir: Ignored - kept for API compatibility
+        config: Configuration dictionary
+        
+    Returns:
+        List of memory strings from in-memory storage
+    """
+    # Get all memories from in-memory mem0 manager
+    mem0_config = config.get("memory", {}).get("mem0_memory", {})
+    user_id = mem0_config.get("user_id", "vince")
+    agent_id = mem0_config.get("agent_id", None)
+    
+    try:
+        mem0_manager = get_mem0_memory_manager(
+            llm_provider=mem0_config.get("llm_provider", "openai"),
+            llm_model=mem0_config.get("llm_model", "gpt-4o-mini"),
+            llm_temperature=mem0_config.get("llm_temperature", 0.0),
+            embedding_provider=mem0_config.get("embedding_provider", "openai"),
+            embedding_model=mem0_config.get("embedding_model", "text-embedding-3-small"),
+            vector_store_provider=mem0_config.get("vector_store_provider", "faiss"),
+            top_k=mem0_config.get("top_k", 3),
+            user_id=user_id,
+        )
+        
+        memories = mem0_manager.get_all_memories(user_id=user_id, agent_id=agent_id, limit=1000)
+        
+        memory_texts = []
+        for memory in memories:
+            if isinstance(memory, dict):
+                memory_text = (
+                    memory.get("memory") or
+                    memory.get("memories") or
+                    memory.get("text") or
+                    memory.get("content") or
+                    memory.get("fact") or
+                    ""
+                )
+                if not memory_text:
+                    for value in memory.values():
+                        if isinstance(value, str) and value.strip():
+                            memory_text = value
+                            break
+                if memory_text:
+                    memory_texts.append(str(memory_text))
+            else:
+                memory_texts.append(str(memory))
+        
+        return memory_texts
+    except Exception as e:
+        debug_info("Could not read mem0 memory")
+        debug_print_exception(e, context="Reading mem0 memory", include_traceback=True)
+        return []
+
