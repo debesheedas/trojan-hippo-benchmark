@@ -35,7 +35,7 @@ PYTHONPATH=src python -m benchmark.attack_generation.persistent_exfiltrate.gener
 PYTHONPATH=src python -m benchmark.attack_generation.persistent_exfiltrate.generate_persistence_tests --n 4 --category tax
 ```
 
-Requires snapshots to be built first (e.g. `python scripts/build_persistence_snapshots.py`).
+Requires memory snapshots under `data/benchmark/snapshots/memory_snapshots_{train,test}/` (shipped in this repo; written by `src/benchmark/snapshot_io.py` when the benign multi-session case from `src/benchmark/dataset_generation/generate_persistence_unrelated_snapshots.py` is run).
 
 ## Adding a new category (e.g. for 7 more topics)
 
