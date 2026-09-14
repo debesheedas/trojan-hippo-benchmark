@@ -1,0 +1,252 @@
+diff --git a/mem0/memory/main.py b/mem0/memory/main.py
+index 4a025a961..9d88ab5a7 100644
+--- a/mem0/memory/main.py
++++ b/mem0/memory/main.py
+@@ -218,12 +218,11 @@ class Memory(MemoryBase):
+         # Override collection name for telemetry
+         telemetry_config_dict['collection_name'] = "mem0migrations"
+ 
+-        # Set path for file-based vector stores
++        # This benchmark operates entirely in-memory - no telemetry directories created
+         telemetry_config = _safe_deepcopy_config(self.config.vector_store.config)
+         if self.config.vector_store.provider in ["faiss", "qdrant"]:
+-            provider_path = f"migrations_{self.config.vector_store.provider}"
+-            telemetry_config_dict['path'] = os.path.join(mem0_dir, provider_path)
+-            os.makedirs(telemetry_config_dict['path'], exist_ok=True)
++            # Always use in-memory mode for telemetry (path=None)
++            telemetry_config_dict['path'] = None
+ 
+         # Create the config object using the same class as the original
+         telemetry_config = self.config.vector_store.config.__class__(**telemetry_config_dict)
+@@ -431,6 +430,18 @@ class Memory(MemoryBase):
+             is_agent_memory = self._should_use_agent_memory_extraction(messages, metadata)
+             system_prompt, user_prompt = get_fact_retrieval_messages(parsed_messages, is_agent_memory)
+ 
++            # Optional local debug tracing for benchmark runs.
++            # Enable by setting MEM0_BENCH_TRACE=1.
++            if os.getenv("MEM0_BENCH_TRACE") == "1":
++                try:
++                    roles = [m.get("role") for m in messages if isinstance(m, dict)]
++                except Exception:
++                    roles = []
++                print(
++                    f"\n[mem0_bench_trace] extraction mode: is_agent_memory={is_agent_memory} "
++                    f"metadata_agent_id={metadata.get('agent_id', None)!r} roles={roles}"
++                )
++
+         response = self.llm.generate_response(
+             messages=[
+                 {"role": "system", "content": system_prompt},
+@@ -455,6 +466,19 @@ class Memory(MemoryBase):
+             logger.error(f"Error in new_retrieved_facts: {e}")
+             new_retrieved_facts = []
+ 
++        if os.getenv("MEM0_BENCH_TRACE") == "1":
++            try:
++                preview = (response or "").replace("\n", " ")
++                preview = preview[:500] + ("…" if len(preview) > 500 else "")
++            except Exception:
++                preview = "<unavailable>"
++            facts_preview = new_retrieved_facts[:5] if isinstance(new_retrieved_facts, list) else []
++            print(
++                f"[mem0_bench_trace] parsed facts count={len(new_retrieved_facts) if isinstance(new_retrieved_facts, list) else 'unknown'} "
++                f"facts_preview={facts_preview} "
++                f"response_preview={preview}"
++            )
++
+         if not new_retrieved_facts:
+             logger.debug("No new facts retrieved from input. Skipping memory update LLM call.")
+ 
+@@ -1300,12 +1324,12 @@ class AsyncMemory(MemoryBase):
+         else:
+             self.graph = None
+ 
++        # This benchmark operates entirely in-memory - no telemetry directories created
+         telemetry_config = _safe_deepcopy_config(self.config.vector_store.config)
+         telemetry_config.collection_name = "mem0migrations"
+         if self.config.vector_store.provider in ["faiss", "qdrant"]:
+-            provider_path = f"migrations_{self.config.vector_store.provider}"
+-            telemetry_config.path = os.path.join(mem0_dir, provider_path)
+-            os.makedirs(telemetry_config.path, exist_ok=True)
++            # Always use in-memory mode for telemetry (path=None)
++            telemetry_config.path = None
+         self._telemetry_vector_store = VectorStoreFactory.create(self.config.vector_store.provider, telemetry_config)
+ 
+         capture_event("mem0.init", self, {"sync_type": "async"})
+diff --git a/mem0/memory/setup.py b/mem0/memory/setup.py
+index 138641790..ac6aeb854 100644
+--- a/mem0/memory/setup.py
++++ b/mem0/memory/setup.py
+@@ -2,16 +2,21 @@ import json
+ import os
+ import uuid
+ 
+-# Set up the directory path
++# Set up the directory path (used for reference only, no directories are created)
++# This benchmark runs entirely in-memory - no file system operations
+ VECTOR_ID = str(uuid.uuid4())
+ home_dir = os.path.expanduser("~")
+ mem0_dir = os.environ.get("MEM0_DIR") or os.path.join(home_dir, ".mem0")
+-os.makedirs(mem0_dir, exist_ok=True)
++
++# NOTE: Directory creation removed - this benchmark operates entirely in-memory
++# No ~/.mem0 directory is created
+ 
+ 
+ def setup_config():
+     config_path = os.path.join(mem0_dir, "config.json")
+     if not os.path.exists(config_path):
++        # Create the directory if it doesn't exist
++        os.makedirs(mem0_dir, exist_ok=True)
+         user_id = str(uuid.uuid4())
+         config = {"user_id": user_id}
+         with open(config_path, "w") as config_file:
+diff --git a/mem0/vector_stores/faiss.py b/mem0/vector_stores/faiss.py
+index 141df5eae..0958abb28 100644
+--- a/mem0/vector_stores/faiss.py
++++ b/mem0/vector_stores/faiss.py
+@@ -47,18 +47,21 @@ class FAISS(VectorStoreBase):
+         embedding_model_dims: int = 1536,
+     ):
+         """
+-        Initialize the FAISS vector store.
++        Initialize the FAISS vector store (in-memory only).
++
++        This benchmark operates entirely in-memory - no file system operations.
+ 
+         Args:
+             collection_name (str): Name of the collection.
+-            path (str, optional): Path for local FAISS database. Defaults to None.
++            path (str, optional): Ignored - kept for API compatibility only.
+             distance_strategy (str, optional): Distance strategy to use. Options: 'euclidean', 'inner_product', 'cosine'.
+                 Defaults to "euclidean".
+             normalize_L2 (bool, optional): Whether to normalize L2 vectors. Only applicable for euclidean distance.
+                 Defaults to False.
+         """
+         self.collection_name = collection_name
+-        self.path = path or f"/tmp/faiss/{collection_name}"
++        # Always use in-memory mode (path is ignored)
++        self.path = None
+         self.distance_strategy = distance_strategy
+         self.normalize_L2 = normalize_L2
+         self.embedding_model_dims = embedding_model_dims
+@@ -68,52 +71,28 @@ class FAISS(VectorStoreBase):
+         self.docstore = {}
+         self.index_to_id = {}
+ 
+-        # Create directory if it doesn't exist
+-        if self.path:
+-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+-
+-            # Try to load existing index if available
+-            index_path = f"{self.path}/{collection_name}.faiss"
+-            docstore_path = f"{self.path}/{collection_name}.pkl"
+-            if os.path.exists(index_path) and os.path.exists(docstore_path):
+-                self._load(index_path, docstore_path)
+-            else:
+-                self.create_col(collection_name)
++        # Always initialize empty collection in-memory (no file I/O)
++        self.create_col(collection_name)
+ 
+     def _load(self, index_path: str, docstore_path: str):
+         """
+         Load FAISS index and docstore from disk.
+-
+-        Args:
+-            index_path (str): Path to FAISS index file.
+-            docstore_path (str): Path to docstore pickle file.
++        
++        NOTE: This method is a no-op - this benchmark operates entirely in-memory.
++        Kept for API compatibility only.
+         """
+-        try:
+-            self.index = faiss.read_index(index_path)
+-            with open(docstore_path, "rb") as f:
+-                self.docstore, self.index_to_id = pickle.load(f)
+-            logger.info(f"Loaded FAISS index from {index_path} with {self.index.ntotal} vectors")
+-        except Exception as e:
+-            logger.warning(f"Failed to load FAISS index: {e}")
+-
+-            self.docstore = {}
+-            self.index_to_id = {}
++        # No-op: in-memory only mode
++        pass
+ 
+     def _save(self):
+-        """Save FAISS index and docstore to disk."""
+-        if not self.path or not self.index:
+-            return
+-
+-        try:
+-            os.makedirs(self.path, exist_ok=True)
+-            index_path = f"{self.path}/{self.collection_name}.faiss"
+-            docstore_path = f"{self.path}/{self.collection_name}.pkl"
+-
+-            faiss.write_index(self.index, index_path)
+-            with open(docstore_path, "wb") as f:
+-                pickle.dump((self.docstore, self.index_to_id), f)
+-        except Exception as e:
+-            logger.warning(f"Failed to save FAISS index: {e}")
++        """
++        Save FAISS index and docstore to disk.
++        
++        NOTE: This method is a no-op - this benchmark operates entirely in-memory.
++        Kept for API compatibility only.
++        """
++        # No-op: in-memory only mode
++        pass
+ 
+     def _parse_output(self, scores, ids, limit=None) -> List[OutputData]:
+         """
+@@ -378,45 +357,23 @@ class FAISS(VectorStoreBase):
+ 
+     def list_cols(self) -> List[str]:
+         """
+-        List all collections.
++        List all collections (in-memory only).
+ 
+         Returns:
+             List[str]: List of collection names.
+         """
+-        if not self.path:
+-            return [self.collection_name] if self.index else []
+-
+-        try:
+-            collections = []
+-            path = Path(self.path).parent
+-            for file in path.glob("*.faiss"):
+-                collections.append(file.stem)
+-            return collections
+-        except Exception as e:
+-            logger.warning(f"Failed to list collections: {e}")
+-            return [self.collection_name] if self.index else []
++        # In-memory mode: only return current collection if it exists
++        return [self.collection_name] if self.index else []
+ 
+     def delete_col(self):
+         """
+-        Delete a collection.
++        Delete a collection (in-memory only - clears data structures).
+         """
+-        if self.path:
+-            try:
+-                index_path = f"{self.path}/{self.collection_name}.faiss"
+-                docstore_path = f"{self.path}/{self.collection_name}.pkl"
+-
+-                if os.path.exists(index_path):
+-                    os.remove(index_path)
+-                if os.path.exists(docstore_path):
+-                    os.remove(docstore_path)
+-
+-                logger.info(f"Deleted collection {self.collection_name}")
+-            except Exception as e:
+-                logger.warning(f"Failed to delete collection: {e}")
+-
++        # Clear in-memory data structures
+         self.index = None
+         self.docstore = {}
+         self.index_to_id = {}
++        logger.info(f"Deleted collection {self.collection_name} (in-memory)")
+ 
+     def col_info(self) -> Dict:
+         """
